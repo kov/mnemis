@@ -5,6 +5,7 @@ mod llm;
 mod memory;
 mod prompt;
 mod repl;
+mod state;
 mod tools;
 
 use anyhow::Result;
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
     let instructions = prompt::build_instructions(&cfg.guidance_file()).await;
     let llm_client = llm::LlmClient::new(&cfg.llm);
     let memory_store = memory::MemoryStore::new(cfg.memory_dir()).await?;
+    let mut state = state::StateStore::load(cfg.state_file()).await?;
     let mut imap = imap_client::ImapClient::connect(&cfg.imap).await?;
     let mut agent = agent::Agent::new(
         llm_client,
@@ -59,18 +61,49 @@ async fn main() -> Result<()> {
 
     let result: Result<Option<String>> = match cli.command {
         None => {
-            // Default autonomous mode
-            agent.run(None, &mut imap, &memory_store).await.map(Some)
+            // Default autonomous mode: one fresh conversation per mailbox
+            if cfg.mailboxes.is_empty() {
+                anyhow::bail!(
+                    "no mailboxes configured. Add a `mailboxes` list to your config file."
+                );
+            }
+            let mut reports = Vec::new();
+            for mailbox in &cfg.mailboxes {
+                eprintln!("=== Scanning {mailbox} ===");
+                agent.reset();
+                let prompt = format!(
+                    "Check the mailbox \"{}\" for new unread emails and report per the guidance. \
+                     Only look at this single mailbox, do not check other mailboxes.",
+                    mailbox
+                );
+                match agent
+                    .run(Some(&prompt), &mut imap, &memory_store, &mut state)
+                    .await
+                {
+                    Ok(report) if !report.is_empty() => reports.push(report),
+                    Ok(_) => {}
+                    Err(err) => eprintln!("Warning: error scanning {mailbox}: {err:#}"),
+                }
+            }
+            // Commit watermarks after all mailboxes succeed
+            if let Err(err) = state.commit().await {
+                eprintln!("Warning: failed to commit state: {err:#}");
+            }
+            if reports.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(reports.join("\n\n---\n\n")))
+            }
         }
         Some(Command::Ask { prompt }) => {
             let prompt_str = prompt.join(" ");
             agent
-                .run(Some(&prompt_str), &mut imap, &memory_store)
+                .run(Some(&prompt_str), &mut imap, &memory_store, &mut state)
                 .await
                 .map(Some)
         }
         Some(Command::Chat) => {
-            repl::run_repl(&mut agent, &mut imap, &memory_store).await?;
+            repl::run_repl(&mut agent, &mut imap, &memory_store, &mut state).await?;
             Ok(None)
         }
     };

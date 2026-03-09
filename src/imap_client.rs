@@ -36,6 +36,12 @@ pub struct FullMessage {
     pub body: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ListResult {
+    pub total: usize,
+    pub messages: Vec<MessageSummary>,
+}
+
 impl ImapClient {
     pub async fn connect(config: &ImapConfig) -> Result<Self> {
         let addr = format!("{}:{}", config.server, config.port);
@@ -94,39 +100,58 @@ impl ImapClient {
         &mut self,
         mailbox: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<MessageSummary>> {
+        since_uid: Option<u32>,
+        unseen_only: bool,
+        since_date: Option<&str>,
+    ) -> Result<ListResult> {
         self.select_mailbox(mailbox).await?;
 
-        let uids: Vec<u32> = {
-            let mut all: Vec<u32> = self
-                .session
-                .uid_search("ALL")
-                .await
-                .context("IMAP search failed")?
-                .into_iter()
-                .collect();
-            all.sort();
-            if let Some(limit) = limit {
-                let start = all.len().saturating_sub(limit);
-                all.split_off(start)
-            } else {
-                all
-            }
+        // Build IMAP search query
+        let mut criteria = Vec::new();
+        if let Some(uid) = since_uid {
+            criteria.push(format!("UID {}:*", uid + 1));
+        }
+        if unseen_only {
+            criteria.push("UNSEEN".to_string());
+        }
+        if let Some(date) = since_date {
+            criteria.push(format!("SINCE {date}"));
+        }
+        let query = if criteria.is_empty() {
+            "ALL".to_string()
+        } else {
+            criteria.join(" ")
+        };
+
+        let mut all: Vec<u32> = self
+            .session
+            .uid_search(&query)
+            .await
+            .context("IMAP search failed")?
+            .into_iter()
+            .collect();
+        all.sort();
+        let total = all.len();
+
+        let uids = if let Some(limit) = limit {
+            let start = all.len().saturating_sub(limit);
+            all.split_off(start)
+        } else {
+            all
         };
 
         if uids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ListResult {
+                total,
+                messages: Vec::new(),
+            });
         }
 
-        let uid_set = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let uid_set = compress_uid_set(&uids);
 
         let fetches: Vec<_> = self
             .session
-            .uid_fetch(&uid_set, "UID FLAGS ENVELOPE")
+            .uid_fetch(&uid_set, "(UID FLAGS ENVELOPE)")
             .await?
             .try_collect()
             .await?;
@@ -190,21 +215,19 @@ impl ImapClient {
             });
         }
 
-        Ok(messages)
+        Ok(ListResult { total, messages })
     }
 
-    pub async fn read_messages(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<FullMessage>> {
+    pub async fn read_messages(
+        &mut self,
+        mailbox: &str,
+        uid_set: &str,
+    ) -> Result<Vec<FullMessage>> {
         self.select_mailbox(mailbox).await?;
-
-        let uid_set = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
 
         let fetches: Vec<_> = self
             .session
-            .uid_fetch(&uid_set, "UID FLAGS RFC822")
+            .uid_fetch(&uid_set, "(UID FLAGS RFC822)")
             .await?
             .try_collect()
             .await?;
@@ -249,13 +272,8 @@ impl ImapClient {
         Ok(messages)
     }
 
-    pub async fn mark_as_read(&mut self, mailbox: &str, uids: &[u32]) -> Result<()> {
+    pub async fn mark_as_read(&mut self, mailbox: &str, uid_set: &str) -> Result<()> {
         self.select_mailbox(mailbox).await?;
-        let uid_set = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
         let _: Vec<_> = self
             .session
             .uid_store(&uid_set, "+FLAGS (\\Seen)")
@@ -269,6 +287,35 @@ impl ImapClient {
         self.session.logout().await?;
         Ok(())
     }
+}
+
+/// Compress a sorted list of UIDs into IMAP range notation (e.g. "1:5,7,9:12").
+fn compress_uid_set(uids: &[u32]) -> String {
+    if uids.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    let mut start = uids[0];
+    let mut end = uids[0];
+    for &uid in &uids[1..] {
+        if uid == end + 1 {
+            end = uid;
+        } else {
+            if start == end {
+                parts.push(start.to_string());
+            } else {
+                parts.push(format!("{start}:{end}"));
+            }
+            start = uid;
+            end = uid;
+        }
+    }
+    if start == end {
+        parts.push(start.to_string());
+    } else {
+        parts.push(format!("{start}:{end}"));
+    }
+    parts.join(",")
 }
 
 fn format_address(addr: Option<&mail_parser::Address>) -> String {

@@ -5,6 +5,7 @@ use crate::llm::{
     ContentItem, InputItem, LlmClient, OutputItem, ReasoningContentItem, Role, ToolDef,
 };
 use crate::memory::MemoryStore;
+use crate::state::StateStore;
 use crate::tools;
 
 pub struct Agent {
@@ -28,20 +29,25 @@ impl Agent {
         }
     }
 
+    /// Reset conversation state for a fresh run.
+    pub fn reset(&mut self) {
+        self.last_response_id = None;
+    }
+
     /// Run one agent turn. Returns the final text output (from message or write_report).
     pub async fn run(
         &mut self,
         user_message: Option<&str>,
         imap: &mut ImapClient,
         memory: &MemoryStore,
+        state: &mut StateStore,
     ) -> Result<String> {
         let mut input: Vec<InputItem> = Vec::new();
-        if let Some(msg) = user_message {
-            input.push(InputItem::Message {
-                role: Role::User,
-                content: msg.to_string(),
-            });
-        }
+        let msg = user_message.unwrap_or("Go ahead, follow the guidance.");
+        input.push(InputItem::Message {
+            role: Role::User,
+            content: msg.to_string(),
+        });
 
         let mut tool_call_count: usize = 0;
         let mut last_report: Option<String> = None;
@@ -116,7 +122,7 @@ impl Agent {
 
                 eprintln!("  [{tool_call_count}] {name}");
 
-                let result = tools::dispatch(name, arguments, imap, memory).await;
+                let result = tools::dispatch(name, arguments, imap, memory, state).await;
                 if let Some(report) = result.report {
                     last_report = Some(report);
                 }

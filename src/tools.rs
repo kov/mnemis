@@ -1,10 +1,18 @@
 use anyhow::Result;
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::imap_client::ImapClient;
 use crate::llm::ToolDef;
 use crate::memory::MemoryStore;
+use crate::state::StateStore;
+
+/// Format a date N days ago as an IMAP date string (e.g. "01-Jan-2026").
+fn imap_date_days_ago(days: u32) -> String {
+    let date = Utc::now().date_naive() - chrono::Days::new(days.into());
+    date.format("%d-%b-%Y").to_string()
+}
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,12 +45,15 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ),
         tool(
             "list_messages",
-            "List messages in a mailbox (subject, from, date, uid, flags).",
+            "List messages in a mailbox (subject, from, date, uid, flags). By default only shows new unseen messages from the last 90 days since the last run. Use include_read/include_old/since_days to broaden the search.",
             json!({
                 "type": "object",
                 "properties": {
                     "mailbox": { "type": "string", "description": "Mailbox name (e.g. INBOX)" },
-                    "limit": { "type": "integer", "description": "Max number of messages to return (most recent first). Omit for all." }
+                    "limit": { "type": "integer", "description": "Max number of messages to return (most recent first). Default: 50." },
+                    "include_read": { "type": "boolean", "description": "Include messages already marked as read. Default: false." },
+                    "include_old": { "type": "boolean", "description": "Include messages already seen in previous runs. Default: false." },
+                    "since_days": { "type": "integer", "description": "Only include messages from the last N days. Default: 90. Set to 0 for no date filter." }
                 },
                 "required": ["mailbox"],
                 "additionalProperties": false,
@@ -55,7 +66,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "mailbox": { "type": "string", "description": "Mailbox name" },
-                    "uids": { "type": "array", "items": { "type": "integer" }, "description": "Message UIDs to read" }
+                    "uids": { "type": "string", "description": "UID set as a plain string of digits, commas, and colons. Examples: 100 or 100,102,105 or 100:110 or 100:110,115. Do NOT add quotes around the value." }
                 },
                 "required": ["mailbox", "uids"],
                 "additionalProperties": false,
@@ -68,7 +79,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "mailbox": { "type": "string", "description": "Mailbox name" },
-                    "uids": { "type": "array", "items": { "type": "integer" }, "description": "Message UIDs to mark as read" }
+                    "uids": { "type": "string", "description": "UID set as a plain string of digits, commas, and colons. Examples: 100 or 100,102,105 or 100:110. Do NOT add quotes around the value." }
                 },
                 "required": ["mailbox", "uids"],
                 "additionalProperties": false,
@@ -131,12 +142,17 @@ pub fn tool_definitions() -> Vec<ToolDef> {
 struct ListMessagesArgs {
     mailbox: String,
     limit: Option<usize>,
+    #[serde(default)]
+    include_read: bool,
+    #[serde(default)]
+    include_old: bool,
+    since_days: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct MailboxUidsArgs {
     mailbox: String,
-    uids: Vec<u32>,
+    uids: String,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +176,11 @@ struct WriteReportArgs {
     report: String,
 }
 
+/// Strip whitespace and stray quotes from a UID set string.
+fn sanitize_uid_set(raw: &str) -> String {
+    raw.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
 /// Result of dispatching a tool call.
 pub struct ToolResult {
     pub output: String,
@@ -173,6 +194,7 @@ pub async fn dispatch(
     arguments: &str,
     imap: &mut ImapClient,
     memory: &MemoryStore,
+    state: &mut StateStore,
 ) -> ToolResult {
     let tool_name: ToolName =
         match serde_json::from_value(serde_json::Value::String(name.to_string())) {
@@ -188,7 +210,7 @@ pub async fn dispatch(
             }
         };
 
-    match dispatch_inner(tool_name, arguments, imap, memory).await {
+    match dispatch_inner(tool_name, arguments, imap, memory, state).await {
         Ok(result) => result,
         Err(err) => ToolResult {
             output: format!("Error: {err:#}"),
@@ -202,6 +224,7 @@ async fn dispatch_inner(
     arguments: &str,
     imap: &mut ImapClient,
     memory: &MemoryStore,
+    state: &mut StateStore,
 ) -> Result<ToolResult> {
     let ok = |output: String| ToolResult {
         output,
@@ -215,17 +238,47 @@ async fn dispatch_inner(
         }
         ToolName::ListMessages => {
             let args: ListMessagesArgs = serde_json::from_str(arguments)?;
-            let messages = imap.list_messages(&args.mailbox, args.limit).await?;
-            Ok(ok(serde_json::to_string(&messages)?))
+            let since_uid = if args.include_old {
+                None
+            } else {
+                let wm = state.watermark(&args.mailbox);
+                if wm > 0 { Some(wm) } else { None }
+            };
+            let unseen_only = !args.include_read;
+            let days = args.since_days.unwrap_or(90);
+            let since_date = if days > 0 {
+                Some(imap_date_days_ago(days))
+            } else {
+                None
+            };
+            let limit = args.limit.unwrap_or(50);
+            let result = imap
+                .list_messages(
+                    &args.mailbox,
+                    Some(limit),
+                    since_uid,
+                    unseen_only,
+                    since_date.as_deref(),
+                )
+                .await?;
+
+            // Record max UID seen for watermark advancement
+            if let Some(max_uid) = result.messages.iter().map(|m| m.uid).max() {
+                state.record_seen(&args.mailbox, max_uid);
+            }
+
+            Ok(ok(serde_json::to_string(&result)?))
         }
         ToolName::ReadMessages => {
             let args: MailboxUidsArgs = serde_json::from_str(arguments)?;
-            let messages = imap.read_messages(&args.mailbox, &args.uids).await?;
+            let uid_set = sanitize_uid_set(&args.uids);
+            let messages = imap.read_messages(&args.mailbox, &uid_set).await?;
             Ok(ok(serde_json::to_string(&messages)?))
         }
         ToolName::MarkAsRead => {
             let args: MailboxUidsArgs = serde_json::from_str(arguments)?;
-            imap.mark_as_read(&args.mailbox, &args.uids).await?;
+            let uid_set = sanitize_uid_set(&args.uids);
+            imap.mark_as_read(&args.mailbox, &uid_set).await?;
             Ok(ok(serde_json::to_string(&json!({"status": "ok"}))?))
         }
         ToolName::WriteMemory => {

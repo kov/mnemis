@@ -8,6 +8,9 @@ pub struct Config {
     pub imap: ImapConfig,
     #[serde(default)]
     pub paths: PathsConfig,
+    /// Mailboxes to scan in autonomous mode.
+    #[serde(default)]
+    pub mailboxes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +45,8 @@ pub struct PathsConfig {
     pub memory_dir: String,
     #[serde(default = "default_guidance_file")]
     pub guidance_file: String,
+    #[serde(default = "default_state_file")]
+    pub state_file: String,
 }
 
 impl Default for PathsConfig {
@@ -49,6 +54,7 @@ impl Default for PathsConfig {
         Self {
             memory_dir: default_memory_dir(),
             guidance_file: default_guidance_file(),
+            state_file: default_state_file(),
         }
     }
 }
@@ -59,6 +65,10 @@ fn default_memory_dir() -> String {
 
 fn default_guidance_file() -> String {
     "~/.config/mnemis/guidance.md".to_string()
+}
+
+fn default_state_file() -> String {
+    "~/.config/mnemis/state.json".to_string()
 }
 
 /// Expand `~` at the start of a path to the user's home directory.
@@ -95,5 +105,9 @@ impl Config {
 
     pub fn guidance_file(&self) -> PathBuf {
         expand_tilde(&self.paths.guidance_file)
+    }
+
+    pub fn state_file(&self) -> PathBuf {
+        expand_tilde(&self.paths.state_file)
     }
 }
