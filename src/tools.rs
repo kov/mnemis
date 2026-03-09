@@ -11,7 +11,7 @@ use crate::memory::MemoryStore;
 enum ToolName {
     ListMailboxes,
     ListMessages,
-    ReadMessage,
+    ReadMessages,
     MarkAsRead,
     WriteMemory,
     ReadMemory,
@@ -49,28 +49,28 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         ),
         tool(
-            "read_message",
-            "Read a full message by UID (headers + text body).",
+            "read_messages",
+            "Read one or more messages by UID (headers + text body).",
             json!({
                 "type": "object",
                 "properties": {
                     "mailbox": { "type": "string", "description": "Mailbox name" },
-                    "uid": { "type": "integer", "description": "Message UID" }
+                    "uids": { "type": "array", "items": { "type": "integer" }, "description": "Message UIDs to read" }
                 },
-                "required": ["mailbox", "uid"],
+                "required": ["mailbox", "uids"],
                 "additionalProperties": false,
             }),
         ),
         tool(
             "mark_as_read",
-            "Set the \\Seen flag on a message. Only use when explicitly instructed.",
+            "Set the \\Seen flag on one or more messages. Only use when explicitly instructed.",
             json!({
                 "type": "object",
                 "properties": {
                     "mailbox": { "type": "string", "description": "Mailbox name" },
-                    "uid": { "type": "integer", "description": "Message UID" }
+                    "uids": { "type": "array", "items": { "type": "integer" }, "description": "Message UIDs to mark as read" }
                 },
-                "required": ["mailbox", "uid"],
+                "required": ["mailbox", "uids"],
                 "additionalProperties": false,
             }),
         ),
@@ -134,9 +134,9 @@ struct ListMessagesArgs {
 }
 
 #[derive(Deserialize)]
-struct MailboxUidArgs {
+struct MailboxUidsArgs {
     mailbox: String,
-    uid: u32,
+    uids: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -218,14 +218,14 @@ async fn dispatch_inner(
             let messages = imap.list_messages(&args.mailbox, args.limit).await?;
             Ok(ok(serde_json::to_string(&messages)?))
         }
-        ToolName::ReadMessage => {
-            let args: MailboxUidArgs = serde_json::from_str(arguments)?;
-            let message = imap.read_message(&args.mailbox, args.uid).await?;
-            Ok(ok(serde_json::to_string(&message)?))
+        ToolName::ReadMessages => {
+            let args: MailboxUidsArgs = serde_json::from_str(arguments)?;
+            let messages = imap.read_messages(&args.mailbox, &args.uids).await?;
+            Ok(ok(serde_json::to_string(&messages)?))
         }
         ToolName::MarkAsRead => {
-            let args: MailboxUidArgs = serde_json::from_str(arguments)?;
-            imap.mark_as_read(&args.mailbox, args.uid).await?;
+            let args: MailboxUidsArgs = serde_json::from_str(arguments)?;
+            imap.mark_as_read(&args.mailbox, &args.uids).await?;
             Ok(ok(serde_json::to_string(&json!({"status": "ok"}))?))
         }
         ToolName::WriteMemory => {

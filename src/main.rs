@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, default_value = "~/.config/mnemis/config.toml")]
     config: String,
 
+    /// Print LLM reasoning and tool calls to stderr
+    #[arg(long)]
+    thinking: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -46,7 +50,12 @@ async fn main() -> Result<()> {
     let llm_client = llm::LlmClient::new(&cfg.llm);
     let memory_store = memory::MemoryStore::new(cfg.memory_dir()).await?;
     let mut imap = imap_client::ImapClient::connect(&cfg.imap).await?;
-    let mut agent = agent::Agent::new(llm_client, instructions, cfg.llm.max_tool_calls);
+    let mut agent = agent::Agent::new(
+        llm_client,
+        instructions,
+        cfg.llm.max_tool_calls,
+        cli.thinking,
+    );
 
     let result: Result<Option<String>> = match cli.command {
         None => {

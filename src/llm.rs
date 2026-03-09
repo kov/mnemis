@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::LlmConfig;
@@ -67,6 +67,18 @@ struct ResponsesRequest<'a> {
 pub enum ContentItem {
     #[serde(rename = "output_text")]
     OutputText { text: String },
+    #[serde(other)]
+    Unknown,
+}
+
+/// A content item inside a reasoning output.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ReasoningContentItem {
+    #[serde(rename = "reasoning_text")]
+    ReasoningText { text: String },
+    #[serde(other)]
+    Unknown,
 }
 
 /// An item in the response output array.
@@ -81,6 +93,10 @@ pub enum OutputItem {
         name: String,
         arguments: String,
     },
+    #[serde(rename = "reasoning")]
+    Reasoning { content: Vec<ReasoningContentItem> },
+    #[serde(other)]
+    Unknown,
 }
 
 /// Response body from POST /v1/responses.
@@ -117,7 +133,7 @@ impl LlmClient {
         tools: &[ToolDef],
         previous_response_id: Option<&str>,
     ) -> Result<ResponsesResponse> {
-        let url = format!("{}/v1/responses", self.base_url);
+        let url = format!("{}/responses", self.base_url);
 
         let body = ResponsesRequest {
             model: &self.model,
@@ -134,12 +150,13 @@ impl LlmClient {
 
         let resp = req.send().await?;
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
             bail!("LLM API error (HTTP {status}): {text}");
         }
 
-        let parsed: ResponsesResponse = resp.json().await?;
+        let parsed: ResponsesResponse = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse LLM response: {text}"))?;
         Ok(parsed)
     }
 }

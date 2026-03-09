@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 
 use crate::imap_client::ImapClient;
-use crate::llm::{ContentItem, InputItem, LlmClient, OutputItem, Role, ToolDef};
+use crate::llm::{
+    ContentItem, InputItem, LlmClient, OutputItem, ReasoningContentItem, Role, ToolDef,
+};
 use crate::memory::MemoryStore;
 use crate::tools;
 
@@ -11,16 +13,18 @@ pub struct Agent {
     tool_defs: Vec<ToolDef>,
     max_tool_calls: usize,
     last_response_id: Option<String>,
+    verbose: bool,
 }
 
 impl Agent {
-    pub fn new(llm: LlmClient, instructions: String, max_tool_calls: usize) -> Self {
+    pub fn new(llm: LlmClient, instructions: String, max_tool_calls: usize, verbose: bool) -> Self {
         Self {
             llm,
             instructions,
             tool_defs: tools::tool_definitions(),
             max_tool_calls,
             last_response_id: None,
+            verbose,
         }
     }
 
@@ -66,17 +70,30 @@ impl Agent {
                         name,
                         arguments,
                     } => {
+                        if self.verbose {
+                            eprintln!("  tool: {name}({arguments})");
+                        }
                         function_calls.push((call_id.clone(), name.clone(), arguments.clone()));
                     }
                     OutputItem::Message { content } => {
                         for c in content {
-                            match c {
-                                ContentItem::OutputText { text } => {
-                                    text_parts.push(text.clone());
+                            if let ContentItem::OutputText { text } = c {
+                                text_parts.push(text.clone());
+                            }
+                        }
+                    }
+                    OutputItem::Reasoning { content } => {
+                        if self.verbose {
+                            for c in content {
+                                if let ReasoningContentItem::ReasoningText { text } = c {
+                                    for line in text.lines() {
+                                        eprintln!("  thinking: {line}");
+                                    }
                                 }
                             }
                         }
                     }
+                    OutputItem::Unknown => {}
                 }
             }
 

@@ -193,62 +193,72 @@ impl ImapClient {
         Ok(messages)
     }
 
-    pub async fn read_message(&mut self, mailbox: &str, uid: u32) -> Result<FullMessage> {
+    pub async fn read_messages(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<FullMessage>> {
         self.select_mailbox(mailbox).await?;
+
+        let uid_set = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
         let fetches: Vec<_> = self
             .session
-            .uid_fetch(uid.to_string(), "UID FLAGS RFC822")
+            .uid_fetch(&uid_set, "UID FLAGS RFC822")
             .await?
             .try_collect()
             .await?;
 
-        let fetch = fetches
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("message UID {uid} not found"))?;
-
-        let raw = fetch.body().unwrap_or_default();
-        let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
-        let msg_uid = fetch.uid.unwrap_or(uid);
-
         let parser = MessageParser::default();
-        let parsed = parser.parse(raw);
+        let mut messages = Vec::new();
 
-        let (subject, from, to, date, body) = if let Some(msg) = parsed {
-            let subject = msg.subject().unwrap_or("").to_string();
-            let from = format_address(msg.from());
-            let to = format_address(msg.to());
-            let date = msg.date().map(|d| d.to_rfc3339()).unwrap_or_default();
-            let body = msg.body_text(0).map(|c| c.into_owned()).unwrap_or_default();
-            (subject, from, to, date, body)
-        } else {
-            // Fallback: return raw as lossy UTF-8
-            let body = String::from_utf8_lossy(raw).into_owned();
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
+        for fetch in &fetches {
+            let raw = fetch.body().unwrap_or_default();
+            let flags: Vec<String> = fetch.flags().map(|f| format!("{f:?}")).collect();
+            let msg_uid = fetch.uid.unwrap_or(0);
+
+            let (subject, from, to, date, body) = if let Some(msg) = parser.parse(raw) {
+                let subject = msg.subject().unwrap_or("").to_string();
+                let from = format_address(msg.from());
+                let to = format_address(msg.to());
+                let date = msg.date().map(|d| d.to_rfc3339()).unwrap_or_default();
+                let body = msg.body_text(0).map(|c| c.into_owned()).unwrap_or_default();
+                (subject, from, to, date, body)
+            } else {
+                let body = String::from_utf8_lossy(raw).into_owned();
+                (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    body,
+                )
+            };
+
+            messages.push(FullMessage {
+                uid: msg_uid,
+                subject,
+                from,
+                to,
+                date,
+                flags,
                 body,
-            )
-        };
+            });
+        }
 
-        Ok(FullMessage {
-            uid: msg_uid,
-            subject,
-            from,
-            to,
-            date,
-            flags,
-            body,
-        })
+        Ok(messages)
     }
 
-    pub async fn mark_as_read(&mut self, mailbox: &str, uid: u32) -> Result<()> {
+    pub async fn mark_as_read(&mut self, mailbox: &str, uids: &[u32]) -> Result<()> {
         self.select_mailbox(mailbox).await?;
+        let uid_set = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let _: Vec<_> = self
             .session
-            .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+            .uid_store(&uid_set, "+FLAGS (\\Seen)")
             .await?
             .try_collect()
             .await?;
