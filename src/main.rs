@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
                     "no mailboxes configured. Add a `mailboxes` list to your config file."
                 );
             }
-            let mut reports = Vec::new();
+            let mut printed_any = false;
             for mailbox in &cfg.mailboxes {
                 eprintln!("=== Scanning {mailbox} ===");
                 agent.reset();
@@ -80,7 +80,13 @@ async fn main() -> Result<()> {
                     .run(Some(&prompt), &mut imap, &memory_store, &mut state)
                     .await
                 {
-                    Ok(report) if !report.is_empty() => reports.push(report),
+                    Ok(report) if !report.is_empty() => {
+                        if printed_any {
+                            println!("\n---\n");
+                        }
+                        println!("{report}");
+                        printed_any = true;
+                    }
                     Ok(_) => {}
                     Err(err) => eprintln!("Warning: error scanning {mailbox}: {err:#}"),
                 }
@@ -89,11 +95,7 @@ async fn main() -> Result<()> {
             if let Err(err) = state.commit().await {
                 eprintln!("Warning: failed to commit state: {err:#}");
             }
-            if reports.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(reports.join("\n\n---\n\n")))
-            }
+            Ok(None)
         }
         Some(Command::Ask { prompt }) => {
             let prompt_str = prompt.join(" ");
