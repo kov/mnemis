@@ -50,6 +50,23 @@ impl ActionStatus {
     }
 }
 
+/// A single message as rendered in the inbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDto {
+    pub id: i64,
+    pub external_id: String,
+    pub subject: Option<String>,
+    /// Short preview of the body — truncated server-side so the wire stays small.
+    pub snippet: String,
+    pub author_display: Option<String>,
+    /// Unix seconds.
+    pub posted_at: i64,
+    pub channel_name: Option<String>,
+    pub source_name: Option<String>,
+    /// True if at least one action references this message as evidence.
+    pub has_action: bool,
+}
+
 /// A single action as rendered in the actions list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionDto {

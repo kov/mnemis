@@ -1,5 +1,7 @@
 use leptos::prelude::*;
-use mnemis_types::{ActionDto, ActionStatus, Confidence};
+use leptos_router::components::{A, Route, Router, Routes};
+use leptos_router::path;
+use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -19,6 +21,11 @@ struct ListActionsArgs {
     include_resolved: bool,
 }
 
+#[derive(Serialize)]
+struct ListMessagesArgs {
+    limit: Option<i64>,
+}
+
 async fn fetch_actions(include_resolved: bool) -> Result<Vec<ActionDto>, String> {
     let args = serde_wasm_bindgen::to_value(&ListActionsArgs { include_resolved })
         .map_err(|e| e.to_string())?;
@@ -28,6 +35,15 @@ async fn fetch_actions(include_resolved: bool) -> Result<Vec<ActionDto>, String>
     serde_wasm_bindgen::from_value::<Vec<ActionDto>>(raw).map_err(|e| e.to_string())
 }
 
+async fn fetch_messages(limit: Option<i64>) -> Result<Vec<MessageDto>, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&ListMessagesArgs { limit }).map_err(|e| e.to_string())?;
+    let raw = invoke("list_messages", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<MessageDto>>(raw).map_err(|e| e.to_string())
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     mount_to_body(App);
@@ -35,17 +51,47 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
+    view! {
+        <Router>
+            <div class="app">
+                <nav class="nav">
+                    <A href="/">"Actions"</A>
+                    <A href="/inbox">"Inbox"</A>
+                </nav>
+                <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
+                    <Route path=path!("/") view=ActionsPage />
+                    <Route path=path!("/inbox") view=InboxPage />
+                </Routes>
+            </div>
+        </Router>
+    }
+}
+
+#[component]
+fn ActionsPage() -> impl IntoView {
     let actions = LocalResource::new(|| async move { fetch_actions(false).await });
     view! {
-        <div class="app">
-            <h1>"Actions"</h1>
-            <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
-                {move || actions.get().map(|res| match res {
-                    Ok(rows) => view! { <components::ActionsList rows=rows /> }.into_any(),
-                    Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
-                })}
-            </Suspense>
-        </div>
+        <h1>"Actions"</h1>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || actions.get().map(|res| match res {
+                Ok(rows) => view! { <components::ActionsList rows=rows /> }.into_any(),
+                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+            })}
+        </Suspense>
+    }
+}
+
+#[component]
+fn InboxPage() -> impl IntoView {
+    let messages = LocalResource::new(|| async move { fetch_messages(None).await });
+    view! {
+        <h1>"Inbox"</h1>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || messages.get().map(|res| match res {
+                Ok(rows) => view! { <components::InboxList rows=rows /> }.into_any(),
+                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+            })}
+        </Suspense>
     }
 }
 

@@ -46,6 +46,74 @@ h1 {
   font-weight: 600;
 }
 
+.nav {
+  display: flex;
+  gap: 18px;
+  padding: 0 0 14px 0;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 4px 0;
+  border-bottom: 2px solid transparent;
+}
+
+.nav a:hover {
+  color: var(--fg);
+}
+
+.nav a.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+
+.message {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.message-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.message-author {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.message-subject {
+  flex: 1;
+  color: var(--fg);
+}
+
+.message-when {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.message-snippet {
+  font-size: 13px;
+  color: var(--fg);
+  opacity: 0.78;
+}
+
+.message-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .action {
   border: 1px solid var(--border);
   border-radius: 8px;

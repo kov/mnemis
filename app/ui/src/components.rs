@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use mnemis_types::{ActionDto, Confidence};
+use mnemis_types::{ActionDto, Confidence, MessageDto};
 
 use crate::{confidence_class, status_label};
 
@@ -82,5 +82,68 @@ fn ActionCard(action: ActionDto) -> impl IntoView {
                 {format!("{source} · {channel} · {evidence} evidence")}
             </div>
         </div>
+    }
+}
+
+#[component]
+pub fn InboxList(rows: Vec<MessageDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! { <div class="empty">"No messages yet."</div> }.into_any();
+    }
+    view! {
+        <div>
+            <For
+                each=move || rows.clone()
+                key=|m| m.id
+                children=move |m: MessageDto| view! { <MessageRow msg=m /> }
+            />
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn MessageRow(msg: MessageDto) -> impl IntoView {
+    let subject = msg
+        .subject
+        .clone()
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let author = msg
+        .author_display
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let source = msg.source_name.clone().unwrap_or_else(|| "?".to_string());
+    let channel = msg.channel_name.clone().unwrap_or_else(|| "?".to_string());
+    let when = format_relative(msg.posted_at);
+
+    view! {
+        <div class="message">
+            <div class="message-head">
+                <span class="message-author">{author}</span>
+                <span class="message-subject">{subject}</span>
+                {msg.has_action.then(|| view! { <span class="badge badge-high">"action"</span> })}
+                <span class="message-when">{when}</span>
+            </div>
+            <div class="message-snippet">{msg.snippet.clone()}</div>
+            <div class="message-meta">{format!("{source} · {channel}")}</div>
+        </div>
+    }
+}
+
+/// Coarse relative-time label. Frontend-only so we don't pull chrono into wasm
+/// just for "2h ago"; the precision needed here is low.
+fn format_relative(posted_at: i64) -> String {
+    let now = (js_sys::Date::now() / 1000.0) as i64;
+    let diff = (now - posted_at).max(0);
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{}m", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h", diff / 3600)
+    } else if diff < 86_400 * 7 {
+        format!("{}d", diff / 86_400)
+    } else {
+        format!("{}w", diff / (86_400 * 7))
     }
 }

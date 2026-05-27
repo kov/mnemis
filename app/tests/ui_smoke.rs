@@ -120,7 +120,73 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "expected the low-confidence revealer to be visible. got text: {body_text}"
     );
 
-    // 7. No console errors / window errors.
+    // 7. Navigate to the inbox via the nav link. We click programmatically
+    //    rather than using fantoccini's click (which goes through the W3C
+    //    perform-actions endpoint and was rejecting clicks on the SPA link
+    //    with no useful diagnostic).
+    let nav_result = client
+        .execute(
+            r#"
+            const link = document.querySelector('a[href="/inbox"]');
+            if (!link) { return 'missing-link'; }
+            link.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        nav_result.as_str(),
+        Some("ok"),
+        "inbox nav script could not find the link: {nav_result:?}"
+    );
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.message"))
+        .await
+        .context("waiting for inbox to render")?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let inbox_text = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        inbox_text.contains("q3 roadmap draft"),
+        "expected the high-action message subject in the inbox. text: {inbox_text}"
+    );
+    assert!(
+        inbox_text.contains("background reading"),
+        "expected the low-action message subject in the inbox. text: {inbox_text}"
+    );
+    assert!(
+        inbox_text.contains("fyi no action"),
+        "expected the action-less message subject in the inbox. text: {inbox_text}"
+    );
+    // Exactly two messages are linked to actions in the seed; the third
+    // should not carry an "action" badge. Count the badge spans directly
+    // — text-based counting trips on "no action needed" in the subject.
+    let badge_count_raw = client
+        .execute(
+            r#"
+            return String(Array.from(document.querySelectorAll('div.message span.badge'))
+                .filter(s => s.textContent.trim() === 'action').length);
+            "#,
+            vec![],
+        )
+        .await?;
+    let badge_count: usize = badge_count_raw.as_str().unwrap_or("0").parse().unwrap_or(0);
+    assert_eq!(
+        badge_count, 2,
+        "expected exactly 2 'action' badges in the inbox (one per action-linked message), \
+         got {badge_count}. text: {inbox_text}"
+    );
+
+    // 8. No console errors / window errors.
     let log_raw = client
         .execute("return JSON.stringify(window.__mnemis_log || []);", vec![])
         .await?;
@@ -225,6 +291,20 @@ async fn seed(pool: &SqlitePool) -> Result<()> {
     .bind(now - 300)
     .bind(now - 300)
     .fetch_one(pool)
+    .await?;
+
+    // Third message with no linked action; lets the inbox test confirm the
+    // 'action' badge is per-message rather than always-on.
+    sqlx::query(
+        "INSERT INTO messages \
+            (channel_id, external_id, author_id, posted_at, subject, body, body_format, ingested_at, flags) \
+         VALUES (?, 'msg-fyi', ?, ?, 'FYI no action needed', 'Just sharing.', 'text', ?, 0)",
+    )
+    .bind(channel_id)
+    .bind(author_id)
+    .bind(now - 60)
+    .bind(now - 60)
+    .execute(pool)
     .await?;
 
     // Two actions: one high (auto-claimed, shown immediately), one low
