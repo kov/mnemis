@@ -24,7 +24,7 @@ custom-protocol = ["tauri/custom-protocol"]
 # UI-driver probe binary — separate so the main app build doesn't pull in
 # fantoccini/hyper unnecessarily. Run with `cargo run -p mnemis-app --bin
 # ui-probe --features ui-probe`.
-ui-probe = ["dep:fantoccini", "dep:tokio-stream"]
+ui-probe = ["dep:fantoccini", "dep:tokio-stream", "dep:libc"]
 
 [dependencies.fantoccini]
 version = "0.22.1"
@@ -33,6 +33,14 @@ optional = true
 [dependencies.tokio-stream]
 version = "0.1.18"
 optional = true
+
+[target.'cfg(unix)'.dependencies.libc]
+version = "0.2.176"
+optional = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+chrono = "0.4.44"
 
 [[bin]]
 name = "mnemis-app"

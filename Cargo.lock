@@ -2828,7 +2828,9 @@ name = "mnemis-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "fantoccini",
+ "libc",
  "mnemis-engine",
  "mnemis-types",
  "serde",
@@ -2836,6 +2838,7 @@ dependencies = [
  "sqlx",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
