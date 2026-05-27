@@ -278,6 +278,44 @@ pub async fn list_actions(cfg: &Config, status_filter: Option<&str>, json: bool)
     Ok(())
 }
 
+pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
+    let pool = db::open(&cfg.db_path()).await?;
+    let llm = build_llm(cfg);
+    let outcome = extract_for_channel(&pool, &llm, channel_id, &cfg.llm.chat_model).await?;
+    println!(
+        "result={} actions_created={} up_to_message_id={:?}",
+        outcome.result, outcome.actions_created, outcome.up_to_message_id
+    );
+    if let Some(s) = outcome.summary {
+        println!("summary: {s}");
+    }
+    Ok(())
+}
+
+pub async fn embed_once(cfg: &Config) -> Result<()> {
+    let pool = db::open(&cfg.db_path()).await?;
+    let embedder = build_embedder(cfg);
+    let processed = drain_once(&pool, &embedder).await?;
+    println!("Embedded {processed} target(s).");
+    Ok(())
+}
+
+fn build_llm(cfg: &Config) -> LlmClient {
+    let llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone());
+    match &cfg.llm.bearer_token {
+        Some(t) => llm.with_bearer_token(t.clone()),
+        None => llm,
+    }
+}
+
+fn build_embedder(cfg: &Config) -> OmlxEmbedder {
+    let mut e = OmlxEmbedder::new(cfg.llm.base_url.clone(), cfg.llm.embedding_model.clone());
+    if let Some(t) = &cfg.llm.bearer_token {
+        e = e.with_bearer_token(t.clone());
+    }
+    e
+}
+
 pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     // Build the prompt by calling extract::prompt::build directly with data loaded
     // the same way extract_for_channel would. Cheap to duplicate the load logic

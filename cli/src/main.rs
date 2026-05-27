@@ -46,6 +46,13 @@ enum Command {
         /// Channel id (from `sqlite3 ... 'SELECT id, name FROM channels'`).
         channel_id: i64,
     },
+    /// Run extraction for one channel against the configured LLM. For debugging.
+    Extract {
+        /// Channel id.
+        channel_id: i64,
+    },
+    /// Drain the embed queue once against the configured embedding model. For debugging.
+    EmbedOnce,
 }
 
 #[derive(Subcommand)]
@@ -91,5 +98,7 @@ async fn main() -> Result<()> {
             commands::list_actions(&cfg, status.as_deref(), json).await
         }
         Command::DumpPrompt { channel_id } => commands::dump_prompt(&cfg, channel_id).await,
+        Command::Extract { channel_id } => commands::extract(&cfg, channel_id).await,
+        Command::EmbedOnce => commands::embed_once(&cfg).await,
     }
 }
