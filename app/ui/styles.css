@@ -49,7 +49,7 @@ h1 {
 .status-panel {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
   padding: 10px 12px;
   background: rgba(0, 0, 0, 0.025);
   border: 1px solid var(--border);
@@ -57,6 +57,54 @@ h1 {
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 14px;
+}
+
+.status-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.status-row > .status-sources,
+.status-row > .status-meta {
+  flex: 1;
+}
+
+.sync-button {
+  margin-left: auto;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sync-button[disabled] {
+  background: var(--muted);
+  cursor: progress;
+}
+
+.status-toast {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.status-toast-ok {
+  background: rgba(45, 122, 79, 0.12);
+  color: var(--high);
+}
+
+.status-toast-error {
+  background: rgba(176, 64, 64, 0.12);
+  color: #b04040;
+}
+
+.status-errors {
+  margin: 4px 0 0 16px;
+  padding: 0;
 }
 
 @media (prefers-color-scheme: dark) {

@@ -93,6 +93,22 @@ pub struct StatusSnapshot {
     pub last_extraction_at: Option<i64>,
 }
 
+/// Summary returned from a manual `sync_now` invocation. Cheap aggregate
+/// counts plus per-source/per-channel errors so the UI can show "synced 3
+/// sources, 12 new messages, 2 actions" and surface failures without the
+/// frontend having to interpret them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncOutcome {
+    pub sources_synced: i64,
+    pub sources_failed: i64,
+    pub channels_polled: i64,
+    pub messages_ingested: i64,
+    pub embeddings_drained: i64,
+    pub actions_created: i64,
+    /// Human-readable error lines (one per failure). Empty on a clean run.
+    pub errors: Vec<String>,
+}
+
 /// A single message as rendered in the inbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDto {

@@ -1,7 +1,7 @@
 use leptos::prelude::*;
-use mnemis_types::{ActionDto, Confidence, MessageDto, SourceHealth, StatusSnapshot};
+use mnemis_types::{ActionDto, Confidence, MessageDto, SourceHealth, StatusSnapshot, SyncOutcome};
 
-use crate::{confidence_class, fetch_status, status_label};
+use crate::{confidence_class, fetch_status, run_sync_now, status_label};
 
 #[component]
 pub fn ActionsList(rows: Vec<ActionDto>) -> impl IntoView {
@@ -133,14 +133,60 @@ fn MessageRow(msg: MessageDto) -> impl IntoView {
 #[component]
 pub fn StatusPanel() -> impl IntoView {
     let status = LocalResource::new(|| async move { fetch_status().await });
+    let syncing = RwSignal::new(false);
+    let last_outcome: RwSignal<Option<Result<SyncOutcome, String>>> = RwSignal::new(None);
+
+    let on_click = move |_| {
+        if syncing.get() {
+            return;
+        }
+        syncing.set(true);
+        last_outcome.set(None);
+        leptos::task::spawn_local(async move {
+            let result = run_sync_now().await;
+            last_outcome.set(Some(result));
+            syncing.set(false);
+            // Refresh the read-side resources so newly extracted actions and
+            // updated source health propagate to the lists / status panel.
+            status.refetch();
+        });
+    };
+
     view! {
         <div class="status-panel">
-            <Suspense fallback=|| view! { <span class="status-loading">"…"</span> }>
-                {move || status.get().map(|res| match res {
-                    Ok(s) => view! { <StatusPanelInner snap=s /> }.into_any(),
-                    Err(e) => view! { <span class="status-error">{format!("status error: {e}")}</span> }.into_any(),
-                })}
-            </Suspense>
+            <div class="status-row">
+                <Suspense fallback=|| view! { <span class="status-loading">"…"</span> }>
+                    {move || status.get().map(|res| match res {
+                        Ok(s) => view! { <StatusPanelInner snap=s /> }.into_any(),
+                        Err(e) => view! { <span class="status-error">{format!("status error: {e}")}</span> }.into_any(),
+                    })}
+                </Suspense>
+                <button
+                    class="sync-button"
+                    on:click=on_click
+                    disabled=move || syncing.get()
+                >
+                    {move || if syncing.get() { "Syncing…" } else { "Sync now" }}
+                </button>
+            </div>
+            {move || last_outcome.get().map(|res| match res {
+                Ok(o) => view! {
+                    <div class="status-toast status-toast-ok">
+                        {format!(
+                            "Synced {} source(s) · {} new message(s) · {} action(s)",
+                            o.sources_synced, o.messages_ingested, o.actions_created
+                        )}
+                        {(!o.errors.is_empty()).then(|| view! {
+                            <ul class="status-errors">
+                                {o.errors.iter().map(|e| view! { <li>{e.clone()}</li> }).collect_view()}
+                            </ul>
+                        })}
+                    </div>
+                }.into_any(),
+                Err(e) => view! {
+                    <div class="status-toast status-toast-error">{format!("Sync failed: {e}")}</div>
+                }.into_any(),
+            })}
         </div>
     }
 }

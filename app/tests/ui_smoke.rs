@@ -69,8 +69,14 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
 
     // 2. Bring up the harness, exporting the DB-path env BEFORE the driver
-    //    is forked so it inherits to all descendants.
-    let env = HashMap::from([("MNEMIS_DB_PATH".to_string(), db_path.display().to_string())]);
+    //    is forked so it inherits to all descendants. MNEMIS_DISABLE_LLM
+    //    keeps sync_now deterministic: it short-circuits with "No LLM
+    //    configured" instead of trying to contact the dev machine's omlx
+    //    + real IMAP.
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
     let harness = Harness::start(HarnessOpts::default(), env).await?;
 
     // 3. Open a session pointing at the seeded DB.
@@ -209,7 +215,43 @@ async fn loads_actions_into_visible_list() -> Result<()> {
          got {badge_count}. text: {inbox_text}"
     );
 
-    // 8. No console errors / window errors.
+    // 8. Click the Sync now button and assert the expected error toast
+    //    (no LLM configured — see MNEMIS_DISABLE_LLM in step 2).
+    let click_result = client
+        .execute(
+            r#"
+            const btn = document.querySelector('button.sync-button');
+            if (!btn) { return 'missing-button'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        click_result.as_str(),
+        Some("ok"),
+        "sync button selector did not match: {click_result:?}"
+    );
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.status-toast"))
+        .await
+        .context("waiting for sync toast")?;
+    let toast_text = client
+        .find(Locator::Css("div.status-toast"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        toast_text.contains("sync failed") && toast_text.contains("no llm"),
+        "expected 'sync failed: no llm' style toast; got: {toast_text}"
+    );
+
+    // 9. No console errors / window errors.
     let log_raw = client
         .execute("return JSON.stringify(window.__mnemis_log || []);", vec![])
         .await?;

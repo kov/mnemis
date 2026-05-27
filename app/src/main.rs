@@ -1,17 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
-use mnemis_engine::{db, queries};
-use mnemis_types::{ActionDto, MessageDto, StatusSnapshot};
+use mnemis_engine::config::Config;
+use mnemis_engine::embed::{Embedder, OmlxEmbedder};
+use mnemis_engine::llm::LlmClient;
+use mnemis_engine::{config, db, orchestrator, queries};
+use mnemis_types::{ActionDto, MessageDto, StatusSnapshot, SyncOutcome};
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Wraps shared mutable engine state held by the Tauri runtime.
 struct AppState {
     pool: SqlitePool,
+    /// LLM + embedder, present when the user has a usable config.toml. If
+    /// missing, sync_now is the only command that surfaces a clear error;
+    /// read-only views continue to work.
+    llm_stack: Option<LlmStack>,
+}
+
+struct LlmStack {
+    llm: LlmClient,
+    embedder: Arc<dyn Embedder>,
+    chat_model: String,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -43,6 +57,22 @@ async fn get_status(state: State<'_, AppState>) -> Result<StatusSnapshot, String
     queries::get_status(&state.pool)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
+    let stack = state
+        .llm_stack
+        .as_ref()
+        .ok_or_else(|| "No LLM configured. Edit ~/.config/mnemis/config.toml.".to_string())?;
+    orchestrator::sync_now(
+        &state.pool,
+        &stack.llm,
+        Arc::clone(&stack.embedder),
+        &stack.chat_model,
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
 
 fn main() {
@@ -79,16 +109,51 @@ fn main() {
                 anyhow::Ok(pool)
             })?;
 
-            app.manage(AppState { pool });
+            // Best-effort config load. The app remains usable read-only when
+            // no config is present — only sync_now will fail. The
+            // MNEMIS_DISABLE_LLM env (used by ui_smoke) forces this path so
+            // tests can exercise sync_now without depending on whatever
+            // config.toml the dev machine has.
+            let llm_stack = if std::env::var("MNEMIS_DISABLE_LLM").is_ok() {
+                info!("MNEMIS_DISABLE_LLM set; sync_now disabled");
+                None
+            } else {
+                match config::load(None) {
+                    Ok(cfg) => Some(build_llm_stack(&cfg)),
+                    Err(e) => {
+                        warn!(error = %e, "no mnemis config; sync_now disabled");
+                        None
+                    }
+                }
+            };
+
+            app.manage(AppState { pool, llm_stack });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_actions,
             list_messages,
-            get_status
+            get_status,
+            sync_now
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn build_llm_stack(cfg: &Config) -> LlmStack {
+    let mut llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone());
+    if let Some(t) = &cfg.llm.bearer_token {
+        llm = llm.with_bearer_token(t.clone());
+    }
+    let mut embedder = OmlxEmbedder::new(cfg.llm.base_url.clone(), cfg.llm.embedding_model.clone());
+    if let Some(t) = &cfg.llm.bearer_token {
+        embedder = embedder.with_bearer_token(t.clone());
+    }
+    LlmStack {
+        llm,
+        embedder: Arc::new(embedder),
+        chat_model: cfg.llm.chat_model.clone(),
+    }
 }
 
 /// Resolve the SQLite path. Prefers `MNEMIS_DB_PATH` (useful for pointing the

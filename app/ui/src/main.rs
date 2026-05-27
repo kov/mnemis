@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
-use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto, StatusSnapshot};
+use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto, StatusSnapshot, SyncOutcome};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -49,6 +49,13 @@ async fn fetch_status() -> Result<StatusSnapshot, String> {
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     serde_wasm_bindgen::from_value::<StatusSnapshot>(raw).map_err(|e| e.to_string())
+}
+
+pub async fn run_sync_now() -> Result<SyncOutcome, String> {
+    let raw = invoke("sync_now", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<SyncOutcome>(raw).map_err(|e| e.to_string())
 }
 
 fn main() {

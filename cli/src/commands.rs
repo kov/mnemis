@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use mnemis_engine::config::Config;
 use mnemis_engine::db;
 use mnemis_engine::embed::{Embedder, OmlxEmbedder, drain_once};
 use mnemis_engine::extract::{extract_for_channel, prompt};
-use mnemis_engine::ingest::ingest_batch;
 use mnemis_engine::llm::LlmClient;
-use mnemis_engine::source::imap::{ImapConfig, ImapSource};
-use mnemis_engine::source::{Cursor, Source, SourceId};
-use sqlx::SqlitePool;
+use mnemis_engine::orchestrator::{self, build_imap_source};
+use mnemis_engine::secrets;
+use mnemis_engine::source::Source;
+use mnemis_engine::source::SourceId;
 use std::sync::Arc;
-
-use crate::config::Config;
-use crate::secrets;
 
 pub async fn init(cfg: &Config, display_name: Option<String>) -> Result<()> {
     let path = cfg.db_path();
@@ -126,90 +124,32 @@ pub async fn add_source_imap(
 
 pub async fn sync(cfg: &Config) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
-    let llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone());
-    let llm = match &cfg.llm.bearer_token {
-        Some(t) => llm.with_bearer_token(t.clone()),
-        None => llm,
-    };
-    let mut embedder = OmlxEmbedder::new(cfg.llm.base_url.clone(), cfg.llm.embedding_model.clone());
-    if let Some(t) = &cfg.llm.bearer_token {
-        embedder = embedder.with_bearer_token(t.clone());
-    }
-    let embedder: Arc<dyn Embedder> = Arc::new(embedder);
+    let llm = build_llm(cfg);
+    let embedder: Arc<dyn Embedder> = Arc::new(build_embedder(cfg));
 
-    let sources: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, name FROM sources WHERE status != 'disabled' ORDER BY id")
-            .fetch_all(&pool)
-            .await?;
-
-    if sources.is_empty() {
+    let count_sources: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sources")
+        .fetch_one(&pool)
+        .await?;
+    if count_sources.0 == 0 {
         println!("No sources configured. Add one with `mnemis add-source imap ...`.");
         return Ok(());
     }
 
-    for (source_id, source_name) in sources {
-        println!("==> Source [{source_id}] {source_name}");
-        let source = match build_imap_source(&pool, SourceId(source_id)).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  source build failed: {e:#}");
-                mark_source_failure(&pool, source_id, &format!("{e:#}"))
-                    .await
-                    .ok();
-                continue;
-            }
-        };
+    let outcome = orchestrator::sync_now(&pool, &llm, embedder, &cfg.llm.chat_model).await?;
 
-        let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
-        )
-        .bind(source_id)
-        .fetch_all(&pool)
-        .await?;
-
-        for (channel_id, external_id, cursor) in channels {
-            print!("  channel {external_id}: polling… ");
-            let cursor = cursor.map(Cursor);
-            let batch = match source.poll(&external_id, cursor.as_ref()).await {
-                Ok(b) => b,
-                Err(e) => {
-                    println!("ERROR: {e:#}");
-                    continue;
-                }
-            };
-            let inserted = ingest_batch(&pool, SourceId(source_id), channel_id, &batch).await?;
-            println!("{inserted} new messages.");
-
-            if inserted > 0 {
-                print!("    embedding new messages… ");
-                let drained = drain_once(&pool, embedder.as_ref()).await?;
-                println!("{drained} embedded.");
-
-                print!("    extracting… ");
-                let outcome =
-                    extract_for_channel(&pool, &llm, channel_id, &cfg.llm.chat_model).await?;
-                println!(
-                    "{} ({} actions{})",
-                    outcome.result,
-                    outcome.actions_created,
-                    outcome
-                        .summary
-                        .as_deref()
-                        .map(|s| format!(", \"{}\"", truncate(s, 80)))
-                        .unwrap_or_default()
-                );
-            }
-        }
-
-        mark_source_ok(&pool, source_id).await.ok();
+    println!(
+        "Synced {} source(s) ({} failed), {} channel(s) polled, {} new message(s), \
+         {} embedding(s) drained, {} action(s) created.",
+        outcome.sources_synced,
+        outcome.sources_failed,
+        outcome.channels_polled,
+        outcome.messages_ingested,
+        outcome.embeddings_drained,
+        outcome.actions_created,
+    );
+    for e in &outcome.errors {
+        eprintln!("  ! {e}");
     }
-
-    // Final drain pass for anything (memory_notes, actions) enqueued during the run.
-    let drained = drain_once(&pool, embedder.as_ref()).await?;
-    if drained > 0 {
-        println!("Final embed pass: {drained} more embedded.");
-    }
-
     Ok(())
 }
 
@@ -421,80 +361,4 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     };
     println!("{}", prompt::build(&inputs));
     Ok(())
-}
-
-// --- helpers --------------------------------------------------------------
-
-async fn build_imap_source(pool: &SqlitePool, source_id: SourceId) -> Result<ImapSource> {
-    let (kind, config_ref): (String, String) =
-        sqlx::query_as("SELECT kind, config_ref FROM sources WHERE id = ?")
-            .bind(source_id.0)
-            .fetch_one(pool)
-            .await?;
-    if kind != "imap" {
-        anyhow::bail!("source {} is not IMAP (kind={kind})", source_id.0);
-    }
-
-    let conn_json: (String,) = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
-        .bind(format!("source/{}/imap", source_id.0))
-        .fetch_one(pool)
-        .await
-        .context("missing IMAP connection settings")?;
-    let parsed: serde_json::Value = serde_json::from_str(&conn_json.0)?;
-    let server = parsed["server"]
-        .as_str()
-        .context("missing server")?
-        .to_string();
-    let port = parsed["port"].as_u64().context("missing port")? as u16;
-    let username = parsed["username"]
-        .as_str()
-        .context("missing username")?
-        .to_string();
-
-    let password = secrets::fetch(&config_ref)
-        .await
-        .with_context(|| format!("fetching keychain entry {config_ref}"))?;
-
-    Ok(ImapSource::new(
-        source_id,
-        ImapConfig {
-            server,
-            port,
-            username,
-            password,
-        },
-    ))
-}
-
-async fn mark_source_ok(pool: &SqlitePool, source_id: i64) -> Result<()> {
-    sqlx::query(
-        "UPDATE sources SET status = 'ok', last_synced_at = ?, last_error = NULL, \
-         consecutive_failures = 0 WHERE id = ?",
-    )
-    .bind(Utc::now().timestamp())
-    .bind(source_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-async fn mark_source_failure(pool: &SqlitePool, source_id: i64, error: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE sources SET status = CASE WHEN consecutive_failures + 1 >= 6 THEN 'failed' \
-         ELSE 'warning' END, last_error = ?, consecutive_failures = consecutive_failures + 1 \
-         WHERE id = ?",
-    )
-    .bind(error)
-    .bind(source_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
 }

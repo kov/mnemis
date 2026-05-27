@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use mnemis_engine::config;
+
 mod commands;
-mod config;
-mod secrets;
 
 #[derive(Parser)]
 #[command(name = "mnemis", about = "mnemis CLI", version)]
