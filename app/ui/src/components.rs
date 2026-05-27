@@ -1,10 +1,34 @@
-use leptos::prelude::*;
-use mnemis_types::{ActionDto, Confidence, MessageDto, SourceHealth, StatusSnapshot, SyncOutcome};
+use std::sync::Arc;
 
-use crate::{confidence_class, fetch_status, run_sync_now, status_label};
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+use mnemis_types::{
+    ActionDto, ActionStatus, Confidence, MessageDto, SourceHealth, StatusSnapshot, SyncOutcome,
+};
+
+use crate::{confidence_class, fetch_actions, fetch_status, run_sync_now, status_label, update_action};
 
 #[component]
-pub fn ActionsList(rows: Vec<ActionDto>) -> impl IntoView {
+pub fn ActionsPage() -> impl IntoView {
+    let actions = LocalResource::new(|| async move { fetch_actions(false).await });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || actions.refetch());
+
+    view! {
+        <h1>"Actions"</h1>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || {
+                let refetch = refetch.clone();
+                actions.get().map(move |res| match res {
+                    Ok(rows) => view! { <ActionsList rows=rows refetch=refetch /> }.into_any(),
+                    Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                })
+            }}
+        </Suspense>
+    }
+}
+
+#[component]
+fn ActionsList(rows: Vec<ActionDto>, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
     if rows.is_empty() {
         return view! { <div class="empty">"No active actions."</div> }.into_any();
     }
@@ -16,33 +40,45 @@ pub fn ActionsList(rows: Vec<ActionDto>) -> impl IntoView {
     let show_low = RwSignal::new(false);
     let low_count = low.len();
     let low_for_view = StoredValue::new(low);
+    let refetch_for_rest = refetch.clone();
+    let refetch_for_low = refetch.clone();
 
     view! {
         <div>
             <For
                 each=move || rest.clone()
                 key=|a| a.id
-                children=move |a: ActionDto| view! { <ActionCard action=a /> }
+                children=move |a: ActionDto| view! {
+                    <ActionCard action=a refetch=refetch_for_rest.clone() />
+                }
             />
 
-            {move || (low_count > 0).then(|| view! {
-                <div
-                    class="revealer"
-                    on:click=move |_| show_low.update(|v| *v = !*v)
-                >
-                    {move || if show_low.get() {
-                        format!("▾ hide {} low-confidence", low_count)
-                    } else {
-                        format!("▸ show {} low-confidence", low_count)
-                    }}
-                </div>
-                <Show when=move || show_low.get() fallback=|| view! { <></> }>
-                    <For
-                        each=move || low_for_view.get_value()
-                        key=|a| a.id
-                        children=move |a: ActionDto| view! { <ActionCard action=a /> }
-                    />
-                </Show>
+            {move || (low_count > 0).then(|| {
+                let refetch_for_low = refetch_for_low.clone();
+                view! {
+                    <div
+                        class="revealer"
+                        on:click=move |_| show_low.update(|v| *v = !*v)
+                    >
+                        {move || if show_low.get() {
+                            format!("▾ hide {} low-confidence", low_count)
+                        } else {
+                            format!("▸ show {} low-confidence", low_count)
+                        }}
+                    </div>
+                    <Show when=move || show_low.get() fallback=|| view! { <></> }>
+                        <For
+                            each=move || low_for_view.get_value()
+                            key=|a| a.id
+                            children={
+                                let refetch_for_low = refetch_for_low.clone();
+                                move |a: ActionDto| view! {
+                                    <ActionCard action=a refetch=refetch_for_low.clone() />
+                                }
+                            }
+                        />
+                    </Show>
+                }
             })}
         </div>
     }
@@ -50,7 +86,7 @@ pub fn ActionsList(rows: Vec<ActionDto>) -> impl IntoView {
 }
 
 #[component]
-fn ActionCard(action: ActionDto) -> impl IntoView {
+fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
     let conf_class = confidence_class(action.confidence);
     let conf_label = match action.confidence {
         Confidence::High => "high",
@@ -67,6 +103,21 @@ fn ActionCard(action: ActionDto) -> impl IntoView {
         .channel_name
         .clone()
         .unwrap_or_else(|| "?".to_string());
+    let id = action.id;
+    let current_status = action.status;
+
+    let trigger = move |target: ActionStatus, reason: Option<String>| {
+        let refetch = refetch.clone();
+        spawn_local(async move {
+            let _ = update_action(id, target, reason).await;
+            refetch();
+        });
+    };
+
+    let trigger_claim = trigger.clone();
+    let trigger_done = trigger.clone();
+    let trigger_dismiss = trigger.clone();
+    let trigger_reopen = trigger.clone();
 
     view! {
         <div class="action">
@@ -81,52 +132,35 @@ fn ActionCard(action: ActionDto) -> impl IntoView {
             <div class="action-meta">
                 {format!("{source} · {channel} · {evidence} evidence")}
             </div>
-        </div>
-    }
-}
-
-#[component]
-pub fn InboxList(rows: Vec<MessageDto>) -> impl IntoView {
-    if rows.is_empty() {
-        return view! { <div class="empty">"No messages yet."</div> }.into_any();
-    }
-    view! {
-        <div>
-            <For
-                each=move || rows.clone()
-                key=|m| m.id
-                children=move |m: MessageDto| view! { <MessageRow msg=m /> }
-            />
-        </div>
-    }
-    .into_any()
-}
-
-#[component]
-fn MessageRow(msg: MessageDto) -> impl IntoView {
-    let subject = msg
-        .subject
-        .clone()
-        .unwrap_or_else(|| "(no subject)".to_string());
-    let author = msg
-        .author_display
-        .clone()
-        .unwrap_or_else(|| "?".to_string());
-    let source = msg.source_name.clone().unwrap_or_else(|| "?".to_string());
-    let channel = msg.channel_name.clone().unwrap_or_else(|| "?".to_string());
-    let when = format_relative(msg.posted_at);
-
-    view! {
-        <div class="message">
-            <div class="message-head">
-                <span class="message-author">{author}</span>
-                <span class="message-subject">{subject}</span>
-                {msg.has_action.then(|| view! { <span class="badge badge-high">"action"</span> })}
-                <span class="message-when">{when}</span>
+            <div class="action-actions">
+                {show_button(current_status, ActionStatus::Claimed).then(|| view! {
+                    <button class="btn btn-secondary" on:click=move |_| trigger_claim(ActionStatus::Claimed, None)>"Claim"</button>
+                })}
+                {show_button(current_status, ActionStatus::Done).then(|| view! {
+                    <button class="btn btn-primary" on:click=move |_| trigger_done(ActionStatus::Done, None)>"Done"</button>
+                })}
+                {show_button(current_status, ActionStatus::Dismissed).then(|| view! {
+                    <button class="btn btn-ghost" on:click=move |_| trigger_dismiss(ActionStatus::Dismissed, Some(String::new()))>"Dismiss"</button>
+                })}
+                {show_button(current_status, ActionStatus::Pending).then(|| view! {
+                    <button class="btn btn-ghost" on:click=move |_| trigger_reopen(ActionStatus::Pending, None)>"Reopen"</button>
+                })}
             </div>
-            <div class="message-snippet">{msg.snippet.clone()}</div>
-            <div class="message-meta">{format!("{source} · {channel}")}</div>
         </div>
+    }
+}
+
+/// Which buttons make sense from the current status. Done/Dismissed get a
+/// Reopen affordance; active actions get Done/Dismiss; only fresh pending
+/// items get an explicit Claim (auto_claimed is already claimed-by-agent).
+fn show_button(current: ActionStatus, target: ActionStatus) -> bool {
+    use ActionStatus::*;
+    match (current, target) {
+        (Pending, Claimed) => true,
+        (Pending | AutoClaimed | Claimed, Done) => true,
+        (Pending | AutoClaimed | Claimed, Dismissed) => true,
+        (Done | Cancelled | Dismissed, Pending) => true,
+        _ => false,
     }
 }
 
@@ -142,12 +176,10 @@ pub fn StatusPanel() -> impl IntoView {
         }
         syncing.set(true);
         last_outcome.set(None);
-        leptos::task::spawn_local(async move {
+        spawn_local(async move {
             let result = run_sync_now().await;
             last_outcome.set(Some(result));
             syncing.set(false);
-            // Refresh the read-side resources so newly extracted actions and
-            // updated source health propagate to the lists / status panel.
             status.refetch();
         });
     };
@@ -266,5 +298,50 @@ fn format_relative(posted_at: i64) -> String {
         format!("{}d", diff / 86_400)
     } else {
         format!("{}w", diff / (86_400 * 7))
+    }
+}
+
+#[component]
+pub fn InboxList(rows: Vec<MessageDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! { <div class="empty">"No messages yet."</div> }.into_any();
+    }
+    view! {
+        <div>
+            <For
+                each=move || rows.clone()
+                key=|m| m.id
+                children=move |m: MessageDto| view! { <MessageRow msg=m /> }
+            />
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn MessageRow(msg: MessageDto) -> impl IntoView {
+    let subject = msg
+        .subject
+        .clone()
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let author = msg
+        .author_display
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let source = msg.source_name.clone().unwrap_or_else(|| "?".to_string());
+    let channel = msg.channel_name.clone().unwrap_or_else(|| "?".to_string());
+    let when = format_relative(msg.posted_at);
+
+    view! {
+        <div class="message">
+            <div class="message-head">
+                <span class="message-author">{author}</span>
+                <span class="message-subject">{subject}</span>
+                {msg.has_action.then(|| view! { <span class="badge badge-high">"action"</span> })}
+                <span class="message-when">{when}</span>
+            </div>
+            <div class="message-snippet">{msg.snippet.clone()}</div>
+            <div class="message-meta">{format!("{source} · {channel}")}</div>
+        </div>
     }
 }

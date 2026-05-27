@@ -258,6 +258,42 @@ h1 {
   color: var(--muted);
 }
 
+.action-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn-ghost {
+  color: var(--muted);
+}
+
+.btn:hover {
+  filter: brightness(1.05);
+}
+
 .action-details {
   font-size: 13px;
   color: var(--fg);

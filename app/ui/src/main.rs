@@ -58,6 +58,30 @@ pub async fn run_sync_now() -> Result<SyncOutcome, String> {
     serde_wasm_bindgen::from_value::<SyncOutcome>(raw).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+struct UpdateActionArgs {
+    action_id: i64,
+    new_status: ActionStatus,
+    dismissed_reason: Option<String>,
+}
+
+pub async fn update_action(
+    action_id: i64,
+    new_status: ActionStatus,
+    dismissed_reason: Option<String>,
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&UpdateActionArgs {
+        action_id,
+        new_status,
+        dismissed_reason,
+    })
+    .map_err(|e| e.to_string())?;
+    invoke("update_action", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     mount_to_body(App);
@@ -84,16 +108,7 @@ fn App() -> impl IntoView {
 
 #[component]
 fn ActionsPage() -> impl IntoView {
-    let actions = LocalResource::new(|| async move { fetch_actions(false).await });
-    view! {
-        <h1>"Actions"</h1>
-        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
-            {move || actions.get().map(|res| match res {
-                Ok(rows) => view! { <components::ActionsList rows=rows /> }.into_any(),
-                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
-            })}
-        </Suspense>
-    }
+    view! { <components::ActionsPage /> }
 }
 
 #[component]

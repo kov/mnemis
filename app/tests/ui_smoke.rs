@@ -149,6 +149,69 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "expected the low-confidence revealer to be visible. got text: {body_text}"
     );
 
+    // 6a. Click "Done" on the visible high-confidence action; assert the
+    //     list refreshes and the action is no longer rendered.
+    let click_done = client
+        .execute(
+            r#"
+            const btn = Array.from(document.querySelectorAll('.action-actions button'))
+                .find(b => b.textContent.trim() === 'Done');
+            if (!btn) { return 'missing-done'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        click_done.as_str(),
+        Some("ok"),
+        "Done button not found in DOM: {click_done:?}"
+    );
+    // Wait for the list to refresh (the action drops out of the default
+    // filter once status=done).
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let t = client
+            .find(Locator::Css("body"))
+            .await?
+            .text()
+            .await
+            .unwrap_or_default()
+            .to_lowercase();
+        if !t.contains("review q3 roadmap") {
+            break;
+        }
+    }
+    let after_done = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        !after_done.contains("review q3 roadmap"),
+        "Done action should have disappeared from the default list. text: {after_done}"
+    );
+
+    // Verify the backend recorded a user-driven 'resolved' event. We open
+    // a separate read pool against the same file because the app holds
+    // the write side.
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (event_kind, actor): (String, String) = sqlx::query_as(
+            "SELECT event_kind, actor FROM action_events \
+             WHERE actor = 'user' ORDER BY occurred_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .context("reading action_events after Done click")?;
+        assert_eq!(event_kind, "resolved");
+        assert_eq!(actor, "user");
+        pool.close().await;
+    }
+
     // 7. Navigate to the inbox via the nav link. We click programmatically
     //    rather than using fantoccini's click (which goes through the W3C
     //    perform-actions endpoint and was rejecting clicks on the SPA link

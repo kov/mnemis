@@ -4,6 +4,7 @@ pub mod embed;
 pub mod extract;
 pub mod ingest;
 pub mod llm;
+pub mod mutations;
 pub mod orchestrator;
 pub mod queries;
 pub mod secrets;
