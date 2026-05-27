@@ -103,7 +103,7 @@ pub async fn drain_once(pool: &SqlitePool, embedder: &dyn Embedder) -> Result<us
                 processed += 1;
             }
             Err(e) => {
-                warn!(error = %e, kind = %target_kind, id = target_id, "embed failed");
+                warn!(error = format!("{e:#}"), kind = %target_kind, id = target_id, "embed failed");
                 sqlx::query(
                     "UPDATE embed_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?",
                 )
@@ -157,7 +157,20 @@ async fn load_target_text(
                     .context("loading memory note text")?;
             Ok((format!("{key}\n\n{content}"), "memory_notes_vec"))
         }
-        // `action` and `contact` kinds land with the extractor and contacts UI.
+        "action" => {
+            let (title, details): (String, Option<String>) =
+                sqlx::query_as("SELECT title, details FROM actions WHERE id = ?")
+                    .bind(target_id)
+                    .fetch_one(pool)
+                    .await
+                    .context("loading action text")?;
+            let text = match details {
+                Some(d) if !d.is_empty() => format!("{title}\n\n{d}"),
+                _ => title,
+            };
+            Ok((text, "actions_vec"))
+        }
+        // `contact` kind lands with the contacts UI.
         other => bail!("unsupported embed target kind: {other}"),
     }
 }
@@ -168,7 +181,32 @@ async fn write_embedding(
     rowid: i64,
     embedding: &[f32],
 ) -> Result<()> {
-    let json = serde_json::to_string(embedding)?;
+    // sqlite-vec's vec_f32() also accepts a raw little-endian f32 blob, which
+    // sidesteps two problems with the JSON path: (1) serde serializes NaN/Inf
+    // as `null`, which makes vec_f32's strtod parser bail with "JSON parsing
+    // error" — observed in practice with live embeddings — and (2) it skips a
+    // pointless serialize/parse round-trip for what is fundamentally a packed
+    // float array. A non-finite value still produces a meaningless similarity
+    // score, but at least the queue keeps draining; log it so it's visible.
+    let mut blob = Vec::with_capacity(embedding.len() * 4);
+    let mut bad = 0usize;
+    for v in embedding {
+        let v = if v.is_finite() {
+            *v
+        } else {
+            bad += 1;
+            0.0
+        };
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    if bad > 0 {
+        warn!(
+            rowid,
+            table = vec_table,
+            count = bad,
+            "embedding had non-finite values; zeroed"
+        );
+    }
     // vec_table is from a hard-coded match in load_target_text — never user input.
     let delete_sql = AssertSqlSafe(format!("DELETE FROM {vec_table} WHERE rowid = ?"));
     let insert_sql = AssertSqlSafe(format!(
@@ -181,7 +219,7 @@ async fn write_embedding(
         .await?;
     sqlx::query(insert_sql)
         .bind(rowid)
-        .bind(&json)
+        .bind(&blob)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -316,6 +354,77 @@ mod tests {
         assert_eq!(attempts, 1);
         assert!(err.unwrap().contains("simulated failure"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handles_non_finite_embedding_values() -> Result<()> {
+        // Regression: live OmlxEmbedder occasionally returns NaN/Inf for
+        // certain inputs, and serde_json serializes those as `null`. The
+        // resulting JSON (`[0.5, null, 0.3, ...]`) makes sqlite-vec's
+        // strtod-based vec_f32() parser bail with "JSON parsing error",
+        // which then poisons every downstream queue entry the same way.
+        // Pin: a NaN in the vector must not blow up the writer.
+        let (_tmp, pool) = setup_with_messages().await?;
+        let mut v = vec![0.5_f32; 768];
+        v[7] = f32::NAN;
+        v[42] = f32::INFINITY;
+        let embedder = FixedEmbedder::new(v);
+
+        let processed = drain_once(&pool, &embedder).await?;
+        assert_eq!(processed, 1, "non-finite values must not fail the insert");
+
+        let (qcount,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(qcount, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embeds_action_targets_into_actions_vec() -> Result<()> {
+        // Regression: record_action enqueues target_kind='action' rows in
+        // embed_queue, but for a long while the embedder bailed with
+        // "unsupported embed target kind: action" and the queue piled up
+        // failed attempts. This test pins the action embed path.
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("test.db");
+        let pool = db::open(&path).await?;
+        db::migrate(&pool).await?;
+
+        let now = Utc::now().timestamp();
+        let (action_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, details, confidence, status, extracted_at) \
+             VALUES ('Review the draft', 'Ana asked for a pass.', 'high', 'auto_claimed', ?) \
+             RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO embed_queue (target_kind, target_id, text_hash, enqueued_at) \
+             VALUES ('action', ?, 'h', ?)",
+        )
+        .bind(action_id)
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        let embedder = FixedEmbedder::new(vec![0.25_f32; 768]);
+        let processed = drain_once(&pool, &embedder).await?;
+        assert_eq!(processed, 1, "action should drain successfully");
+        assert_eq!(embedder.call_count(), 1);
+
+        // Queue empty + vector landed in actions_vec.
+        let (qcount,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(qcount, 0);
+        let (vcount,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM actions_vec WHERE rowid = ?")
+            .bind(action_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(vcount, 1, "actions_vec should hold one embedding");
         Ok(())
     }
 
