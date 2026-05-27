@@ -203,16 +203,27 @@ fn build_llm_stack(cfg: &Config) -> LlmStack {
     }
 }
 
-/// Resolve the SQLite path. Prefers `MNEMIS_DB_PATH` (useful for pointing the
-/// dev build at the existing CLI database); otherwise uses Tauri's per-OS
-/// app data dir.
-fn resolve_db_path(app: &tauri::App) -> anyhow::Result<PathBuf> {
+/// Resolve the SQLite path.
+///
+/// Order:
+/// 1. `MNEMIS_DB_PATH` env override (handy for tests + pointing dev builds
+///    at a specific database).
+/// 2. The CLI config's `paths.db` (or its default of
+///    `~/.local/share/mnemis/mnemis.db` on Linux,
+///    `~/Library/Application Support/mnemis/mnemis.db` on macOS).
+///
+/// Falling back to `config::default_db_path()` rather than Tauri's
+/// `app_data_dir()` is deliberate: the CLI and the desktop app must share
+/// one database, and the CLI's path predates the Tauri bundle identifier.
+fn resolve_db_path(_app: &tauri::App) -> anyhow::Result<PathBuf> {
     if let Ok(p) = std::env::var("MNEMIS_DB_PATH") {
         return Ok(PathBuf::from(p));
     }
-    let dir = app
-        .path()
-        .app_data_dir()
-        .context("resolving app data dir")?;
-    Ok(dir.join("mnemis.db"))
+    // Respect an explicit config override; otherwise fall through to the
+    // built-in default. Config loading is best-effort; a missing file is
+    // not a failure here.
+    if let Ok(cfg) = config::load(None) {
+        return Ok(cfg.db_path());
+    }
+    Ok(config::default_db_path())
 }
