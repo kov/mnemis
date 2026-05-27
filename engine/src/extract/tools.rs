@@ -43,7 +43,9 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef::function(
             "record_action".to_string(),
             "Record one action item. evidence_external_ids must reference at least one \
-             message visible in the window or fetched via fetch_message."
+             message visible in the window or fetched via fetch_message. Returns \
+             {\"action_id\": \"A-N\", \"status\": ...} — keep the action_id if you may \
+             want to amend the same action later in this response (use update_action)."
                 .to_string(),
             json!({
                 "type": "object",
@@ -60,6 +62,31 @@ pub fn definitions() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["title", "details", "confidence", "rationale", "evidence_external_ids"]
+            }),
+        ),
+        ToolDef::function(
+            "update_action".to_string(),
+            "Amend an existing action (one you just recorded, or one from the Existing list). \
+             Identify it by its A-N id. Only the fields you pass are changed; new evidence \
+             is appended, not replaced. Use this instead of calling record_action a second \
+             time for the same underlying item."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "action_id":  { "type": "string", "description": "the A-N id returned by record_action or shown in Existing actions" },
+                    "title":      { "type": "string" },
+                    "details":    { "type": "string" },
+                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                    "rationale":  { "type": "string" },
+                    "due_at":     { "type": ["string", "null"], "description": "ISO 8601 timestamp or null" },
+                    "evidence_external_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "additional evidence to append; not replaced"
+                    }
+                },
+                "required": ["action_id"]
             }),
         ),
     ]
@@ -91,6 +118,7 @@ pub async fn dispatch(
             }
             Err(e) => Err(e),
         },
+        "update_action" => update_action(pool, scope, arguments).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
 
@@ -344,6 +372,189 @@ async fn record_action(
     Ok(json!({
         "action_id": format!("A-{action_id}"),
         "status": initial_status,
+    })
+    .to_string())
+}
+
+#[derive(Deserialize)]
+struct UpdateArgs {
+    action_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    details: Option<String>,
+    #[serde(default)]
+    confidence: Option<String>,
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    due_at: Option<String>,
+    #[serde(default)]
+    evidence_external_ids: Option<Vec<String>>,
+}
+
+/// Parse "A-N" (preferred) or bare numeric form.
+fn parse_action_ref(s: &str) -> Result<i64> {
+    let trimmed = s.trim();
+    let numeric = trimmed.strip_prefix("A-").unwrap_or(trimmed);
+    numeric
+        .parse::<i64>()
+        .with_context(|| format!("invalid action_id: {s:?} (expected A-N or N)"))
+}
+
+async fn update_action(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    arguments: &str,
+) -> Result<String> {
+    let args: UpdateArgs = serde_json::from_str(arguments).context("parsing update_action args")?;
+    let action_id = parse_action_ref(&args.action_id)?;
+
+    if let Some(c) = &args.confidence
+        && !["high", "medium", "low"].contains(&c.as_str())
+    {
+        anyhow::bail!("invalid confidence: {c}");
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // Make sure the action exists. Scope check: it must have at least one
+    // evidence message from this source, OR no evidence yet (newly created
+    // in this same loop). This keeps the extractor from amending unrelated
+    // actions, while still letting it tweak its own work.
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT title, status FROM actions WHERE id = ? AND status NOT IN ('done', 'dismissed')",
+    )
+    .bind(action_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (_old_title, old_status) = match row {
+        Some(r) => r,
+        None => {
+            tx.rollback().await.ok();
+            anyhow::bail!("action A-{action_id} not found or already resolved");
+        }
+    };
+
+    // Patch the provided fields. confidence bumps may promote pending →
+    // auto_claimed; we don't demote in the other direction here (would
+    // surprise the user).
+    let new_status = match (old_status.as_str(), args.confidence.as_deref()) {
+        ("pending", Some("high")) => Some("auto_claimed"),
+        _ => None,
+    };
+    if let Some(t) = &args.title {
+        sqlx::query("UPDATE actions SET title = ? WHERE id = ?")
+            .bind(t)
+            .bind(action_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(d) = &args.details {
+        sqlx::query("UPDATE actions SET details = ? WHERE id = ?")
+            .bind(d)
+            .bind(action_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(c) = &args.confidence {
+        sqlx::query("UPDATE actions SET confidence = ? WHERE id = ?")
+            .bind(c)
+            .bind(action_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(r) = &args.rationale {
+        sqlx::query("UPDATE actions SET rationale = ? WHERE id = ?")
+            .bind(r)
+            .bind(action_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(s) = &args.due_at {
+        let ts = DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.with_timezone(&Utc).timestamp());
+        sqlx::query("UPDATE actions SET due_at = ? WHERE id = ?")
+            .bind(ts)
+            .bind(action_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(new_status) = new_status {
+        sqlx::query("UPDATE actions SET status = ? WHERE id = ?")
+            .bind(new_status)
+            .bind(action_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Append (not replace) any extra evidence.
+    let mut appended_evidence = Vec::new();
+    if let Some(extras) = &args.evidence_external_ids {
+        for ext_id in extras {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT m.id FROM messages m \
+                 JOIN channels c ON c.id = m.channel_id \
+                 WHERE m.external_id = ? AND c.source_id = ? LIMIT 1",
+            )
+            .bind(ext_id)
+            .bind(scope.source_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((mid,)) = row else { continue };
+            // Skip if already linked.
+            let (existing,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM action_evidence WHERE action_id = ? AND message_id = ?",
+            )
+            .bind(action_id)
+            .bind(mid)
+            .fetch_one(&mut *tx)
+            .await?;
+            if existing > 0 {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+                 VALUES (?, ?, 'source', 0)",
+            )
+            .bind(action_id)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+            appended_evidence.push(ext_id.clone());
+        }
+    }
+
+    let now = Utc::now().timestamp();
+    let event_data = json!({
+        "title": args.title,
+        "details": args.details,
+        "confidence": args.confidence,
+        "rationale": args.rationale,
+        "due_at": args.due_at,
+        "status": new_status,
+    })
+    .to_string();
+    let evidence_json = serde_json::to_string(&appended_evidence)?;
+    sqlx::query(
+        "INSERT INTO action_events \
+         (action_id, event_kind, actor, data_json, evidence_external_ids, occurred_at) \
+         VALUES (?, 'amended', 'agent_amend', ?, ?, ?)",
+    )
+    .bind(action_id)
+    .bind(&event_data)
+    .bind(&evidence_json)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("inserting action_events amend row")?;
+
+    tx.commit().await?;
+
+    Ok(json!({
+        "action_id": format!("A-{action_id}"),
+        "amended": true,
     })
     .to_string())
 }

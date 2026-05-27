@@ -507,6 +507,122 @@ mod tests {
         Ok(())
     }
 
+    async fn ingest_extra_message(
+        pool: &SqlitePool,
+        source_id: i64,
+        channel_id: i64,
+        external_id: &str,
+    ) -> Result<()> {
+        let msg = ImportedMessage {
+            external_id: external_id.to_string(),
+            parent_external_id: None,
+            author: Some(ImportedAuthor {
+                external_id: "ana@example.com".to_string(),
+                display_name: Some("Ana".to_string()),
+                handle: None,
+            }),
+            posted_at: DateTime::<Utc>::from_timestamp(1_700_000_100, 0).unwrap(),
+            subject: Some("Follow-up".to_string()),
+            body: "And one more thing".to_string(),
+            body_format: "text".to_string(),
+            raw_json: None,
+            flags: 0,
+        };
+        ingest_batch(
+            pool,
+            SourceId(source_id),
+            channel_id,
+            &PollBatch {
+                messages: vec![msg],
+                next_cursor: Cursor("2:3".to_string()),
+                more_available: false,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_action_amends_fields_and_appends_evidence() -> Result<()> {
+        // Pin: the extractor needs a way to amend an action it (or a prior
+        // run) already created — without that, the only way to "revise" is
+        // to call record_action again, which produces near-duplicates.
+        // update_action takes the A-N id returned by record_action, patches
+        // only the provided fields, appends new evidence rather than
+        // replacing it, and logs an 'amended' event.
+        let (_tmp, pool, source_id, channel_id) = setup().await?;
+        ingest_extra_message(&pool, source_id, channel_id, "msg-2").await?;
+        let scope = ExtractionScope {
+            source_id,
+            channel_id,
+        };
+
+        // First, create an action and capture its id from the tool output.
+        let create_args = serde_json::json!({
+            "title": "Take a look",
+            "details": "Ana asked you to review.",
+            "confidence": "medium",
+            "rationale": "Implied ask",
+            "evidence_external_ids": ["msg-1"]
+        })
+        .to_string();
+        let created = tools::dispatch(&pool, scope, "record_action", &create_args).await;
+        assert!(created.recorded_action);
+        let created_json: serde_json::Value = serde_json::from_str(&created.output)?;
+        let action_ref = created_json
+            .get("action_id")
+            .and_then(|v| v.as_str())
+            .expect("record_action should return action_id")
+            .to_string();
+
+        // Amend: tighten title, bump confidence, add a second evidence msg.
+        let update_args = serde_json::json!({
+            "action_id": action_ref,
+            "title": "Review Ana's draft and reply",
+            "confidence": "high",
+            "evidence_external_ids": ["msg-2"]
+        })
+        .to_string();
+        let updated = tools::dispatch(&pool, scope, "update_action", &update_args).await;
+        assert!(
+            !updated.output.contains("error"),
+            "update_action returned an error: {}",
+            updated.output
+        );
+        assert!(
+            !updated.recorded_action,
+            "update_action should not be counted as a new recording"
+        );
+
+        // Action state reflects the amend.
+        let (title, confidence, status, details): (String, String, String, Option<String>) =
+            sqlx::query_as("SELECT title, confidence, status, details FROM actions LIMIT 1")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(title, "Review Ana's draft and reply");
+        assert_eq!(confidence, "high");
+        // Bumping medium→high should promote pending→auto_claimed.
+        assert_eq!(status, "auto_claimed");
+        // Untouched field stays put.
+        assert_eq!(details.as_deref(), Some("Ana asked you to review."));
+
+        // Evidence appended, not replaced.
+        let (evidence_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM action_evidence")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(evidence_count, 2);
+
+        // Audit trail: 'created' + 'amended'.
+        let kinds: Vec<(String,)> =
+            sqlx::query_as("SELECT event_kind FROM action_events ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        let kinds: Vec<String> = kinds.into_iter().map(|(k,)| k).collect();
+        assert_eq!(kinds, vec!["created".to_string(), "amended".to_string()]);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn medium_confidence_stays_pending() -> Result<()> {
         let (_tmp, pool, source_id, channel_id) = setup().await?;

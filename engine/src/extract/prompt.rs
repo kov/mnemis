@@ -75,7 +75,12 @@ pub fn build(inputs: &PromptInputs) -> String {
     );
 
     if !inputs.existing_actions.is_empty() {
-        out.push_str("# Existing pending actions for this channel (do NOT duplicate)\n");
+        out.push_str(
+            "# Existing actions for this channel\n\
+             These already exist. Each line is `[A-N] title` — if one of them needs more \
+             info or a correction based on what's in the window, amend it with \
+             update_action(action_id=\"A-N\", ...) instead of recording a new one.\n",
+        );
         for a in inputs.existing_actions {
             let due = a
                 .due_at
@@ -96,12 +101,21 @@ pub fn build(inputs: &PromptInputs) -> String {
          - search_messages(query): keyword/semantic search across recent messages for context\n\
          - fetch_message(external_id): full body of one message\n\
          - record_action(title, details, confidence, rationale, due_at?, evidence_external_ids[]): \
-           record one action; evidence_external_ids must reference at least one message\n\n\
+           record one action. Returns {\"action_id\": \"A-N\", ...} — hold onto the A-N id if \
+           you might need to revise the same action later in this response.\n\
+         - update_action(action_id, ...): amend an action you already recorded (or one from \
+           the Existing list above). Pass only the fields you want to change; extra evidence \
+           is appended, not replaced. Use this whenever you'd otherwise be tempted to record \
+           the same underlying item a second time.\n\n\
          # Process\n\
          1. Read the window below.\n\
-         2. For each candidate: judge against the criteria. Use the tools if you need prior context.\n\
-         3. Call record_action for each genuine action. Skip if it matches an existing pending action.\n\
-         4. Stop when finished. If no actions, just stop.\n\n",
+         2. For each actionable thing: judge against the criteria. Use the tools if you need prior context.\n\
+         3. Create exactly one action per actionable item. If you later spot the same item \
+            being mentioned again (or with more detail), amend the existing action via \
+            update_action rather than recording another one.\n\
+         4. Stop when finished. Your final message MUST reflect what you actually did — if \
+            you recorded actions, summarize them briefly; if you recorded none, say so. Do \
+            not say \"no actions found\" after calling record_action.\n\n",
     );
 
     out.push_str(&format!(
