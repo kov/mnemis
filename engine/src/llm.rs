@@ -1,5 +1,19 @@
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// Abstraction over the LLM transport so tests can swap in a scripted mock
+/// while production uses the real omlx HTTP client.
+#[async_trait]
+pub trait LlmTransport: Send + Sync {
+    async fn send(
+        &self,
+        instructions: &str,
+        input: Vec<InputItem>,
+        tools: &[ToolDef],
+        previous_response_id: Option<&str>,
+    ) -> Result<ResponsesResponse>;
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -118,8 +132,11 @@ impl LlmClient {
         self.bearer_token = Some(token.into());
         self
     }
+}
 
-    pub async fn send(
+#[async_trait]
+impl LlmTransport for LlmClient {
+    async fn send(
         &self,
         instructions: &str,
         input: Vec<InputItem>,

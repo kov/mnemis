@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tracing::{debug, warn};
 
-use crate::llm::{InputItem, LlmClient, OutputItem, Role};
+use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 
 pub mod prompt;
 pub mod tools;
@@ -25,7 +25,7 @@ pub struct ExtractionOutcome {
 
 pub async fn extract_for_channel(
     pool: &SqlitePool,
-    llm: &LlmClient,
+    llm: &dyn LlmTransport,
     channel_id: i64,
     model_name: &str,
 ) -> Result<ExtractionOutcome> {
@@ -264,7 +264,7 @@ async fn load_user_profile_for(pool: &SqlitePool, source_kind: &str) -> Result<U
 
 async fn run_agent_loop(
     pool: &SqlitePool,
-    llm: &LlmClient,
+    llm: &dyn LlmTransport,
     scope: ExtractionScope,
     system_prompt: String,
 ) -> Result<(usize, Option<String>)> {

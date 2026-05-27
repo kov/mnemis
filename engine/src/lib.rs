@@ -4,3 +4,4 @@ pub mod extract;
 pub mod ingest;
 pub mod llm;
 pub mod source;
+pub mod test_util;
