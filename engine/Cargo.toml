@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+mnemis-types = { path = "../types" }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
