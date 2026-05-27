@@ -1,5 +1,11 @@
 use chrono::{DateTime, Utc};
 
+/// Max chars of a message body rendered into the window. A single huge email
+/// (financial daily reports, mailing-list digests) can otherwise blow the
+/// model's context window. The model still has `fetch_message` to pull the
+/// full body when it actually needs it.
+const BODY_PROMPT_CAP_CHARS: usize = 4000;
+
 /// Inputs for prompt assembly. Pure-data so we can unit-test rendering.
 pub struct PromptInputs<'a> {
     pub source_kind: &'a str,
@@ -136,7 +142,22 @@ pub fn build(inputs: &PromptInputs) -> String {
         {
             out.push_str(&format!("Subject: {s}\n"));
         }
-        out.push_str(&m.body);
+        if m.body.len() > BODY_PROMPT_CAP_CHARS {
+            // Cap on byte length, but slice on a char boundary so we don't
+            // panic on multi-byte UTF-8 (matters for non-ASCII bodies).
+            let mut end = BODY_PROMPT_CAP_CHARS;
+            while !m.body.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&m.body[..end]);
+            out.push_str(&format!(
+                "\n[... {} chars truncated; fetch_message(\"{}\") for full body]",
+                m.body.len() - end,
+                m.external_id,
+            ));
+        } else {
+            out.push_str(&m.body);
+        }
         out.push_str("\n---\n");
     }
 
@@ -176,6 +197,68 @@ mod tests {
         assert!(rendered.contains("Subject: Hello"));
         assert!(rendered.contains("by Friday"));
         assert!(rendered.contains("# Window"));
+    }
+
+    #[test]
+    fn long_message_bodies_are_capped_with_a_marker_pointing_to_fetch_message() {
+        // Pin: a single huge body must not flood the prompt. The model still
+        // has fetch_message available if it needs the full content. This is
+        // the bound that keeps a backlog of long emails from blowing the
+        // context window (observed: 100 messages × ~3K tokens each).
+        let huge = "X".repeat(50_000);
+        let inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            current_time: dt(1_700_000_000),
+            existing_actions: &[],
+            window: &[WindowMessage {
+                external_id: "msg-huge".to_string(),
+                posted_at: dt(1_699_999_000),
+                author: "Ana".to_string(),
+                subject: Some("Daily report".to_string()),
+                body: huge,
+            }],
+        };
+        let rendered = build(&inputs);
+        let body_x_count = rendered.matches('X').count();
+        assert!(
+            body_x_count < 10_000,
+            "body should be truncated; saw {body_x_count} X chars"
+        );
+        assert!(
+            rendered.contains("truncated"),
+            "truncation marker missing from prompt"
+        );
+        assert!(
+            rendered.contains("fetch_message(\"msg-huge\")"),
+            "marker should tell the model how to get the full body"
+        );
+    }
+
+    #[test]
+    fn short_message_bodies_are_left_untouched() {
+        let inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            current_time: dt(1_700_000_000),
+            existing_actions: &[],
+            window: &[WindowMessage {
+                external_id: "msg-tiny".to_string(),
+                posted_at: dt(1_699_999_000),
+                author: "Ana".to_string(),
+                subject: None,
+                body: "Short ask".to_string(),
+            }],
+        };
+        let rendered = build(&inputs);
+        assert!(rendered.contains("Short ask"));
+        assert!(!rendered.contains("truncated"));
     }
 
     #[test]

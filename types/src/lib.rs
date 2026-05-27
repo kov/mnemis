@@ -145,3 +145,106 @@ pub struct ActionDto {
     /// Source display name (e.g. `fastmail`).
     pub source_name: Option<String>,
 }
+
+/// Map a long, raw error string from the engine (typically an anyhow chain
+/// from `SyncOutcome.errors`) into a short, human-friendly one-liner suitable
+/// for the toast. Falls back to a truncated copy of the raw text for
+/// patterns we haven't seen yet — so we never hide unknown failures, just
+/// shorten them.
+pub fn summarize_sync_error(raw: &str) -> String {
+    // Context window blown by oversize prompt.
+    if let Some(s) = parse_context_window(raw) {
+        return s;
+    }
+    // IMAP source had no credentials wired up.
+    if raw.contains("missing IMAP connection settings") {
+        return "Missing IMAP connection settings — check this source's config.".to_string();
+    }
+    // Transport-level network errors from reqwest.
+    if raw.contains("error sending request for url") {
+        return "Could not reach the LLM/embedding server (network or DNS).".to_string();
+    }
+    if raw.contains("connection refused") || raw.contains("Connection refused") {
+        return "Connection refused by the LLM/embedding server.".to_string();
+    }
+    // Auth errors.
+    if raw.contains("401") || raw.contains("Unauthorized") {
+        return "Authentication failed (HTTP 401) — check bearer token.".to_string();
+    }
+    // Unknown: truncate so the toast stays readable but the user still sees
+    // *something* actionable.
+    const MAX: usize = 200;
+    if raw.len() <= MAX {
+        raw.to_string()
+    } else {
+        let mut end = MAX;
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &raw[..end])
+    }
+}
+
+/// "Prompt too long: 154806 tokens exceeds max context window of 131072 tokens"
+fn parse_context_window(raw: &str) -> Option<String> {
+    let needle = "Prompt too long: ";
+    let i = raw.find(needle)? + needle.len();
+    let rest = &raw[i..];
+    let used: u32 = rest.split(' ').next()?.parse().ok()?;
+    let max_needle = "max context window of ";
+    let j = raw.find(max_needle)? + max_needle.len();
+    let rest = &raw[j..];
+    let max: u32 = rest.split(' ').next()?.parse().ok()?;
+    Some(format!(
+        "Window too large ({used} > {max} tokens) — message body or backlog too big."
+    ))
+}
+
+#[cfg(test)]
+mod summarize_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_context_window_overflow() {
+        let raw = "source 'fastmail' channel 'INBOX/Lembrar': extract failed: channel 6: \
+                   LLM send failed on turn 0: LLM API error (HTTP 400 Bad Request): \
+                   {\"error\":{\"message\":\"Prompt too long: 154806 tokens exceeds max \
+                   context window of 131072 tokens\",\"type\":\"invalid_request_error\"}}";
+        let s = summarize_sync_error(raw);
+        assert!(s.contains("154806"), "got: {s}");
+        assert!(s.contains("131072"), "got: {s}");
+        assert!(s.to_lowercase().contains("too large"), "got: {s}");
+    }
+
+    #[test]
+    fn classifies_missing_imap_settings() {
+        let raw = "source 'test-account' (id=1): missing IMAP connection settings: \
+                   no rows returned by a query that expected to return at least one row";
+        let s = summarize_sync_error(raw);
+        assert!(s.contains("Missing IMAP"));
+        assert!(s.len() < 200);
+    }
+
+    #[test]
+    fn classifies_network_failure() {
+        let raw = "error sending request for url (http://alface:1234/v1/embeddings): \
+                   connection error";
+        let s = summarize_sync_error(raw);
+        assert!(s.to_lowercase().contains("could not reach"));
+    }
+
+    #[test]
+    fn falls_back_to_truncated_raw_for_unknown_patterns() {
+        let raw = format!("some weird new failure: {}", "x".repeat(500));
+        let s = summarize_sync_error(&raw);
+        // 200 ASCII chars of body + 3-byte UTF-8 ellipsis.
+        assert!(s.len() <= 203, "got len {}", s.len());
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn passes_short_unknown_errors_through_unchanged() {
+        let raw = "boom";
+        assert_eq!(summarize_sync_error(raw), "boom");
+    }
+}

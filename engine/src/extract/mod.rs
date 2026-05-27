@@ -87,37 +87,47 @@ pub async fn extract_for_channel(
     };
     let outcome = run_agent_loop(pool, llm, scope, system_prompt).await;
 
-    let (result, actions_created, summary) = match outcome {
-        Ok((created, summary)) => ("ok", created, summary),
-        Err(e) => {
-            // {e:#} prints the full anyhow chain — without it we lose the
-            // underlying transport error and only see the outer context.
-            warn!(
-                error = format!("{e:#}"),
-                channel_id, "extraction agent failed"
-            );
-            ("error", 0, Some(format!("{e:#}")))
+    // Record the run first either way, then bubble the error so the
+    // orchestrator can surface it in SyncOutcome.errors → the toast.
+    // Swallowing it here meant per-channel extract failures were invisible
+    // in the UI even though they wrote to extraction_runs.
+    match outcome {
+        Ok((actions_created, summary)) => {
+            record_run(
+                pool,
+                channel_id,
+                up_to,
+                model_name,
+                "ok",
+                actions_created,
+                0,
+                summary.clone(),
+            )
+            .await?;
+            Ok(ExtractionOutcome {
+                result: "ok",
+                actions_created,
+                up_to_message_id: up_to,
+                summary,
+            })
         }
-    };
-
-    record_run(
-        pool,
-        channel_id,
-        up_to,
-        model_name,
-        result,
-        actions_created,
-        0,
-        summary.clone(),
-    )
-    .await?;
-
-    Ok(ExtractionOutcome {
-        result,
-        actions_created,
-        up_to_message_id: up_to,
-        summary,
-    })
+        Err(e) => {
+            let chain = format!("{e:#}");
+            warn!(error = %chain, channel_id, "extraction agent failed");
+            record_run(
+                pool,
+                channel_id,
+                up_to,
+                model_name,
+                "error",
+                0,
+                0,
+                Some(chain.clone()),
+            )
+            .await?;
+            Err(e.context(format!("channel {channel_id}")))
+        }
+    }
 }
 
 struct ChannelInfo {
@@ -385,9 +395,30 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::ingest::ingest_batch;
+    use crate::llm::ResponsesResponse;
     use crate::source::{Cursor, ImportedAuthor, ImportedMessage, PollBatch, SourceId};
+    use anyhow::bail;
+    use async_trait::async_trait;
     use chrono::Utc;
     use tempfile::TempDir;
+
+    /// An LlmTransport that always fails — for pinning the error-propagation
+    /// path. Mirrors what omlx returns when the prompt blows the context
+    /// window or the server is down.
+    struct FailingLlm(&'static str);
+
+    #[async_trait]
+    impl crate::llm::LlmTransport for FailingLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            _input: Vec<crate::llm::InputItem>,
+            _tools: &[crate::llm::ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<ResponsesResponse> {
+            bail!("{}", self.0)
+        }
+    }
 
     async fn setup() -> Result<(TempDir, SqlitePool, i64, i64)> {
         let tmp = TempDir::new()?;
@@ -553,6 +584,38 @@ mod tests {
             },
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extract_for_channel_propagates_agent_failure() -> Result<()> {
+        // Pin: when the LLM call fails (e.g. context window exceeded), the
+        // failure has to bubble back to the orchestrator so the toast can
+        // surface it. Previously we caught the error inside
+        // extract_for_channel, wrote result='error' to extraction_runs, and
+        // returned Ok — so per-channel failures were invisible in the UI.
+        let (_tmp, pool, _source_id, channel_id) = setup().await?;
+        let llm = FailingLlm(
+            "LLM API error (HTTP 400 Bad Request): Prompt too long: 154806 \
+             tokens exceeds max context window of 131072 tokens",
+        );
+        let result = extract_for_channel(&pool, &llm, channel_id, "test-model").await;
+        let err = result.expect_err("extract_for_channel should return Err when the agent fails");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("context window"),
+            "error chain should contain transport detail: {msg}"
+        );
+
+        // It still records the run so re-extraction can see what happened.
+        let (recorded_result, summary): (String, Option<String>) = sqlx::query_as(
+            "SELECT result, summary FROM extraction_runs WHERE channel_id = ? ORDER BY ran_at DESC LIMIT 1",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(recorded_result, "error");
+        assert!(summary.unwrap_or_default().contains("context window"));
         Ok(())
     }
 

@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use mnemis_types::{
     ActionDto, ActionStatus, Confidence, MessageDto, SourceHealth, StatusSnapshot, SyncOutcome,
+    summarize_sync_error,
 };
 
 use crate::{confidence_class, fetch_actions, fetch_status, run_sync_now, status_label, update_action};
@@ -231,7 +232,14 @@ pub fn StatusPanel() -> impl IntoView {
                         )}
                         {(!o.errors.is_empty()).then(|| view! {
                             <ul class="status-errors">
-                                {o.errors.iter().map(|e| view! { <li>{e.clone()}</li> }).collect_view()}
+                                {o.errors.iter().map(|e| {
+                                    let short = summarize_sync_error(e);
+                                    view! {
+                                        // title= keeps the full raw chain available on hover
+                                        // for the rare case the short summary is misleading.
+                                        <li title=e.clone()>{short}</li>
+                                    }
+                                }).collect_view()}
                             </ul>
                         })}
                     </div>
