@@ -85,6 +85,12 @@ The harness uses process groups (`setsid` at spawn, `kill(-pgid, ...)` at drop) 
 - For clippy with the `ui-probe` feature: `cargo clippy -p mnemis-app --bin ui-probe --features ui-probe -- -D warnings` (the feature is mnemis-app-only).
 - `app/ui` is a standalone workspace — its deps don't pollute the host build graph. Don't `cd` into it casually; if you do, `cd -` afterwards or use `--manifest-path`.
 
+## Platform notes
+
+- **macOS** is the tray-resident primary target. `app/src/tray.rs` (cfg-gated) installs a tray icon + "Show window / Sync now / Quit" menu; closing the main window hides it instead of exiting (Cmd+Q or tray Quit actually exits).
+- **Linux** runs as a regular window today — tray support (runtime detection of `org.kde.StatusNotifierWatcher` via zbus) is **Phase 7** per `v2-redesign` memory. Closing the window quits as usual.
+- Single-instance is wired everywhere via `tauri-plugin-single-instance`: a second launch focuses the existing window.
+
 ## Pointers (don't duplicate here)
 
 - Design rationale → memory `v2-redesign`

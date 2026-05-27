@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod tray;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,18 +17,18 @@ use tauri::{Manager, State};
 use tracing::{info, warn};
 
 /// Wraps shared mutable engine state held by the Tauri runtime.
-struct AppState {
-    pool: SqlitePool,
+pub(crate) struct AppState {
+    pub pool: SqlitePool,
     /// LLM + embedder, present when the user has a usable config.toml. If
     /// missing, sync_now is the only command that surfaces a clear error;
     /// read-only views continue to work.
-    llm_stack: Option<LlmStack>,
+    pub llm_stack: Option<LlmStack>,
 }
 
-struct LlmStack {
-    llm: LlmClient,
-    embedder: Arc<dyn Embedder>,
-    chat_model: String,
+pub(crate) struct LlmStack {
+    pub llm: LlmClient,
+    pub embedder: Arc<dyn Embedder>,
+    pub chat_model: String,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -96,6 +99,14 @@ fn main() {
     Box::leak(Box::new(rt));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Second launch: surface and focus the existing window instead.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .setup(|app| {
             let app_data = resolve_db_path(app)?;
             if let Some(parent) = app_data.parent() {
@@ -128,7 +139,30 @@ fn main() {
             };
 
             app.manage(AppState { pool, llm_stack });
+
+            // macOS: tray-resident. Linux/Windows: window-only for now.
+            // Linux runtime tray detection is Phase 7.
+            #[cfg(target_os = "macos")]
+            tray::install(app.handle())?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // macOS hide-to-tray: intercept close and hide the window.
+            // Cmd+Q / the tray Quit menu item exits normally.
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            // Silence unused-var warnings on non-macOS.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = window;
+                let _ = event;
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_actions,
