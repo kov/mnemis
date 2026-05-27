@@ -5,6 +5,7 @@ use mnemis_engine::db;
 use mnemis_engine::embed::{Embedder, OmlxEmbedder, drain_once};
 use mnemis_engine::extract::{extract_for_channel, prompt};
 use mnemis_engine::llm::LlmClient;
+use mnemis_engine::maintenance;
 use mnemis_engine::orchestrator::{self, build_imap_source};
 use mnemis_engine::secrets;
 use mnemis_engine::source::Source;
@@ -360,5 +361,35 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
         window: &window,
     };
     println!("{}", prompt::build(&inputs));
+    Ok(())
+}
+
+pub async fn reset_data(cfg: &Config, yes: bool) -> Result<()> {
+    let path = cfg.db_path();
+    let pool = db::open(&path).await?;
+    db::migrate(&pool).await?;
+
+    println!("DB: {}", path.display());
+    let before = maintenance::count_user_data(&pool).await?;
+    println!("== BEFORE ==");
+    for (t, n) in &before {
+        println!("  {t:<22} {n}");
+    }
+
+    if !yes {
+        println!();
+        println!("(dry run) re-run with --yes to actually clear.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Clearing...");
+    let counts = maintenance::reset_data(&pool).await?;
+    println!("== AFTER ==");
+    for (t, n) in &counts.after {
+        println!("  {t:<22} {n}");
+    }
+    println!();
+    println!("done.");
     Ok(())
 }

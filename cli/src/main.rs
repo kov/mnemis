@@ -53,6 +53,14 @@ enum Command {
     },
     /// Drain the embed queue once against the configured embedding model. For debugging.
     EmbedOnce,
+    /// Zero out user data (messages, actions, embeddings, etc.) while keeping
+    /// sources, channels, contacts, settings, and user_profile. Source/channel
+    /// cursors are rewound so the next sync re-bootstraps.
+    ResetData {
+        /// Actually perform the wipe. Without this flag, prints counts only.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,5 +108,6 @@ async fn main() -> Result<()> {
         Command::DumpPrompt { channel_id } => commands::dump_prompt(&cfg, channel_id).await,
         Command::Extract { channel_id } => commands::extract(&cfg, channel_id).await,
         Command::EmbedOnce => commands::embed_once(&cfg).await,
+        Command::ResetData { yes } => commands::reset_data(&cfg, yes).await,
     }
 }
