@@ -50,6 +50,49 @@ impl ActionStatus {
     }
 }
 
+/// Health of a single configured source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceHealth {
+    Ok,
+    Warning,
+    Failed,
+    Disabled,
+}
+
+impl SourceHealth {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ok" => Some(Self::Ok),
+            "warning" => Some(Self::Warning),
+            "failed" => Some(Self::Failed),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceStatus {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub health: SourceHealth,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: i64,
+}
+
+/// Overall application status snapshot for the status panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    pub sources: Vec<SourceStatus>,
+    /// Pending items in the embedding queue.
+    pub embed_queue_depth: i64,
+    /// Most recent successful or failed extraction run, across all channels.
+    pub last_extraction_at: Option<i64>,
+}
+
 /// A single message as rendered in the inbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDto {

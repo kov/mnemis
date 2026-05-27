@@ -46,6 +46,62 @@ h1 {
   font-weight: 600;
 }
 
+.status-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-panel {
+    background: rgba(255, 255, 255, 0.04);
+  }
+}
+
+.status-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.status-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-source::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-source.status-ok { color: var(--high); }
+.status-source.status-warning { color: var(--medium); }
+.status-source.status-failed { color: #b04040; }
+.status-source.status-disabled { color: var(--muted); opacity: 0.6; }
+
+.status-empty { font-style: italic; }
+
+.status-meta {
+  display: flex;
+  gap: 16px;
+  color: var(--muted);
+}
+
+.status-loading { color: var(--muted); }
+.status-error { color: #b04040; }
+
 .nav {
   display: flex;
   gap: 18px;

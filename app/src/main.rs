@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use mnemis_engine::{db, queries};
-use mnemis_types::{ActionDto, MessageDto};
+use mnemis_types::{ActionDto, MessageDto, StatusSnapshot};
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
 use tracing::info;
@@ -34,6 +34,13 @@ async fn list_messages(
         None => queries::MessageFilter::default(),
     };
     queries::list_messages(&state.pool, filter)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_status(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
+    queries::get_status(&state.pool)
         .await
         .map_err(|e| e.to_string())
 }
@@ -75,7 +82,11 @@ fn main() {
             app.manage(AppState { pool });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_actions, list_messages])
+        .invoke_handler(tauri::generate_handler![
+            list_actions,
+            list_messages,
+            get_status
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

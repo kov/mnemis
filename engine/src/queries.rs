@@ -2,7 +2,9 @@
 //! defined in `mnemis-types`. Used by Tauri commands and CLI commands.
 
 use anyhow::{Context, Result};
-use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto};
+use mnemis_types::{
+    ActionDto, ActionStatus, Confidence, MessageDto, SourceHealth, SourceStatus, StatusSnapshot,
+};
 use sqlx::SqlitePool;
 
 const SNIPPET_LEN: usize = 160;
@@ -179,6 +181,61 @@ fn snippet(body: &str) -> String {
     }
 }
 
+/// Snapshot for the status panel: per-source health + embed-queue depth +
+/// most-recent extraction timestamp.
+#[allow(clippy::type_complexity)]
+pub async fn get_status(pool: &SqlitePool) -> Result<StatusSnapshot> {
+    let source_rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT id, name, kind, status, last_synced_at, last_error, consecutive_failures \
+         FROM sources ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("loading sources for status")?;
+
+    let sources = source_rows
+        .into_iter()
+        .map(
+            |(id, name, kind, status, last_synced_at, last_error, consecutive_failures)| {
+                SourceStatus {
+                    id,
+                    name,
+                    kind,
+                    health: SourceHealth::parse(&status).unwrap_or(SourceHealth::Warning),
+                    last_synced_at,
+                    last_error,
+                    consecutive_failures,
+                }
+            },
+        )
+        .collect();
+
+    let (embed_queue_depth,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue")
+        .fetch_one(pool)
+        .await
+        .context("counting embed queue")?;
+
+    let last_extraction_at: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT MAX(ran_at) FROM extraction_runs WHERE result IN ('ok', 'error')")
+            .fetch_optional(pool)
+            .await?;
+    let last_extraction_at = last_extraction_at.and_then(|(opt,)| opt);
+
+    Ok(StatusSnapshot {
+        sources,
+        embed_queue_depth,
+        last_extraction_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +379,69 @@ mod tests {
         assert_eq!(rows[1].snippet, "first line");
         assert!(!rows[0].has_action);
         assert!(rows[1].has_action);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_status_reports_fresh_db_as_empty() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let s = get_status(&pool).await?;
+        assert!(s.sources.is_empty());
+        assert_eq!(s.embed_queue_depth, 0);
+        assert!(s.last_extraction_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_status_reflects_source_and_queue_state() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+
+        sqlx::query(
+            "INSERT INTO sources (kind, name, config_ref, created_at, status, last_synced_at, \
+                                  last_error, consecutive_failures) \
+             VALUES ('imap', 'work', 'kc/work', ?, 'warning', ?, 'transient error', 1)",
+        )
+        .bind(now)
+        .bind(now - 60)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO embed_queue (target_kind, target_id, text_hash, enqueued_at) \
+             VALUES ('message', 1, 'h1', ?), ('message', 2, 'h2', ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (1, 'INBOX', 'INBOX', 'mailbox')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO extraction_runs (channel_id, ran_at, model, prompt_version, result, \
+                                          messages_pending_embed) \
+             VALUES (1, ?, 'm', 1, 'ok', 0)",
+        )
+        .bind(now - 30)
+        .execute(&pool)
+        .await?;
+
+        let s = get_status(&pool).await?;
+        assert_eq!(s.sources.len(), 1);
+        let src = &s.sources[0];
+        assert_eq!(src.name, "work");
+        assert_eq!(src.health, SourceHealth::Warning);
+        assert_eq!(src.consecutive_failures, 1);
+        assert_eq!(src.last_synced_at, Some(now - 60));
+        assert_eq!(s.embed_queue_depth, 2);
+        assert_eq!(s.last_extraction_at, Some(now - 30));
         Ok(())
     }
 }

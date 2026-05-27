@@ -76,7 +76,13 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     // 3. Open a session pointing at the seeded DB.
     let client = harness.open_session(&app_bin).await?;
 
-    // 4. Wait for the app shell, give Suspense a beat.
+    // 4. Wait for the app shell + status panel, give Suspense a beat.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.status-panel"))
+        .await
+        .context("waiting for div.status-panel")?;
     client
         .wait()
         .at_most(SETTLE_TIMEOUT)
@@ -84,6 +90,23 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         .await
         .context("waiting for div.app")?;
     tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // 4a. Status panel shows the seeded source + embed-queue depth (0 in seed).
+    let status_text = client
+        .find(Locator::Css("div.status-panel"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        status_text.contains("work"),
+        "status panel should list the 'work' source. got: {status_text}"
+    );
+    assert!(
+        status_text.contains("embed queue: 0"),
+        "status panel should show an empty embed queue. got: {status_text}"
+    );
 
     // 5. Dump what the user sees.
     let body_text = client

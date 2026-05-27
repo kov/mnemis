@@ -1,7 +1,7 @@
 use leptos::prelude::*;
-use mnemis_types::{ActionDto, Confidence, MessageDto};
+use mnemis_types::{ActionDto, Confidence, MessageDto, SourceHealth, StatusSnapshot};
 
-use crate::{confidence_class, status_label};
+use crate::{confidence_class, fetch_status, status_label};
 
 #[component]
 pub fn ActionsList(rows: Vec<ActionDto>) -> impl IntoView {
@@ -127,6 +127,81 @@ fn MessageRow(msg: MessageDto) -> impl IntoView {
             <div class="message-snippet">{msg.snippet.clone()}</div>
             <div class="message-meta">{format!("{source} · {channel}")}</div>
         </div>
+    }
+}
+
+#[component]
+pub fn StatusPanel() -> impl IntoView {
+    let status = LocalResource::new(|| async move { fetch_status().await });
+    view! {
+        <div class="status-panel">
+            <Suspense fallback=|| view! { <span class="status-loading">"…"</span> }>
+                {move || status.get().map(|res| match res {
+                    Ok(s) => view! { <StatusPanelInner snap=s /> }.into_any(),
+                    Err(e) => view! { <span class="status-error">{format!("status error: {e}")}</span> }.into_any(),
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
+fn StatusPanelInner(snap: StatusSnapshot) -> impl IntoView {
+    let queue = snap.embed_queue_depth;
+    let last_extraction = snap
+        .last_extraction_at
+        .map(format_relative)
+        .map(|t| format!("last extract {t} ago"))
+        .unwrap_or_else(|| "never extracted".to_string());
+
+    view! {
+        <div class="status-sources">
+            {if snap.sources.is_empty() {
+                view! { <span class="status-empty">"no sources configured"</span> }.into_any()
+            } else {
+                view! {
+                    <For
+                        each=move || snap.sources.clone()
+                        key=|s| s.id
+                        children=move |s| {
+                            let cls = health_class(s.health);
+                            let label = health_label(s.health);
+                            let when = s.last_synced_at
+                                .map(format_relative)
+                                .map(|t| format!(" ({t} ago)"))
+                                .unwrap_or_default();
+                            view! {
+                                <span class=format!("status-source {cls}") title=s.last_error.clone().unwrap_or_default()>
+                                    {format!("{}: {}{}", s.name, label, when)}
+                                </span>
+                            }
+                        }
+                    />
+                }.into_any()
+            }}
+        </div>
+        <div class="status-meta">
+            <span class="status-queue">{format!("embed queue: {queue}")}</span>
+            <span class="status-extraction">{last_extraction}</span>
+        </div>
+    }
+}
+
+fn health_class(h: SourceHealth) -> &'static str {
+    match h {
+        SourceHealth::Ok => "status-ok",
+        SourceHealth::Warning => "status-warning",
+        SourceHealth::Failed => "status-failed",
+        SourceHealth::Disabled => "status-disabled",
+    }
+}
+
+fn health_label(h: SourceHealth) -> &'static str {
+    match h {
+        SourceHealth::Ok => "ok",
+        SourceHealth::Warning => "warning",
+        SourceHealth::Failed => "failed",
+        SourceHealth::Disabled => "disabled",
     }
 }
 

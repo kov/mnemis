@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
-use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto};
+use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto, StatusSnapshot};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -44,6 +44,13 @@ async fn fetch_messages(limit: Option<i64>) -> Result<Vec<MessageDto>, String> {
     serde_wasm_bindgen::from_value::<Vec<MessageDto>>(raw).map_err(|e| e.to_string())
 }
 
+async fn fetch_status() -> Result<StatusSnapshot, String> {
+    let raw = invoke("get_status", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<StatusSnapshot>(raw).map_err(|e| e.to_string())
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     mount_to_body(App);
@@ -54,6 +61,7 @@ fn App() -> impl IntoView {
     view! {
         <Router>
             <div class="app">
+                <components::StatusPanel />
                 <nav class="nav">
                     <A href="/">"Actions"</A>
                     <A href="/inbox">"Inbox"</A>
