@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use tracing::{debug, warn};
+use std::time::Instant;
+use tracing::{debug, trace, warn};
 
 use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 
@@ -89,8 +90,13 @@ pub async fn extract_for_channel(
     let (result, actions_created, summary) = match outcome {
         Ok((created, summary)) => ("ok", created, summary),
         Err(e) => {
-            warn!(error = %e, channel_id, "extraction agent failed");
-            ("error", 0, Some(e.to_string()))
+            // {e:#} prints the full anyhow chain — without it we lose the
+            // underlying transport error and only see the outer context.
+            warn!(
+                error = format!("{e:#}"),
+                channel_id, "extraction agent failed"
+            );
+            ("error", 0, Some(format!("{e:#}")))
         }
     };
 
@@ -277,6 +283,8 @@ async fn run_agent_loop(
     let mut actions_created = 0usize;
 
     for turn in 0..MAX_AGENT_TURNS {
+        let t = Instant::now();
+        trace!(turn, channel_id = scope.channel_id, "LLM: send");
         let response = llm
             .send(
                 &system_prompt,
@@ -286,6 +294,12 @@ async fn run_agent_loop(
             )
             .await
             .with_context(|| format!("LLM send failed on turn {turn}"))?;
+        trace!(
+            turn,
+            channel_id = scope.channel_id,
+            secs = t.elapsed().as_secs(),
+            "LLM: recv"
+        );
         last_response_id = Some(response.id);
 
         let mut function_calls = Vec::new();

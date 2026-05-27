@@ -10,7 +10,14 @@ use crate::{confidence_class, fetch_actions, fetch_status, run_sync_now, status_
 
 #[component]
 pub fn ActionsPage() -> impl IntoView {
-    let actions = LocalResource::new(|| async move { fetch_actions(false).await });
+    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let actions = LocalResource::new(move || {
+        // Subscribing to sync_tick here makes the resource re-fetch whenever
+        // StatusPanel bumps it after a successful sync, so the user doesn't
+        // have to navigate away and back to see fresh actions.
+        let _ = sync_tick.get();
+        async move { fetch_actions(false).await }
+    });
     let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || actions.refetch());
 
     view! {
@@ -166,7 +173,12 @@ fn show_button(current: ActionStatus, target: ActionStatus) -> bool {
 
 #[component]
 pub fn StatusPanel() -> impl IntoView {
-    let status = LocalResource::new(|| async move { fetch_status().await });
+    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let status = LocalResource::new(move || {
+        // Status panel also reacts to sync_tick so source health stays fresh.
+        let _ = sync_tick.get();
+        async move { fetch_status().await }
+    });
     let syncing = RwSignal::new(false);
     let last_outcome: RwSignal<Option<Result<SyncOutcome, String>>> = RwSignal::new(None);
 
@@ -178,9 +190,18 @@ pub fn StatusPanel() -> impl IntoView {
         last_outcome.set(None);
         spawn_local(async move {
             let result = run_sync_now().await;
+            let succeeded = result.is_ok();
             last_outcome.set(Some(result));
             syncing.set(false);
-            status.refetch();
+            if succeeded {
+                // Bump the tick so resources subscribed to it (Actions,
+                // Inbox, Status itself) all refetch on their own. Without
+                // this the user has to navigate away and back to see new
+                // data.
+                sync_tick.update(|v| *v += 1);
+            } else {
+                status.refetch();
+            }
         });
     };
 

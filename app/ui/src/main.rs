@@ -89,6 +89,11 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
+    // Bumped after every successful sync. Resources that should react to a
+    // sync read this signal so they automatically refetch — saves the user
+    // from having to nav away and back.
+    provide_context(RwSignal::new(0u32));
+
     view! {
         <Router>
             <div class="app">
@@ -113,7 +118,13 @@ fn ActionsPage() -> impl IntoView {
 
 #[component]
 fn InboxPage() -> impl IntoView {
-    let messages = LocalResource::new(|| async move { fetch_messages(None).await });
+    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let messages = LocalResource::new(move || {
+        // Subscribing to sync_tick here makes the resource re-fetch whenever
+        // StatusPanel bumps it after a successful sync.
+        let _ = sync_tick.get();
+        async move { fetch_messages(None).await }
+    });
     view! {
         <h1>"Inbox"</h1>
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>

@@ -13,7 +13,8 @@ use chrono::Utc;
 use mnemis_types::SyncOutcome;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tracing::warn;
+use std::time::Instant;
+use tracing::{info, trace, warn};
 
 use crate::embed::{Embedder, drain_once};
 use crate::extract::extract_for_channel;
@@ -41,9 +42,25 @@ pub async fn sync_now(
             .await
             .context("listing sources")?;
 
+    info!(count = sources.len(), "sync starting");
+    let sync_started = Instant::now();
+
     for (source_id, source_name) in sources {
+        let started = Instant::now();
+        info!(source_id, source_name = %source_name, "source: start");
         match sync_one_source(pool, source_id, &source_name, llm, &embedder, model_name).await {
             Ok(counts) => {
+                info!(
+                    source_id,
+                    source_name = %source_name,
+                    channels = counts.channels_polled,
+                    messages = counts.messages_ingested,
+                    embeddings = counts.embeddings_drained,
+                    actions = counts.actions_created,
+                    errors = counts.errors.len(),
+                    secs = started.elapsed().as_secs(),
+                    "source: done"
+                );
                 out.sources_synced += 1;
                 out.channels_polled += counts.channels_polled;
                 out.messages_ingested += counts.messages_ingested;
@@ -54,7 +71,15 @@ pub async fn sync_now(
             }
             Err(e) => {
                 let msg = format!("source '{source_name}' (id={source_id}): {e:#}");
-                warn!(error = %e, source_id, source_name, "source sync failed");
+                // {e:#} expands the anyhow chain — the outer "source sync
+                // failed" alone is rarely enough to tell what actually broke.
+                warn!(
+                    error = format!("{e:#}"),
+                    source_id,
+                    source_name = %source_name,
+                    secs = started.elapsed().as_secs(),
+                    "source: failed"
+                );
                 out.sources_failed += 1;
                 out.errors.push(msg.clone());
                 mark_source_failure(pool, source_id, &format!("{e:#}"))
@@ -65,9 +90,32 @@ pub async fn sync_now(
     }
 
     // Final embed pass picks up actions/notes enqueued during this cycle.
-    if let Ok(n) = drain_once(pool, embedder.as_ref()).await {
-        out.embeddings_drained += n as i64;
+    let drain_started = Instant::now();
+    match drain_once(pool, embedder.as_ref()).await {
+        Ok(n) => {
+            out.embeddings_drained += n as i64;
+            if n > 0 {
+                info!(
+                    count = n,
+                    secs = drain_started.elapsed().as_secs(),
+                    "final embed drain"
+                );
+            }
+        }
+        Err(e) => warn!(error = format!("{e:#}"), "final embed drain failed"),
     }
+
+    info!(
+        sources_synced = out.sources_synced,
+        sources_failed = out.sources_failed,
+        channels = out.channels_polled,
+        messages = out.messages_ingested,
+        actions = out.actions_created,
+        embeddings = out.embeddings_drained,
+        errors = out.errors.len(),
+        secs = sync_started.elapsed().as_secs(),
+        "sync done"
+    );
 
     Ok(out)
 }
@@ -98,13 +146,27 @@ async fn sync_one_source(
     .await
     .context("listing channels")?;
 
+    let total_channels = channels.len();
     let mut counts = SourceCounts::default();
-    for (channel_id, external_id, cursor) in channels {
+    for (idx, (channel_id, external_id, cursor)) in channels.into_iter().enumerate() {
         counts.channels_polled += 1;
+        let ch_started = Instant::now();
+        info!(
+            channel_id,
+            channel = %external_id,
+            progress = format!("{}/{total_channels}", idx + 1),
+            "channel: start"
+        );
         let cursor = cursor.map(Cursor);
         let batch = match source.poll(&external_id, cursor.as_ref()).await {
             Ok(b) => b,
             Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    channel_id,
+                    channel = %external_id,
+                    "channel: poll failed"
+                );
                 counts.errors.push(format!(
                     "source '{source_name}' channel '{external_id}': poll failed: {e:#}"
                 ));
@@ -114,24 +176,83 @@ async fn sync_one_source(
 
         let inserted = ingest_batch(pool, SourceId(source_id), channel_id, &batch).await?;
         counts.messages_ingested += inserted as i64;
+        trace!(channel_id, ingested = inserted, "channel: ingested");
 
         if inserted == 0 {
+            info!(
+                channel_id,
+                channel = %external_id,
+                ingested = 0,
+                secs = ch_started.elapsed().as_secs(),
+                "channel: done"
+            );
             continue;
         }
 
+        let mut ch_embedded = 0i64;
+        let mut ch_embed_err: Option<String> = None;
         match drain_once(pool, embedder.as_ref()).await {
-            Ok(n) => counts.embeddings_drained += n as i64,
-            Err(e) => counts.errors.push(format!(
-                "source '{source_name}' channel '{external_id}': embed failed: {e:#}"
-            )),
+            Ok(n) => {
+                ch_embedded = n as i64;
+                counts.embeddings_drained += n as i64;
+                trace!(channel_id, embedded = n, "channel: embedded");
+            }
+            Err(e) => {
+                ch_embed_err = Some(format!("{e:#}"));
+                warn!(
+                    error = format!("{e:#}"),
+                    channel_id,
+                    channel = %external_id,
+                    "channel: embed failed"
+                );
+                counts.errors.push(format!(
+                    "source '{source_name}' channel '{external_id}': embed failed: {e:#}"
+                ));
+            }
         }
 
+        let ex_started = Instant::now();
+        trace!(channel_id, "channel: extracting");
+        let mut ch_actions = 0usize;
+        let mut ch_extract_err: Option<String> = None;
         match extract_for_channel(pool, llm, channel_id, model_name).await {
-            Ok(o) => counts.actions_created += o.actions_created as i64,
-            Err(e) => counts.errors.push(format!(
-                "source '{source_name}' channel '{external_id}': extract failed: {e:#}"
-            )),
+            Ok(o) => {
+                ch_actions = o.actions_created;
+                counts.actions_created += o.actions_created as i64;
+                trace!(
+                    channel_id,
+                    actions = o.actions_created,
+                    result = o.result,
+                    secs = ex_started.elapsed().as_secs(),
+                    "channel: extracted"
+                );
+            }
+            Err(e) => {
+                ch_extract_err = Some(format!("{e:#}"));
+                warn!(
+                    error = format!("{e:#}"),
+                    channel_id,
+                    channel = %external_id,
+                    secs = ex_started.elapsed().as_secs(),
+                    "channel: extract failed"
+                );
+                counts.errors.push(format!(
+                    "source '{source_name}' channel '{external_id}': extract failed: {e:#}"
+                ));
+            }
         }
+
+        info!(
+            channel_id,
+            channel = %external_id,
+            ingested = inserted,
+            embedded = ch_embedded,
+            actions = ch_actions,
+            embed_err = ch_embed_err.is_some(),
+            extract_err = ch_extract_err.is_some(),
+            secs = ch_started.elapsed().as_secs(),
+            "channel: done"
+        );
     }
 
     Ok(counts)
