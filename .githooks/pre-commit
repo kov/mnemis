@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit checks for mnemis. To enable in this clone:
+#   git config core.hooksPath .githooks
+
+cargo fmt --all -- --check || {
+    echo "cargo fmt found issues; run 'cargo fmt --all' to fix" >&2
+    exit 1
+}
+
+cargo clippy --workspace --all-targets -- -D warnings || {
+    echo "cargo clippy found issues" >&2
+    exit 1
+}
