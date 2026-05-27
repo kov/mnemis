@@ -21,6 +21,8 @@ use tracing::{error, info, warn};
 use super::AppState;
 
 pub fn install(app: &AppHandle) -> Result<()> {
+    info!("installing tray icon");
+
     let show = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
     let sync = MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit mnemis", true, None::<&str>)?;
@@ -30,9 +32,19 @@ pub fn install(app: &AppHandle) -> Result<()> {
         .default_window_icon()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no default window icon configured"))?;
+    info!(
+        icon_w = icon.width(),
+        icon_h = icon.height(),
+        "loaded default window icon for tray"
+    );
 
-    let _tray = TrayIconBuilder::with_id("main")
+    let tray = TrayIconBuilder::with_id("main")
         .icon(icon)
+        // macOS menu bar wants template images (black-on-transparent, OS
+        // recolors). Our placeholder is colored RGBA, which renders weirdly
+        // — flag template here so the icon is at least visible while we
+        // ship a proper template asset later.
+        .icon_as_template(true)
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -42,6 +54,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
             _ => {}
         })
         .build(app)?;
+    info!(tray_id = ?tray.id(), "tray icon installed");
     Ok(())
 }
 
