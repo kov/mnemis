@@ -2,3 +2,20 @@
 name = "mnemis-engine"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.44", features = ["serde"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlite-vec = "0.1.9"
+sqlx = { version = "0.9.0", features = ["sqlite-bundled", "runtime-tokio", "macros", "migrate", "chrono"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
