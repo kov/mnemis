@@ -1,0 +1,357 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::SqlitePool;
+
+use crate::llm::ToolDef;
+
+/// Snapshot of which channel + source an extraction run is scoped to.
+/// Used by tool dispatch to scope DB lookups appropriately.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionScope {
+    pub source_id: i64,
+    pub channel_id: i64,
+}
+
+pub fn definitions() -> Vec<ToolDef> {
+    vec![
+        ToolDef::function(
+            "search_messages".to_string(),
+            "Keyword search across messages in this source. Returns up to 10 matches \
+             with external_id, channel, posted_at, and a short snippet."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                },
+                "required": ["query"]
+            }),
+        ),
+        ToolDef::function(
+            "fetch_message".to_string(),
+            "Fetch the full body of a single message by its external_id.".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "external_id": { "type": "string" }
+                },
+                "required": ["external_id"]
+            }),
+        ),
+        ToolDef::function(
+            "record_action".to_string(),
+            "Record one action item. evidence_external_ids must reference at least one \
+             message visible in the window or fetched via fetch_message."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "title":      { "type": "string", "description": "imperative, ≤80 chars" },
+                    "details":    { "type": "string", "description": "1-3 sentences of context" },
+                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                    "rationale":  { "type": "string", "description": "≤200 chars, why this is an action" },
+                    "due_at":     { "type": ["string", "null"], "description": "ISO 8601 timestamp or null" },
+                    "evidence_external_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                    }
+                },
+                "required": ["title", "details", "confidence", "rationale", "evidence_external_ids"]
+            }),
+        ),
+    ]
+}
+
+/// Result of dispatching a single tool call.
+pub struct DispatchOutput {
+    /// JSON string returned to the model as the function_call_output.
+    pub output: String,
+    /// Whether this call recorded a new action (for run summary).
+    pub recorded_action: bool,
+}
+
+pub async fn dispatch(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    name: &str,
+    arguments: &str,
+) -> DispatchOutput {
+    let result = match name {
+        "search_messages" => search_messages(pool, scope, arguments).await,
+        "fetch_message" => fetch_message(pool, scope, arguments).await,
+        "record_action" => match record_action(pool, scope, arguments).await {
+            Ok(json) => {
+                return DispatchOutput {
+                    output: json,
+                    recorded_action: true,
+                };
+            }
+            Err(e) => Err(e),
+        },
+        other => Err(anyhow::anyhow!("unknown tool: {other}")),
+    };
+
+    let output = match result {
+        Ok(json) => json,
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    };
+    DispatchOutput {
+        output,
+        recorded_action: false,
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchArgs {
+    query: String,
+}
+
+#[derive(Serialize)]
+struct SearchHit {
+    external_id: String,
+    posted_at: String,
+    snippet: String,
+    channel: String,
+}
+
+async fn search_messages(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    arguments: &str,
+) -> Result<String> {
+    let args: SearchArgs =
+        serde_json::from_str(arguments).context("parsing search_messages args")?;
+    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT m.external_id, m.posted_at, m.body, c.name \
+         FROM messages_fts \
+         JOIN messages m ON m.id = messages_fts.rowid \
+         JOIN channels c ON c.id = m.channel_id \
+         WHERE messages_fts MATCH ? AND c.source_id = ? \
+         ORDER BY rank LIMIT 10",
+    )
+    .bind(&args.query)
+    .bind(scope.source_id)
+    .fetch_all(pool)
+    .await
+    .context("FTS search failed")?;
+
+    let hits: Vec<SearchHit> = rows
+        .into_iter()
+        .map(|(external_id, posted_at, body, channel)| SearchHit {
+            external_id,
+            posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+            snippet: snippet(&body, 200),
+            channel,
+        })
+        .collect();
+    Ok(serde_json::to_string(&hits)?)
+}
+
+#[derive(Deserialize)]
+struct FetchArgs {
+    external_id: String,
+}
+
+#[derive(Serialize)]
+struct FetchedMessage {
+    external_id: String,
+    posted_at: String,
+    author: Option<String>,
+    subject: Option<String>,
+    body: String,
+}
+
+#[allow(clippy::type_complexity)]
+async fn fetch_message(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    arguments: &str,
+) -> Result<String> {
+    let args: FetchArgs = serde_json::from_str(arguments).context("parsing fetch_message args")?;
+    let row: Option<(String, i64, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body \
+         FROM messages m \
+         LEFT JOIN people p ON p.id = m.author_id \
+         JOIN channels c ON c.id = m.channel_id \
+         WHERE m.external_id = ? AND c.source_id = ?",
+    )
+    .bind(&args.external_id)
+    .bind(scope.source_id)
+    .fetch_optional(pool)
+    .await
+    .context("fetch_message lookup failed")?;
+
+    match row {
+        Some((external_id, posted_at, author, subject, body)) => {
+            let fetched = FetchedMessage {
+                external_id,
+                posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_default(),
+                author,
+                subject,
+                body,
+            };
+            Ok(serde_json::to_string(&fetched)?)
+        }
+        None => Ok(json!({ "error": "message not found" }).to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecordArgs {
+    title: String,
+    details: String,
+    confidence: String,
+    rationale: String,
+    #[serde(default)]
+    due_at: Option<String>,
+    evidence_external_ids: Vec<String>,
+}
+
+async fn record_action(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    arguments: &str,
+) -> Result<String> {
+    let args: RecordArgs = serde_json::from_str(arguments).context("parsing record_action args")?;
+
+    if !["high", "medium", "low"].contains(&args.confidence.as_str()) {
+        anyhow::bail!("invalid confidence: {}", args.confidence);
+    }
+    if args.evidence_external_ids.is_empty() {
+        anyhow::bail!("evidence_external_ids must contain at least one id");
+    }
+
+    let now = Utc::now().timestamp();
+    let due_at_ts = args
+        .due_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc).timestamp());
+
+    let initial_status = if args.confidence == "high" {
+        "auto_claimed"
+    } else {
+        "pending"
+    };
+    let actor = if args.confidence == "high" {
+        "agent_auto"
+    } else {
+        "agent_queued"
+    };
+
+    let mut tx = pool.begin().await?;
+
+    let (action_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO actions \
+         (title, details, confidence, rationale, status, due_at, extracted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(&args.title)
+    .bind(&args.details)
+    .bind(&args.confidence)
+    .bind(&args.rationale)
+    .bind(initial_status)
+    .bind(due_at_ts)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    .context("inserting action")?;
+
+    // Resolve evidence message ids (scoped to source — extractor can fetch across channels).
+    let mut evidence_ids = Vec::new();
+    for (i, ext_id) in args.evidence_external_ids.iter().enumerate() {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT m.id FROM messages m \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE m.external_id = ? AND c.source_id = ? \
+             LIMIT 1",
+        )
+        .bind(ext_id)
+        .bind(scope.source_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((mid,)) = row {
+            sqlx::query(
+                "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+                 VALUES (?, ?, 'source', ?)",
+            )
+            .bind(action_id)
+            .bind(mid)
+            .bind(if i == 0 { 1 } else { 0 })
+            .execute(&mut *tx)
+            .await
+            .context("inserting action_evidence")?;
+            evidence_ids.push(mid);
+        }
+    }
+
+    if evidence_ids.is_empty() {
+        // No real evidence found — roll back.
+        tx.rollback().await.ok();
+        anyhow::bail!("none of the evidence_external_ids resolved to known messages");
+    }
+
+    let event_data = json!({
+        "title": args.title,
+        "confidence": args.confidence,
+        "rationale": args.rationale,
+    })
+    .to_string();
+    let evidence_json = serde_json::to_string(&args.evidence_external_ids)?;
+    sqlx::query(
+        "INSERT INTO action_events \
+         (action_id, event_kind, actor, data_json, evidence_external_ids, occurred_at) \
+         VALUES (?, 'created', ?, ?, ?, ?)",
+    )
+    .bind(action_id)
+    .bind(actor)
+    .bind(&event_data)
+    .bind(&evidence_json)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("inserting action_events")?;
+
+    // Enqueue embed for the action (for cross-channel dedup later).
+    let action_text = format!("{}\n\n{}", args.title, args.details);
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(action_text.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    sqlx::query(
+        "INSERT INTO embed_queue (target_kind, target_id, text_hash, enqueued_at) \
+         VALUES ('action', ?, ?, ?) \
+         ON CONFLICT(target_kind, target_id) DO UPDATE SET \
+             text_hash = excluded.text_hash, enqueued_at = excluded.enqueued_at, \
+             attempts = 0, last_error = NULL \
+         WHERE embed_queue.text_hash != excluded.text_hash",
+    )
+    .bind(action_id)
+    .bind(&hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(json!({
+        "action_id": format!("A-{action_id}"),
+        "status": initial_status,
+    })
+    .to_string())
+}
+
+fn snippet(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.replace('\n', " ");
+    }
+    let truncated: String = text.chars().take(max).collect();
+    format!("{}…", truncated.replace('\n', " "))
+}
