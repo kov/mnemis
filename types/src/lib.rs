@@ -265,12 +265,27 @@ pub fn summarize_sync_error(raw: &str) -> String {
     if raw.contains("missing IMAP connection settings") {
         return "Missing IMAP connection settings — check this source's config.".to_string();
     }
-    // Transport-level network errors from reqwest.
-    if raw.contains("error sending request for url") {
-        return "Could not reach the LLM/embedding server (network or DNS).".to_string();
+    // Transport-level network errors from reqwest. Check the *specific*
+    // signatures before the generic "error sending request" catch-all —
+    // every reqwest transport error carries that phrase, so it would
+    // otherwise mask the more useful diagnoses below.
+    //
+    // "connection closed before message completed" means the server
+    // accepted the request and then dropped the TCP connection mid-reply —
+    // classically an out-of-memory crash partway through prefill. With a
+    // local model that almost always means the prompt window blew past the
+    // server's context limit; surface that hint.
+    if raw.contains("connection closed before message completed") {
+        return "The LLM server dropped the connection mid-request — it likely ran out of \
+                memory (the message window may be too large for the model's context)."
+            .to_string();
     }
     if raw.contains("connection refused") || raw.contains("Connection refused") {
-        return "Connection refused by the LLM/embedding server.".to_string();
+        return "Connection refused — the LLM/embedding server isn't running or crashed."
+            .to_string();
+    }
+    if raw.contains("error sending request for url") {
+        return "Could not reach the LLM/embedding server (network or DNS).".to_string();
     }
     // Auth errors.
     if raw.contains("401") || raw.contains("Unauthorized") {
@@ -336,6 +351,30 @@ mod summarize_tests {
                    connection error";
         let s = summarize_sync_error(raw);
         assert!(s.to_lowercase().contains("could not reach"));
+    }
+
+    #[test]
+    fn classifies_connection_dropped_mid_request() {
+        // The signature an OOM/context-overflow produces: the server takes
+        // the request, then drops the socket before replying. Must NOT
+        // collapse into the generic "could not reach" message even though
+        // it also contains "error sending request for url".
+        let raw = "channel 6: LLM send failed on turn 0: error sending request for url \
+                   (http://alface:1234/v1/responses): client error (SendRequest): \
+                   connection closed before message completed";
+        let s = summarize_sync_error(raw);
+        assert!(s.to_lowercase().contains("ran out of memory"), "got: {s}");
+        assert!(s.to_lowercase().contains("context"), "got: {s}");
+    }
+
+    #[test]
+    fn connection_refused_beats_generic_network_branch() {
+        // reqwest wraps ECONNREFUSED inside "error sending request for url";
+        // the specific message should still win.
+        let raw = "error sending request for url (http://alface:1234/v1/embeddings): \
+                   client error (Connect): tcp connect error: Connection refused (os error 111)";
+        let s = summarize_sync_error(raw);
+        assert!(s.to_lowercase().contains("refused"), "got: {s}");
     }
 
     #[test]

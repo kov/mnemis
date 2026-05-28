@@ -428,12 +428,31 @@ pub fn StatusPanel() -> impl IntoView {
                 </button>
             </div>
             {move || last_outcome.get().map(|res| match res {
-                Ok(o) => view! {
-                    <div class="status-toast status-toast-ok">
-                        {format!(
-                            "Synced {} source(s) · {} new message(s) · {} action(s)",
-                            o.sources_synced, o.messages_ingested, o.actions_created
-                        )}
+                Ok(o) => {
+                    // A sync that returns Ok can still carry per-channel
+                    // errors (partial success). Render those amber, not
+                    // green, so they don't read as "all clear". Fully-clean
+                    // syncs stay green; total failure is the Err branch.
+                    let had_errors = !o.errors.is_empty();
+                    let toast_class = if had_errors {
+                        "status-toast status-toast-warning"
+                    } else {
+                        "status-toast status-toast-ok"
+                    };
+                    let headline = format!(
+                        "Synced {} source(s) · {} new message(s) · {} action(s){}",
+                        o.sources_synced,
+                        o.messages_ingested,
+                        o.actions_created,
+                        if had_errors {
+                            format!(" · {} error(s)", o.errors.len())
+                        } else {
+                            String::new()
+                        },
+                    );
+                    view! {
+                    <div class=toast_class>
+                        {headline}
                         {(!o.errors.is_empty()).then(|| view! {
                             <ul class="status-errors">
                                 {o.errors.iter().map(|e| {
@@ -447,7 +466,7 @@ pub fn StatusPanel() -> impl IntoView {
                             </ul>
                         })}
                     </div>
-                }.into_any(),
+                }.into_any()},
                 Err(e) => view! {
                     <div class="status-toast status-toast-error">{format!("Sync failed: {e}")}</div>
                 }.into_any(),

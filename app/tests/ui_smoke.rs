@@ -1649,6 +1649,24 @@ async fn toast_classifies_per_source_error() -> Result<()> {
         "raw sqlx error should NOT leak into the user-facing summary. got: {toast_text}"
     );
 
+    // A completed-with-errors sync must read as a warning (amber), not a
+    // clean green success — the whole point of the toast is to flag that
+    // something needs attention.
+    let toast_class = client
+        .find(Locator::Css("div.status-toast"))
+        .await?
+        .attr("class")
+        .await?
+        .unwrap_or_default();
+    assert!(
+        toast_class.contains("status-toast-warning"),
+        "partial-error sync should use the warning toast style. got class: {toast_class}"
+    );
+    assert!(
+        !toast_class.contains("status-toast-ok"),
+        "partial-error sync must not use the green success style. got class: {toast_class}"
+    );
+
     client.close().await.ok();
     Ok(())
 }

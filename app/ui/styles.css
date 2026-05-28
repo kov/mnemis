@@ -113,6 +113,11 @@ h1 {
   color: var(--high);
 }
 
+.status-toast-warning {
+  background: rgba(177, 138, 35, 0.14);
+  color: var(--medium);
+}
+
 .status-toast-error {
   background: rgba(176, 64, 64, 0.12);
   color: #b04040;
