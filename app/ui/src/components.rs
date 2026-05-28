@@ -2,12 +2,17 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos::web_sys::HtmlTextAreaElement;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, MessageDto, SourceHealth, StatusSnapshot, SyncOutcome,
-    summarize_sync_error,
+    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, SourceHealth, StatusSnapshot,
+    SyncOutcome, summarize_sync_error,
 };
+use wasm_bindgen::JsCast;
 
-use crate::{confidence_class, fetch_actions, fetch_status, run_sync_now, status_label, update_action};
+use crate::{
+    confidence_class, fetch_actions, fetch_status, run_sync_now, status_label,
+    submit_dismissal_feedback, update_action,
+};
 
 #[component]
 pub fn ActionsPage() -> impl IntoView {
@@ -114,18 +119,29 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
     let id = action.id;
     let current_status = action.status;
 
-    let trigger = move |target: ActionStatus, reason: Option<String>| {
-        let refetch = refetch.clone();
+    // None = no modal open. Some(kind) = feedback modal open with that kind.
+    // The status change has already been applied by the time the modal opens;
+    // we hold off refetching until the user picks Submit or Skip so the card
+    // stays on screen while they decide.
+    let feedback_open: RwSignal<Option<FeedbackKind>> = RwSignal::new(None);
+
+    let refetch_for_status = refetch.clone();
+    let trigger_status = move |target: ActionStatus, then_open: Option<FeedbackKind>| {
+        let refetch = refetch_for_status.clone();
         spawn_local(async move {
-            let _ = update_action(id, target, reason).await;
-            refetch();
+            let _ = update_action(id, target, None).await;
+            match then_open {
+                Some(kind) => feedback_open.set(Some(kind)),
+                None => refetch(),
+            }
         });
     };
 
-    let trigger_claim = trigger.clone();
-    let trigger_done = trigger.clone();
-    let trigger_dismiss = trigger.clone();
-    let trigger_reopen = trigger.clone();
+    let trigger_claim = trigger_status.clone();
+    let trigger_done = trigger_status.clone();
+    let trigger_dismiss = trigger_status.clone();
+    let trigger_unclaim = trigger_status.clone();
+    let trigger_reopen = trigger_status.clone();
 
     view! {
         <div class="action">
@@ -144,15 +160,87 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                 {show_button(current_status, ActionStatus::Claimed).then(|| view! {
                     <button class="btn btn-secondary" on:click=move |_| trigger_claim(ActionStatus::Claimed, None)>"Claim"</button>
                 })}
+                // Undo affordance for an auto-claim. Sends the action back to
+                // pending and opens the feedback modal pre-tagged as a wrong
+                // auto-claim — but the user can Skip if there's nothing to
+                // teach (e.g. they handled it out of band).
+                {matches!(current_status, ActionStatus::AutoClaimed).then(|| view! {
+                    <button class="btn btn-ghost" on:click=move |_| trigger_unclaim(ActionStatus::Pending, Some(FeedbackKind::WrongAutoClaim))>"Undo"</button>
+                })}
                 {show_button(current_status, ActionStatus::Done).then(|| view! {
                     <button class="btn btn-primary" on:click=move |_| trigger_done(ActionStatus::Done, None)>"Done"</button>
                 })}
                 {show_button(current_status, ActionStatus::Dismissed).then(|| view! {
-                    <button class="btn btn-ghost" on:click=move |_| trigger_dismiss(ActionStatus::Dismissed, Some(String::new()))>"Dismiss"</button>
+                    <button class="btn btn-ghost" on:click=move |_| trigger_dismiss(ActionStatus::Dismissed, Some(FeedbackKind::Dismissed))>"Dismiss"</button>
                 })}
                 {show_button(current_status, ActionStatus::Pending).then(|| view! {
                     <button class="btn btn-ghost" on:click=move |_| trigger_reopen(ActionStatus::Pending, None)>"Reopen"</button>
                 })}
+            </div>
+            <Show when=move || feedback_open.get().is_some() fallback=|| view! { <></> }>
+                {
+                    let refetch = refetch.clone();
+                    view! {
+                        <FeedbackModal
+                            action_id=id
+                            kind=feedback_open.get().expect("guarded by Show")
+                            on_close=Arc::new({
+                                let refetch = refetch.clone();
+                                move || {
+                                    feedback_open.set(None);
+                                    refetch();
+                                }
+                            })
+                        />
+                    }
+                }
+            </Show>
+        </div>
+    }
+}
+
+/// Optional-comment feedback dialog. Used for both "I'm dismissing this" and
+/// "the auto-claim was wrong". Skip closes without writing a row — important
+/// for the auto-claim case where the user often took action out of band and
+/// there's genuinely nothing the model could have learned.
+#[component]
+fn FeedbackModal(
+    action_id: i64,
+    kind: FeedbackKind,
+    on_close: Arc<dyn Fn() + Send + Sync>,
+) -> impl IntoView {
+    let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+    let prompt = match kind {
+        FeedbackKind::Dismissed => "Why isn't this an action item? (optional)",
+        FeedbackKind::WrongAutoClaim => {
+            "What made this a wrong auto-claim? Leave blank if there's nothing to teach."
+        }
+    };
+
+    let on_close_submit = on_close.clone();
+    let on_submit = move |_| {
+        let comment = textarea_ref.get().and_then(|el| {
+            let v = el.unchecked_ref::<HtmlTextAreaElement>().value();
+            let trimmed = v.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        let close = on_close_submit.clone();
+        spawn_local(async move {
+            let _ = submit_dismissal_feedback(action_id, kind, comment).await;
+            close();
+        });
+    };
+
+    let on_close_skip = on_close.clone();
+    let on_skip = move |_| on_close_skip();
+
+    view! {
+        <div class="feedback-modal" data-feedback-kind=kind.as_str()>
+            <div class="feedback-prompt">{prompt}</div>
+            <textarea class="feedback-input" node_ref=textarea_ref placeholder="Comment (optional)" />
+            <div class="feedback-actions">
+                <button class="btn btn-ghost" on:click=on_skip>"Skip"</button>
+                <button class="btn btn-primary" on:click=on_submit>"Submit feedback"</button>
             </div>
         </div>
     }

@@ -50,6 +50,35 @@ impl ActionStatus {
     }
 }
 
+/// Why a `dismissal_feedback` row exists — both feed into the extractor as
+/// negative examples but the rendering differs slightly so the model knows
+/// what the user objected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    /// User said "this isn't really an action item."
+    Dismissed,
+    /// User undid an auto-claim with a comment — the auto-claim was wrong.
+    WrongAutoClaim,
+}
+
+impl FeedbackKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dismissed => "dismissed",
+            Self::WrongAutoClaim => "wrong_auto_claim",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dismissed" => Some(Self::Dismissed),
+            "wrong_auto_claim" => Some(Self::WrongAutoClaim),
+            _ => None,
+        }
+    }
+}
+
 /// Health of a single configured source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -11,7 +11,9 @@ use mnemis_engine::config::Config;
 use mnemis_engine::embed::{Embedder, OmlxEmbedder};
 use mnemis_engine::llm::LlmClient;
 use mnemis_engine::{config, db, mutations, orchestrator, queries};
-use mnemis_types::{ActionDto, ActionStatus, MessageDto, StatusSnapshot, SyncOutcome};
+use mnemis_types::{
+    ActionDto, ActionStatus, FeedbackKind, MessageDto, StatusSnapshot, SyncOutcome,
+};
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
 use tracing::{info, warn};
@@ -70,6 +72,18 @@ async fn update_action(
     dismissed_reason: Option<String>,
 ) -> Result<(), String> {
     mutations::update_action_status(&state.pool, action_id, new_status, dismissed_reason)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn submit_dismissal_feedback(
+    state: State<'_, AppState>,
+    action_id: i64,
+    kind: FeedbackKind,
+    comment: Option<String>,
+) -> Result<(), String> {
+    mutations::record_dismissal_feedback(&state.pool, action_id, kind, comment)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -188,7 +202,8 @@ fn main() {
             list_messages,
             get_status,
             sync_now,
-            update_action
+            update_action,
+            submit_dismissal_feedback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -340,6 +340,224 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     Ok(())
 }
 
+/// Two adjacent flows share one seeded DB: dismissing a pending action with
+/// a comment writes a `dismissal_feedback` row, while undoing an auto-claim
+/// via the Skip path writes none (the user often took the action out of band
+/// and there's nothing the model could have learned). Pin both end-to-end so
+/// the modal's Submit/Skip wiring stays load-bearing.
+#[tokio::test(flavor = "current_thread")]
+async fn dismiss_records_feedback_and_undo_skip_records_none() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-feedback.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        seed(&pool).await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.action"))
+        .await
+        .context("waiting for actions to render")?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // 1. Click Undo on the auto-claimed action ("Review Q3 roadmap"), then
+    //    Skip the feedback modal. The action should drop out of the default
+    //    list (it goes back to pending — still listed) but the modal must
+    //    appear and close cleanly.
+    let undo = client
+        .execute(
+            r#"
+            const card = Array.from(document.querySelectorAll('div.action'))
+                .find(c => c.textContent.includes('Review Q3 roadmap'));
+            if (!card) { return 'missing-card'; }
+            const btn = Array.from(card.querySelectorAll('button')).find(b => b.textContent.trim() === 'Undo');
+            if (!btn) { return 'missing-undo'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(undo.as_str(), Some("ok"), "Undo click failed: {undo:?}");
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(
+            "div.feedback-modal[data-feedback-kind='wrong_auto_claim']",
+        ))
+        .await
+        .context("waiting for the wrong-auto-claim feedback modal")?;
+
+    let skip = client
+        .execute(
+            r#"
+            const modal = document.querySelector("div.feedback-modal[data-feedback-kind='wrong_auto_claim']");
+            if (!modal) { return 'missing-modal'; }
+            const skipBtn = Array.from(modal.querySelectorAll('button')).find(b => b.textContent.trim() === 'Skip');
+            if (!skipBtn) { return 'missing-skip'; }
+            skipBtn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(skip.as_str(), Some("ok"), "Skip click failed: {skip:?}");
+
+    // Wait for the modal to disappear.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if client
+            .find(Locator::Css("div.feedback-modal"))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    assert!(
+        client
+            .find(Locator::Css("div.feedback-modal"))
+            .await
+            .is_err(),
+        "feedback modal should have closed after Skip"
+    );
+
+    // 2. Reveal the low-confidence list (the pending "Background reading"
+    //    action lives there) and Dismiss it with a comment.
+    let reveal = client
+        .execute(
+            r#"
+            const rev = document.querySelector('div.revealer');
+            if (!rev) { return 'missing-revealer'; }
+            rev.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(reveal.as_str(), Some("ok"));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let dismiss = client
+        .execute(
+            r#"
+            const card = Array.from(document.querySelectorAll('div.action'))
+                .find(c => c.textContent.toLowerCase().includes('background reading'));
+            if (!card) { return 'missing-card'; }
+            const btn = Array.from(card.querySelectorAll('button')).find(b => b.textContent.trim() === 'Dismiss');
+            if (!btn) { return 'missing-dismiss'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        dismiss.as_str(),
+        Some("ok"),
+        "Dismiss click failed: {dismiss:?}"
+    );
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(
+            "div.feedback-modal[data-feedback-kind='dismissed']",
+        ))
+        .await
+        .context("waiting for the dismissed feedback modal")?;
+
+    let submit = client
+        .execute(
+            r#"
+            const modal = document.querySelector("div.feedback-modal[data-feedback-kind='dismissed']");
+            if (!modal) { return 'missing-modal'; }
+            const ta = modal.querySelector('textarea.feedback-input');
+            if (!ta) { return 'missing-textarea'; }
+            ta.value = 'this came from an automated list, not actionable';
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            const submitBtn = Array.from(modal.querySelectorAll('button')).find(b => b.textContent.trim() === 'Submit feedback');
+            if (!submitBtn) { return 'missing-submit'; }
+            submitBtn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        submit.as_str(),
+        Some("ok"),
+        "Submit click failed: {submit:?}"
+    );
+
+    // Wait for the modal to disappear AND the feedback row to land.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if client
+            .find(Locator::Css("div.feedback-modal"))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    // 3. Verify the DB state: exactly one dismissal_feedback row, the right
+    //    kind and reason. The Skip path must NOT have written a row.
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT kind, reason, scope_kind FROM dismissal_feedback")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "Skip should have written nothing; Submit should have written one row. got: {rows:?}"
+        );
+        let (kind, reason, scope_kind) = &rows[0];
+        assert_eq!(kind, "dismissed");
+        assert!(
+            reason.contains("automated list"),
+            "reason should carry the typed comment, got: {reason:?}"
+        );
+        assert_eq!(scope_kind, "channel");
+
+        // And the undo path emitted an 'unclaimed' event, not 'unresolved'.
+        let kinds: Vec<(String,)> =
+            sqlx::query_as("SELECT event_kind FROM action_events WHERE actor = 'user' ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        let kinds: Vec<String> = kinds.into_iter().map(|(k,)| k).collect();
+        assert!(
+            kinds.contains(&"unclaimed".to_string()),
+            "expected an 'unclaimed' event from the Undo path. events: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"dismissed".to_string()),
+            "expected a 'dismissed' event from the Dismiss path. events: {kinds:?}"
+        );
+        pool.close().await;
+    }
+
+    client.close().await.ok();
+    Ok(())
+}
+
 /// Seed exactly two actions linked to messages: one high-confidence (visible
 /// up front) and one low-confidence (hidden behind the revealer). Matches
 /// the `record_action` insert shape so the same `queries::list_actions` SQL

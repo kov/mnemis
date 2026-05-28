@@ -1,7 +1,9 @@
 use leptos::prelude::*;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
-use mnemis_types::{ActionDto, ActionStatus, Confidence, MessageDto, StatusSnapshot, SyncOutcome};
+use mnemis_types::{
+    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, StatusSnapshot, SyncOutcome,
+};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -77,6 +79,30 @@ pub async fn update_action(
     })
     .map_err(|e| e.to_string())?;
     invoke("update_action", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct SubmitFeedbackArgs {
+    action_id: i64,
+    kind: FeedbackKind,
+    comment: Option<String>,
+}
+
+pub async fn submit_dismissal_feedback(
+    action_id: i64,
+    kind: FeedbackKind,
+    comment: Option<String>,
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SubmitFeedbackArgs {
+        action_id,
+        kind,
+        comment,
+    })
+    .map_err(|e| e.to_string())?;
+    invoke("submit_dismissal_feedback", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     Ok(())
