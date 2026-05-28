@@ -1,26 +1,26 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub llm: LlmSection,
     #[serde(default)]
     pub paths: PathsSection,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LlmSection {
     pub base_url: String,
     pub chat_model: String,
     pub embedding_model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PathsSection {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db: Option<String>,
 }
 
@@ -32,6 +32,36 @@ impl Config {
             .map(expand_tilde)
             .unwrap_or_else(default_db_path)
     }
+}
+
+/// Write the LLM section to the configured `config.toml`, preserving the
+/// `[paths]` section if one was present. Creates parent directories as
+/// needed; if the file didn't exist, an empty `[paths]` is omitted so the
+/// resulting file is the minimum we can read back.
+pub fn save_llm(llm: &LlmSection) -> Result<()> {
+    let path = default_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    let paths = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str::<Config>(&text)
+            .map(|c| c.paths)
+            .unwrap_or_default(),
+        Err(_) => PathsSection::default(),
+    };
+    let cfg = Config {
+        llm: LlmSection {
+            base_url: llm.base_url.clone(),
+            chat_model: llm.chat_model.clone(),
+            embedding_model: llm.embedding_model.clone(),
+            bearer_token: llm.bearer_token.clone(),
+        },
+        paths,
+    };
+    let text = toml::to_string_pretty(&cfg).context("serializing config")?;
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 pub fn load(override_path: Option<&Path>) -> Result<Config> {

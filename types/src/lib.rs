@@ -175,6 +175,50 @@ pub struct ActionDto {
     pub source_name: Option<String>,
 }
 
+/// Profile editor wire shape. `identifiers` is a flat list across kinds so
+/// the UI can render and edit them as `(kind, value)` tuples; the engine
+/// reconciles them against `contact_identifiers` rows on save.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserProfileDto {
+    pub display_name: String,
+    pub custom_prompt: Option<String>,
+    pub identifiers: Vec<ProfileIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIdentifier {
+    /// `'email'|'mattermost_handle'|'discord_id'|'phone'` — anything
+    /// `contact_identifiers.kind` accepts.
+    pub kind: String,
+    pub value: String,
+}
+
+/// LLM config view/edit shape. Matches `engine::config::LlmSection` plus a
+/// `config_path` so the UI can tell the user where edits land. The bearer
+/// token is sent both ways — the form omits it when blank.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmConfigDto {
+    pub base_url: String,
+    pub chat_model: String,
+    pub embedding_model: String,
+    pub bearer_token: Option<String>,
+    pub config_path: String,
+}
+
+/// One row in the Settings → Sources table. Health is duplicated from
+/// `SourceStatus` for convenience so the settings page doesn't need a second
+/// fetch to colour the row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRowDto {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub muted: bool,
+    pub health: SourceHealth,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 /// A resolution the extractor proposed but isn't confident enough to apply
 /// on its own. The UI surfaces these in a "Suggested resolutions" panel
 /// where the user can confirm (apply) or reject (discard).

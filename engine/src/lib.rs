@@ -9,6 +9,7 @@ pub mod mutations;
 pub mod orchestrator;
 pub mod queries;
 pub mod secrets;
+pub mod settings;
 pub mod source;
 pub mod test_util;
 
