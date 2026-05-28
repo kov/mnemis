@@ -523,23 +523,16 @@ async fn toast_classifies_per_source_error() -> Result<()> {
     let app_bin = sibling_app_binary()
         .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
 
-    // The harness sets env vars on the parent process so the tauri-driver
-    // child inherits them; that means MNEMIS_DISABLE_LLM=1 set by an earlier
-    // test in the same binary leaks into this one and short-circuits the
-    // app to "No LLM configured", which skips the per-source error path we
-    // want to assert on. Explicitly clear it.
-    // SAFETY: ui_smoke runs with --test-threads=1.
-    unsafe { std::env::remove_var("MNEMIS_DISABLE_LLM") };
-
     let env = HashMap::from([
         ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
         (
             "MNEMIS_CONFIG_PATH".to_string(),
             config_path.display().to_string(),
         ),
-        // NB: deliberately NOT setting MNEMIS_DISABLE_LLM — we want the
-        // LlmStack to initialize so sync_now reaches the orchestrator and
-        // emits the per-source error in SyncOutcome.errors.
+        // Deliberately NOT setting MNEMIS_DISABLE_LLM — we want LlmStack to
+        // initialize so sync_now reaches the orchestrator and emits the
+        // per-source error in SyncOutcome.errors. (Harness applies env to
+        // the child only, so other tests' values don't leak in.)
     ]);
     let harness = Harness::start(HarnessOpts::default(), env).await?;
     let client = harness.open_session(&app_bin).await?;

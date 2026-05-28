@@ -139,36 +139,19 @@ fn terminate_process_group(child: &mut Child) {
 impl Harness {
     /// Bring up the test environment.
     ///
-    /// `app_env` is exported into **this process** before tauri-driver
-    /// forks, so the env naturally flows down the process tree to the
-    /// spawned app (tauri-driver → WebKitWebDriver → mnemis-app). This is
-    /// the workaround for tauri-driver 2.0.6 silently dropping any
-    /// `tauri:options` field other than `application` and `args`.
-    ///
-    /// Tests using the harness must be single-threaded (use
-    /// `#[tokio::test(flavor = "current_thread")]` and don't share a
-    /// process with other env-mutating tests).
+    /// `app_env` is applied to the spawned `tauri-driver` subprocess (and
+    /// therefore inherited by the WebKitWebDriver + mnemis-app it forks),
+    /// so each test gets its own isolated env without mutating the parent.
+    /// This works around tauri-driver 2.0.6 silently dropping any
+    /// `tauri:options` field other than `application` and `args`: rather
+    /// than passing env through WebDriver capabilities, we set it on the
+    /// child process so it inherits via normal fork rules.
     pub async fn start(opts: HarnessOpts, app_env: HashMap<String, String>) -> Result<Self> {
         let weston = if opts.headless {
             Some(spawn_weston().await?)
         } else {
             None
         };
-
-        // Export env BEFORE driver spawn — env on a forked child is frozen
-        // at fork time; mutating it in the parent later has no effect.
-        for (k, v) in &app_env {
-            // SAFETY: documented single-threaded contract.
-            unsafe { std::env::set_var(k, v) };
-        }
-        if let Some(w) = &weston {
-            // SAFETY: same.
-            unsafe {
-                std::env::set_var("WAYLAND_DISPLAY", &w.socket_name);
-                std::env::set_var("GDK_BACKEND", "wayland");
-                std::env::remove_var("DISPLAY");
-            }
-        }
 
         let mut driver_cmd = Command::new("tauri-driver");
         driver_cmd
@@ -178,6 +161,19 @@ impl Harness {
             .arg(&opts.webkit_driver)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+
+        // Apply test-supplied env on the child only — never the parent —
+        // so tests stay isolated from each other and from the test process.
+        for (k, v) in &app_env {
+            driver_cmd.env(k, v);
+        }
+        if let Some(w) = &weston {
+            // Wayland routing for the headless weston compositor. Same
+            // child-only rule: don't pollute the test process.
+            driver_cmd.env("WAYLAND_DISPLAY", &w.socket_name);
+            driver_cmd.env("GDK_BACKEND", "wayland");
+            driver_cmd.env_remove("DISPLAY");
+        }
         // SAFETY: setsid is async-signal-safe and only modifies the child's
         // process group, which is exactly what we want for tree cleanup.
         unsafe {
