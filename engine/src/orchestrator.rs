@@ -138,6 +138,29 @@ async fn sync_one_source(
     model_name: &str,
 ) -> Result<SourceCounts> {
     let source = build_imap_source(pool, SourceId(source_id)).await?;
+    sync_one_source_with(
+        pool,
+        source_id,
+        source_name,
+        &source,
+        llm,
+        embedder,
+        model_name,
+    )
+    .await
+}
+
+/// Inner loop, split out so tests can inject a fake `Source` without
+/// touching the keychain or the IMAP transport.
+async fn sync_one_source_with(
+    pool: &SqlitePool,
+    source_id: i64,
+    source_name: &str,
+    source: &dyn Source,
+    llm: &dyn LlmTransport,
+    embedder: &Arc<dyn Embedder>,
+    model_name: &str,
+) -> Result<SourceCounts> {
     let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
     )
@@ -331,7 +354,12 @@ pub async fn mark_source_failure(pool: &SqlitePool, source_id: i64, error: &str)
 mod tests {
     use super::*;
     use crate::db;
+    use crate::llm::{InputItem, ResponsesResponse, ToolDef};
+    use crate::source::{ChannelInfo, ImportedAuthor, ImportedMessage, PollBatch, SourceKind};
     use crate::test_util::{MockLlm, mock};
+    use anyhow::bail;
+    use async_trait::async_trait;
+    use chrono::Utc;
     use tempfile::TempDir;
 
     /// With no sources configured, sync_now returns an empty outcome cleanly.
@@ -351,6 +379,133 @@ mod tests {
         assert_eq!(out.sources_failed, 0);
         assert_eq!(out.messages_ingested, 0);
         assert!(out.errors.is_empty());
+        Ok(())
+    }
+
+    /// Stand-in Source that returns one message on poll, no matter what's
+    /// asked. We only need `poll` for sync_one_source_with; the other
+    /// methods aren't on the sync path.
+    struct OneMessageSource(SourceId);
+
+    #[async_trait]
+    impl Source for OneMessageSource {
+        fn id(&self) -> SourceId {
+            self.0
+        }
+        fn kind(&self) -> SourceKind {
+            SourceKind::Imap
+        }
+        async fn list_channels(&self) -> Result<Vec<ChannelInfo>> {
+            unimplemented!("not used in sync path")
+        }
+        async fn poll(&self, _channel: &str, _cursor: Option<&Cursor>) -> Result<PollBatch> {
+            Ok(PollBatch {
+                messages: vec![ImportedMessage {
+                    external_id: "m1".to_string(),
+                    parent_external_id: None,
+                    author: Some(ImportedAuthor {
+                        external_id: "ana@example.com".to_string(),
+                        display_name: Some("Ana".to_string()),
+                        handle: None,
+                    }),
+                    posted_at: Utc::now(),
+                    subject: Some("Hello".to_string()),
+                    body: "Please take a look".to_string(),
+                    body_format: "text".to_string(),
+                    raw_json: None,
+                    flags: 0,
+                }],
+                next_cursor: Cursor("1:2".to_string()),
+                more_available: false,
+            })
+        }
+        async fn fetch(&self, _channel: &str, _msg: &str) -> Result<ImportedMessage> {
+            unimplemented!("not used in sync path")
+        }
+    }
+
+    struct ContextWindowLlm;
+
+    #[async_trait]
+    impl LlmTransport for ContextWindowLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            _input: Vec<InputItem>,
+            _tools: &[ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<ResponsesResponse> {
+            bail!(
+                "LLM API error (HTTP 400 Bad Request): Prompt too long: \
+                 154806 tokens exceeds max context window of 131072 tokens"
+            )
+        }
+    }
+
+    /// End-to-end: a per-channel extract failure must land in the
+    /// SourceCounts.errors so sync_now relays it into SyncOutcome.errors →
+    /// toast. Previously the failure was swallowed inside
+    /// extract_for_channel and never reached the orchestrator.
+    #[tokio::test]
+    async fn extract_failure_lands_in_source_counts_errors() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+
+        let (source_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'fastmail', 'fake/ref', ?) RETURNING id",
+        )
+        .bind(Utc::now().timestamp())
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'INBOX/Lembrar', 'INBOX/Lembrar', 'mailbox')",
+        )
+        .bind(source_id)
+        .execute(&pool)
+        .await?;
+
+        let source = OneMessageSource(SourceId(source_id));
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::embed::OmlxEmbedder::new(
+            "http://0.0.0.0".to_string(),
+            "noop".to_string(),
+        ));
+
+        let counts = sync_one_source_with(
+            &pool,
+            source_id,
+            "fastmail",
+            &source,
+            &ContextWindowLlm,
+            &embedder,
+            "test-model",
+        )
+        .await?;
+
+        assert_eq!(counts.channels_polled, 1);
+        assert_eq!(counts.messages_ingested, 1);
+        assert_eq!(counts.actions_created, 0);
+        assert_eq!(
+            counts.errors.len(),
+            1,
+            "expected one channel error in counts: {:?}",
+            counts.errors
+        );
+        let err = &counts.errors[0];
+        assert!(
+            err.contains("fastmail"),
+            "error should name the source: {err}"
+        );
+        assert!(
+            err.contains("INBOX/Lembrar"),
+            "error should name the channel: {err}"
+        );
+        assert!(
+            err.contains("context window"),
+            "error should preserve the transport message for the classifier: {err}"
+        );
         Ok(())
     }
 }

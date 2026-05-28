@@ -44,7 +44,15 @@ pub fn load(override_path: Option<&Path>) -> Result<Config> {
     Ok(cfg)
 }
 
+/// Where to look for `config.toml` when no explicit override is passed.
+///
+/// `MNEMIS_CONFIG_PATH` wins so tests (and one-off setups) can point at a
+/// temp file without writing to `~/.config/mnemis/`. Falls back to the
+/// XDG-style default.
 pub fn default_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("MNEMIS_CONFIG_PATH") {
+        return PathBuf::from(p);
+    }
     if let Some(home) = dirs::home_dir() {
         return home.join(".config/mnemis/config.toml");
     }

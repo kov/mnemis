@@ -469,3 +469,124 @@ async fn seed(pool: &SqlitePool) -> Result<()> {
 
     Ok(())
 }
+
+/// Sync now produces per-channel/per-source errors; the toast must show the
+/// **classified** one-liner (via mnemis_types::summarize_sync_error), not
+/// the raw anyhow chain. Triggers it by seeding an IMAP source whose
+/// build_imap_source fails (no settings row), then clicking Sync.
+///
+/// Uses a temp config.toml + MNEMIS_CONFIG_PATH so the LlmStack initializes
+/// without depending on the dev machine's real config. The LLM is never
+/// reached because sync fails at IMAP setup, so the URL can be bogus.
+#[tokio::test(flavor = "current_thread")]
+async fn toast_classifies_per_source_error() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-class.db");
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[llm]\nbase_url = \"http://0.0.0.0:1/v1\"\nchat_model = \"none\"\n\
+             embedding_model = \"none\"\n\n[paths]\ndb = \"{}\"\n",
+            db_path.display(),
+        ),
+    )?;
+
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        // Single source, no settings row → build_imap_source fails with
+        // "missing IMAP connection settings".
+        sqlx::query(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'fake/missing', ?)",
+        )
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             SELECT id, 'INBOX', 'INBOX', 'mailbox' FROM sources WHERE name = 'work'",
+        )
+        .execute(&pool)
+        .await?;
+        // user_profile is required by the status query.
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+
+    // The harness sets env vars on the parent process so the tauri-driver
+    // child inherits them; that means MNEMIS_DISABLE_LLM=1 set by an earlier
+    // test in the same binary leaks into this one and short-circuits the
+    // app to "No LLM configured", which skips the per-source error path we
+    // want to assert on. Explicitly clear it.
+    // SAFETY: ui_smoke runs with --test-threads=1.
+    unsafe { std::env::remove_var("MNEMIS_DISABLE_LLM") };
+
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        (
+            "MNEMIS_CONFIG_PATH".to_string(),
+            config_path.display().to_string(),
+        ),
+        // NB: deliberately NOT setting MNEMIS_DISABLE_LLM — we want the
+        // LlmStack to initialize so sync_now reaches the orchestrator and
+        // emits the per-source error in SyncOutcome.errors.
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("button.sync-button"))
+        .await
+        .context("waiting for sync button")?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let click_result = client
+        .execute(
+            "const btn = document.querySelector('button.sync-button'); \
+             if (!btn) { return 'missing'; } btn.click(); return 'ok';",
+            vec![],
+        )
+        .await?;
+    assert_eq!(click_result.as_str(), Some("ok"));
+
+    // Wait for the success toast (Ok branch — sync_now returned Ok with
+    // errors populated, since IMAP build failure is per-source, not
+    // top-level).
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("ul.status-errors"))
+        .await
+        .context("waiting for status-errors list inside the sync toast")?;
+
+    let toast_text = client
+        .find(Locator::Css("ul.status-errors"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default();
+
+    assert!(
+        toast_text.contains("Missing IMAP"),
+        "toast should show the classified summary, not the raw chain. got: {toast_text}"
+    );
+    assert!(
+        !toast_text.contains("no rows returned"),
+        "raw sqlx error should NOT leak into the user-facing summary. got: {toast_text}"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
