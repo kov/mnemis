@@ -739,6 +739,160 @@ mod tests {
         Ok(())
     }
 
+    /// Helper: insert a pending action linked to msg-1 from `setup()`. Returns
+    /// (action_id, A-N reference string) so resolve_action tests can target it.
+    async fn seed_pending_action(pool: &SqlitePool, title: &str) -> Result<(i64, String)> {
+        let now = Utc::now().timestamp();
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, details, confidence, status, extracted_at) \
+             VALUES (?, 'd', 'medium', 'pending', ?) RETURNING id",
+        )
+        .bind(title)
+        .bind(now)
+        .fetch_one(pool)
+        .await?;
+        let (msg_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE external_id = 'msg-1'")
+                .fetch_one(pool)
+                .await?;
+        sqlx::query(
+            "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+             VALUES (?, ?, 'source', 1)",
+        )
+        .bind(id)
+        .bind(msg_id)
+        .execute(pool)
+        .await?;
+        Ok((id, format!("A-{id}")))
+    }
+
+    #[tokio::test]
+    async fn resolve_action_high_confidence_auto_applies_done() -> Result<()> {
+        // Pin: when the extractor calls resolve_action with confidence='high'
+        // the action transitions to 'done' immediately, resolved_at is set,
+        // and the audit log records 'resolved' with actor='agent_auto'. The
+        // evidence messages attach with kind='resolution' so the UI can
+        // distinguish "what created this action" from "what resolved it".
+        let (_tmp, pool, source_id, channel_id) = setup().await?;
+        let (action_id, action_ref) = seed_pending_action(&pool, "Ship the draft").await?;
+
+        let scope = ExtractionScope {
+            source_id,
+            channel_id,
+        };
+        let args = serde_json::json!({
+            "action_id": action_ref,
+            "status": "done",
+            "confidence": "high",
+            "rationale": "Ana confirmed the draft landed.",
+            "evidence_external_ids": ["msg-1"],
+        })
+        .to_string();
+        let out = tools::dispatch(&pool, scope, "resolve_action", &args).await;
+        assert!(
+            !out.output.contains("error"),
+            "resolve_action errored: {}",
+            out.output
+        );
+
+        let (status, resolved_at): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, resolved_at FROM actions WHERE id = ?")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(status, "done");
+        assert!(resolved_at.is_some(), "resolved_at must be set");
+
+        let (resolution_evidence,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM action_evidence \
+             WHERE action_id = ? AND kind = 'resolution'",
+        )
+        .bind(action_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            resolution_evidence, 1,
+            "expected the evidence_external_ids to attach as a 'resolution' evidence row"
+        );
+
+        let (event_kind, actor): (String, String) = sqlx::query_as(
+            "SELECT event_kind, actor FROM action_events WHERE action_id = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(action_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(event_kind, "resolved");
+        assert_eq!(actor, "agent_auto");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_action_medium_confidence_queues_as_suggestion() -> Result<()> {
+        // Medium/low confidence MUST NOT auto-resolve — the user has to
+        // confirm. The audit log gets a 'suggested_resolution' event with
+        // actor='agent_queued' so the UI can surface it in the suggestions
+        // panel; the action itself stays in its prior state.
+        let (_tmp, pool, source_id, channel_id) = setup().await?;
+        let (action_id, action_ref) = seed_pending_action(&pool, "Maybe ship the draft").await?;
+
+        let scope = ExtractionScope {
+            source_id,
+            channel_id,
+        };
+        let args = serde_json::json!({
+            "action_id": action_ref,
+            "status": "done",
+            "confidence": "medium",
+            "rationale": "Looks like Ana mentioned it shipped.",
+            "evidence_external_ids": ["msg-1"],
+        })
+        .to_string();
+        let out = tools::dispatch(&pool, scope, "resolve_action", &args).await;
+        assert!(
+            !out.output.contains("\"error\""),
+            "unexpected error: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("\"applied\":false"),
+            "medium-conf should report applied=false. got: {}",
+            out.output
+        );
+
+        // Action state untouched.
+        let (status, resolved_at): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, resolved_at FROM actions WHERE id = ?")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(status, "pending");
+        assert!(
+            resolved_at.is_none(),
+            "queued suggestion must not set resolved_at"
+        );
+
+        // Suggestion event present.
+        let (event_kind, actor, data_json): (String, String, String) = sqlx::query_as(
+            "SELECT event_kind, actor, data_json FROM action_events \
+             WHERE action_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(action_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(event_kind, "suggested_resolution");
+        assert_eq!(actor, "agent_queued");
+        assert!(
+            data_json.contains("\"status\":\"done\""),
+            "data_json should carry the proposed status. got: {data_json}"
+        );
+        assert!(
+            data_json.contains("\"confidence\":\"medium\""),
+            "data_json should carry the confidence. got: {data_json}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn load_feedback_for_pulls_channel_source_and_global_capped() -> Result<()> {
         // Pin the scoping rule + cap: union of channel + source + global,

@@ -65,6 +65,29 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         ),
         ToolDef::function(
+            "resolve_action".to_string(),
+            "Mark a prior action as done or cancelled because the window proves it. \
+             Identify the action by its A-N id; provide evidence_external_ids that \
+             show the resolution (≥1). high-confidence applies immediately; medium/low \
+             queue the suggestion for the user to confirm — same gating as record_action."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "action_id":  { "type": "string", "description": "A-N id from Existing actions" },
+                    "status":     { "type": "string", "enum": ["done", "cancelled"] },
+                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                    "rationale":  { "type": "string", "description": "≤200 chars, what proves it's done" },
+                    "evidence_external_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                    }
+                },
+                "required": ["action_id", "status", "confidence", "rationale", "evidence_external_ids"]
+            }),
+        ),
+        ToolDef::function(
             "update_action".to_string(),
             "Amend an existing action (one you just recorded, or one from the Existing list). \
              Identify it by its A-N id. Only the fields you pass are changed; new evidence \
@@ -119,6 +142,7 @@ pub async fn dispatch(
             Err(e) => Err(e),
         },
         "update_action" => update_action(pool, scope, arguments).await,
+        "resolve_action" => resolve_action(pool, scope, arguments).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
 
@@ -555,6 +579,141 @@ async fn update_action(
     Ok(json!({
         "action_id": format!("A-{action_id}"),
         "amended": true,
+    })
+    .to_string())
+}
+
+#[derive(Deserialize)]
+struct ResolveArgs {
+    action_id: String,
+    status: String,
+    confidence: String,
+    rationale: String,
+    evidence_external_ids: Vec<String>,
+}
+
+async fn resolve_action(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    arguments: &str,
+) -> Result<String> {
+    let args: ResolveArgs =
+        serde_json::from_str(arguments).context("parsing resolve_action args")?;
+    let action_id = parse_action_ref(&args.action_id)?;
+
+    if !["done", "cancelled"].contains(&args.status.as_str()) {
+        anyhow::bail!("invalid status: {}", args.status);
+    }
+    if !["high", "medium", "low"].contains(&args.confidence.as_str()) {
+        anyhow::bail!("invalid confidence: {}", args.confidence);
+    }
+    if args.evidence_external_ids.is_empty() {
+        anyhow::bail!("evidence_external_ids must contain at least one id");
+    }
+
+    let mut tx = pool.begin().await?;
+
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT status FROM actions WHERE id = ? AND status NOT IN ('done', 'dismissed', 'cancelled')",
+    )
+    .bind(action_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if row.is_none() {
+        tx.rollback().await.ok();
+        anyhow::bail!("action A-{action_id} not found or already resolved");
+    }
+
+    // Resolution evidence (kind='resolution') is attached either way — even
+    // for the queued case, it's useful for the user to see what the agent
+    // would have used to justify the resolution.
+    let mut attached = Vec::new();
+    for ext_id in &args.evidence_external_ids {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT m.id FROM messages m \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE m.external_id = ? AND c.source_id = ? LIMIT 1",
+        )
+        .bind(ext_id)
+        .bind(scope.source_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((mid,)) = row else { continue };
+        let (existing,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM action_evidence \
+             WHERE action_id = ? AND message_id = ? AND kind = 'resolution'",
+        )
+        .bind(action_id)
+        .bind(mid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if existing > 0 {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+             VALUES (?, ?, 'resolution', 0)",
+        )
+        .bind(action_id)
+        .bind(mid)
+        .execute(&mut *tx)
+        .await?;
+        attached.push(ext_id.clone());
+    }
+    if attached.is_empty() {
+        tx.rollback().await.ok();
+        anyhow::bail!("none of the evidence_external_ids resolved to known messages");
+    }
+
+    let now = Utc::now().timestamp();
+    let auto = args.confidence == "high";
+    let (event_kind, actor) = if auto {
+        ("resolved", "agent_auto")
+    } else {
+        ("suggested_resolution", "agent_queued")
+    };
+
+    if auto {
+        sqlx::query(
+            "UPDATE actions SET status = ?, resolved_at = ? \
+             WHERE id = ?",
+        )
+        .bind(&args.status)
+        .bind(now)
+        .bind(action_id)
+        .execute(&mut *tx)
+        .await
+        .context("applying high-confidence resolution")?;
+    }
+
+    let event_data = json!({
+        "status": args.status,
+        "confidence": args.confidence,
+        "rationale": args.rationale,
+    })
+    .to_string();
+    let evidence_json = serde_json::to_string(&attached)?;
+    sqlx::query(
+        "INSERT INTO action_events \
+         (action_id, event_kind, actor, data_json, evidence_external_ids, occurred_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(action_id)
+    .bind(event_kind)
+    .bind(actor)
+    .bind(&event_data)
+    .bind(&evidence_json)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("inserting action_events resolve row")?;
+
+    tx.commit().await?;
+
+    Ok(json!({
+        "action_id": format!("A-{action_id}"),
+        "applied": auto,
+        "status": if auto { args.status } else { "queued".to_string() },
     })
     .to_string())
 }

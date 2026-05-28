@@ -110,7 +110,9 @@ pub fn build(inputs: &PromptInputs) -> String {
             "# Existing actions for this channel\n\
              These already exist. Each line is `[A-N] title` — if one of them needs more \
              info or a correction based on what's in the window, amend it with \
-             update_action(action_id=\"A-N\", ...) instead of recording a new one.\n",
+             update_action(action_id=\"A-N\", ...) instead of recording a new one. \
+             If the window proves one is already done or no longer relevant, call \
+             resolve_action(action_id=\"A-N\", status=...) so it stops cluttering the inbox.\n",
         );
         for a in inputs.existing_actions {
             let due = a
@@ -170,7 +172,11 @@ pub fn build(inputs: &PromptInputs) -> String {
          - update_action(action_id, ...): amend an action you already recorded (or one from \
            the Existing list above). Pass only the fields you want to change; extra evidence \
            is appended, not replaced. Use this whenever you'd otherwise be tempted to record \
-           the same underlying item a second time.\n\n\
+           the same underlying item a second time.\n\
+         - resolve_action(action_id, status, confidence, rationale, evidence_external_ids): \
+           mark a prior action as done or cancelled because the window proves it. \
+           High-confidence applies immediately; medium/low queues a suggestion for the user. \
+           Use this when you'd otherwise just record nothing about an item that's clearly resolved.\n\n\
          # Process\n\
          1. Read the window below.\n\
          2. For each actionable thing: judge against the criteria. Use the tools if you need prior context.\n\
@@ -320,6 +326,45 @@ mod tests {
         let rendered = build(&inputs);
         assert!(rendered.contains("Short ask"));
         assert!(!rendered.contains("truncated"));
+    }
+
+    #[test]
+    fn prompt_mentions_resolve_action_in_both_existing_actions_and_tools_sections() {
+        // Pin: the agent must learn it can close out stale items, and the
+        // hint must appear in both the existing-actions block (where the IDs
+        // live) and the tools block (where the schema lives). Easy to lose
+        // either reference during prompt edits.
+        let inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            current_time: dt(1_700_000_000),
+            existing_actions: &[ExistingAction {
+                id: 7,
+                title: "Send the contract".to_string(),
+                details: None,
+                due_at: None,
+            }],
+            feedback: &[],
+            window: &[],
+        };
+        let rendered = build(&inputs);
+        let existing_section_idx = rendered
+            .find("# Existing actions for this channel")
+            .expect("existing-actions section missing");
+        let tools_idx = rendered.find("# Tools").expect("tools section missing");
+        let after_existing = &rendered[existing_section_idx..tools_idx];
+        let after_tools = &rendered[tools_idx..];
+        assert!(
+            after_existing.contains("resolve_action"),
+            "existing-actions block must hint at resolve_action"
+        );
+        assert!(
+            after_tools.contains("resolve_action("),
+            "tools block must define resolve_action"
+        );
     }
 
     #[test]
