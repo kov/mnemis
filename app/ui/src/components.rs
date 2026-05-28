@@ -4,14 +4,14 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::web_sys::HtmlTextAreaElement;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, SourceHealth, StatusSnapshot,
-    SyncOutcome, summarize_sync_error,
+    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, PendingResolutionDto,
+    SourceHealth, StatusSnapshot, SyncOutcome, summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
 use crate::{
-    confidence_class, fetch_actions, fetch_status, run_sync_now, status_label,
-    submit_dismissal_feedback, update_action,
+    confidence_class, confirm_resolution, fetch_actions, fetch_pending_resolutions, fetch_status,
+    reject_resolution, run_sync_now, status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -28,6 +28,7 @@ pub fn ActionsPage() -> impl IntoView {
 
     view! {
         <h1>"Actions"</h1>
+        <SuggestedResolutions />
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let refetch = refetch.clone();
@@ -37,6 +38,115 @@ pub fn ActionsPage() -> impl IntoView {
                 })
             }}
         </Suspense>
+    }
+}
+
+/// "Suggested resolutions" panel: shows medium/low confidence resolve_action
+/// calls the extractor queued for user review. Confirm applies the proposed
+/// status; Reject discards the suggestion without changing the action.
+#[component]
+fn SuggestedResolutions() -> impl IntoView {
+    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let suggestions = LocalResource::new(move || {
+        let _ = sync_tick.get();
+        async move { fetch_pending_resolutions().await }
+    });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || suggestions.refetch());
+
+    view! {
+        <Suspense fallback=|| view! { <></> }>
+            {move || {
+                let refetch = refetch.clone();
+                suggestions.get().and_then(|res| match res {
+                    Ok(rows) if rows.is_empty() => None,
+                    Ok(rows) => Some(view! { <SuggestionsList rows=rows refetch=refetch /> }.into_any()),
+                    // A failure here shouldn't blow the whole page; just log
+                    // via the dev console (already wired through fetch_*).
+                    Err(_) => None,
+                })
+            }}
+        </Suspense>
+    }
+}
+
+#[component]
+fn SuggestionsList(
+    rows: Vec<PendingResolutionDto>,
+    refetch: Arc<dyn Fn() + Send + Sync>,
+) -> impl IntoView {
+    view! {
+        <div class="suggestions-panel">
+            <div class="suggestions-header">{format!("{} suggested resolution(s)", rows.len())}</div>
+            <For
+                each=move || rows.clone()
+                key=|r| r.action_id
+                children={
+                    let refetch = refetch.clone();
+                    move |r: PendingResolutionDto| view! {
+                        <SuggestionRow row=r refetch=refetch.clone() />
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+#[component]
+fn SuggestionRow(row: PendingResolutionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
+    let action_id = row.action_id;
+    // Translate the wire string to the typed enum the Tauri command expects.
+    let suggested_status = match row.suggested_status.as_str() {
+        "cancelled" => ActionStatus::Cancelled,
+        _ => ActionStatus::Done,
+    };
+    let suggested_label = match suggested_status {
+        ActionStatus::Cancelled => "cancelled",
+        _ => "done",
+    };
+    let conf_class = confidence_class(row.confidence);
+    let conf_label = match row.confidence {
+        Confidence::High => "high",
+        Confidence::Medium => "medium",
+        Confidence::Low => "low",
+    };
+    let rationale = row.rationale.unwrap_or_default();
+
+    let on_confirm = {
+        let refetch = refetch.clone();
+        move |_| {
+            let refetch = refetch.clone();
+            spawn_local(async move {
+                let _ = confirm_resolution(action_id, suggested_status).await;
+                refetch();
+            });
+        }
+    };
+    let on_reject = {
+        let refetch = refetch.clone();
+        move |_| {
+            let refetch = refetch.clone();
+            spawn_local(async move {
+                let _ = reject_resolution(action_id).await;
+                refetch();
+            });
+        }
+    };
+
+    view! {
+        <div class="suggestion" data-action-id=action_id.to_string()>
+            <div class="suggestion-head">
+                <span class="suggestion-title">{row.action_title.clone()}</span>
+                <span class=conf_class>{conf_label}</span>
+                <span class="badge">{format!("→ {suggested_label}")}</span>
+            </div>
+            {(!rationale.is_empty()).then(|| view! {
+                <div class="suggestion-rationale">{rationale}</div>
+            })}
+            <div class="suggestion-actions">
+                <button class="btn btn-primary" on:click=on_confirm>"Confirm"</button>
+                <button class="btn btn-ghost" on:click=on_reject>"Reject"</button>
+            </div>
+        </div>
     }
 }
 

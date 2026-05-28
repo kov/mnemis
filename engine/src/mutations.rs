@@ -183,6 +183,33 @@ pub async fn record_dismissal_feedback(
     Ok(())
 }
 
+/// User explicitly rejected the agent's resolution suggestion for this
+/// action. Inserts a `suggestion_dismissed` event so the suggestion stops
+/// appearing in [`crate::queries::list_pending_resolutions`]. The action
+/// itself is untouched — rejecting a suggestion is not the same as
+/// dismissing the action.
+pub async fn reject_resolution_suggestion(pool: &SqlitePool, action_id: i64) -> Result<()> {
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM actions WHERE id = ?")
+        .bind(action_id)
+        .fetch_optional(pool)
+        .await
+        .context("looking up action for reject")?;
+    if exists.is_none() {
+        anyhow::bail!("action {action_id} not found");
+    }
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO action_events (action_id, event_kind, actor, occurred_at) \
+         VALUES (?, 'suggestion_dismissed', 'user', ?)",
+    )
+    .bind(action_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("inserting suggestion_dismissed event")?;
+    Ok(())
+}
+
 fn status_str(s: ActionStatus) -> &'static str {
     match s {
         ActionStatus::Pending => "pending",
@@ -437,6 +464,31 @@ mod tests {
                 .await?;
         assert_eq!(status, "dismissed");
         assert_eq!(reason.as_deref(), Some("not actually for me"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reject_resolution_suggestion_inserts_event_and_leaves_status() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let id = seed_action(&pool, "pending").await?;
+
+        reject_resolution_suggestion(&pool, id).await?;
+
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM actions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(status, "pending", "reject must not touch action status");
+
+        let (kind, actor): (String, String) =
+            sqlx::query_as("SELECT event_kind, actor FROM action_events WHERE action_id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(kind, "suggestion_dismissed");
+        assert_eq!(actor, "user");
         Ok(())
     }
 

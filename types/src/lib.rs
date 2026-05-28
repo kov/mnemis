@@ -175,6 +175,21 @@ pub struct ActionDto {
     pub source_name: Option<String>,
 }
 
+/// A resolution the extractor proposed but isn't confident enough to apply
+/// on its own. The UI surfaces these in a "Suggested resolutions" panel
+/// where the user can confirm (apply) or reject (discard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingResolutionDto {
+    pub action_id: i64,
+    pub action_title: String,
+    /// `"done"` or `"cancelled"` — what the agent proposes the new status be.
+    pub suggested_status: String,
+    pub confidence: Confidence,
+    pub rationale: Option<String>,
+    /// Unix seconds — when the agent emitted the suggestion.
+    pub suggested_at: i64,
+}
+
 /// Map a long, raw error string from the engine (typically an anyhow chain
 /// from `SyncOutcome.errors`) into a short, human-friendly one-liner suitable
 /// for the toast. Falls back to a truncated copy of the raw text for

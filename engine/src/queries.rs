@@ -3,7 +3,8 @@
 
 use anyhow::{Context, Result};
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, MessageDto, SourceHealth, SourceStatus, StatusSnapshot,
+    ActionDto, ActionStatus, Confidence, MessageDto, PendingResolutionDto, SourceHealth,
+    SourceStatus, StatusSnapshot,
 };
 use sqlx::SqlitePool;
 
@@ -236,6 +237,68 @@ pub async fn get_status(pool: &SqlitePool) -> Result<StatusSnapshot> {
     })
 }
 
+/// Return resolution suggestions awaiting user review. A row appears here when
+/// the extractor's most-recent `suggested_resolution` for an action has not
+/// been superseded by a later user-driven event (`resolved`, `dismissed`,
+/// `claimed`, `unclaimed`, or `suggestion_dismissed`) and the action itself
+/// is still active.
+pub async fn list_pending_resolutions(pool: &SqlitePool) -> Result<Vec<PendingResolutionDto>> {
+    // The latest-per-action subquery picks one suggested_resolution row per
+    // action; the NOT EXISTS clause suppresses ones the user already handled.
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT a.id, a.title, e.data_json, e.occurred_at \
+         FROM action_events e \
+         JOIN actions a ON a.id = e.action_id \
+         WHERE e.event_kind = 'suggested_resolution' \
+           AND e.id = ( \
+               SELECT MAX(e2.id) FROM action_events e2 \
+               WHERE e2.action_id = e.action_id \
+                 AND e2.event_kind = 'suggested_resolution' \
+           ) \
+           AND a.status IN ('pending', 'auto_claimed', 'claimed') \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM action_events e3 \
+               WHERE e3.action_id = e.action_id \
+                 AND e3.id > e.id \
+                 AND e3.actor = 'user' \
+                 AND e3.event_kind IN \
+                     ('resolved','dismissed','claimed','unclaimed','suggestion_dismissed') \
+           ) \
+         ORDER BY e.occurred_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .context("listing pending resolutions")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (action_id, action_title, data_json, suggested_at) in rows {
+        let parsed: serde_json::Value = serde_json::from_str(&data_json).unwrap_or_default();
+        let suggested_status = parsed
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("done")
+            .to_string();
+        let confidence = parsed
+            .get("confidence")
+            .and_then(|v| v.as_str())
+            .and_then(Confidence::parse)
+            .unwrap_or(Confidence::Medium);
+        let rationale = parsed
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        out.push(PendingResolutionDto {
+            action_id,
+            action_title,
+            suggested_status,
+            confidence,
+            rationale,
+            suggested_at,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +505,154 @@ mod tests {
         assert_eq!(src.last_synced_at, Some(now - 60));
         assert_eq!(s.embed_queue_depth, 2);
         assert_eq!(s.last_extraction_at, Some(now - 30));
+        Ok(())
+    }
+
+    /// Seed an action + a `suggested_resolution` event on it. Returns the
+    /// action id so tests can drive follow-up events.
+    async fn seed_suggested(
+        pool: &SqlitePool,
+        title: &str,
+        suggested_status: &str,
+        suggested_at: i64,
+    ) -> Result<i64> {
+        let (action_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, confidence, status, extracted_at) \
+             VALUES (?, 'medium', 'pending', ?) RETURNING id",
+        )
+        .bind(title)
+        .bind(suggested_at)
+        .fetch_one(pool)
+        .await?;
+        let data = serde_json::json!({
+            "status": suggested_status,
+            "confidence": "medium",
+            "rationale": "Looks resolved in the window",
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO action_events \
+             (action_id, event_kind, actor, data_json, occurred_at) \
+             VALUES (?, 'suggested_resolution', 'agent_queued', ?, ?)",
+        )
+        .bind(action_id)
+        .bind(&data)
+        .bind(suggested_at)
+        .execute(pool)
+        .await?;
+        Ok(action_id)
+    }
+
+    #[tokio::test]
+    async fn list_pending_resolutions_returns_active_suggestions() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        let id = seed_suggested(&pool, "Send invoice", "done", now).await?;
+
+        let rows = list_pending_resolutions(&pool).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action_id, id);
+        assert_eq!(rows[0].action_title, "Send invoice");
+        assert_eq!(rows[0].suggested_status, "done");
+        assert_eq!(rows[0].confidence, Confidence::Medium);
+        assert!(rows[0].rationale.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_pending_resolutions_suppresses_user_resolved_actions() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        let id = seed_suggested(&pool, "Send invoice", "done", now).await?;
+
+        // User confirmed the suggestion by marking done themselves.
+        sqlx::query("UPDATE actions SET status = 'done', resolved_at = ? WHERE id = ?")
+            .bind(now + 5)
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO action_events (action_id, event_kind, actor, occurred_at) \
+             VALUES (?, 'resolved', 'user', ?)",
+        )
+        .bind(id)
+        .bind(now + 5)
+        .execute(&pool)
+        .await?;
+
+        let rows = list_pending_resolutions(&pool).await?;
+        assert!(
+            rows.is_empty(),
+            "user-resolved action should not appear as pending. got: {rows:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_pending_resolutions_suppresses_after_explicit_reject() -> Result<()> {
+        // Even if the action stays active, an explicit 'suggestion_dismissed'
+        // event closes that suggestion out — the user said no.
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        let id = seed_suggested(&pool, "Send invoice", "done", now).await?;
+        sqlx::query(
+            "INSERT INTO action_events (action_id, event_kind, actor, occurred_at) \
+             VALUES (?, 'suggestion_dismissed', 'user', ?)",
+        )
+        .bind(id)
+        .bind(now + 5)
+        .execute(&pool)
+        .await?;
+
+        let rows = list_pending_resolutions(&pool).await?;
+        assert!(rows.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_pending_resolutions_uses_latest_suggestion_per_action() -> Result<()> {
+        // Older suggestion was rejected; newer suggestion stands.
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        let id = seed_suggested(&pool, "Send invoice", "done", now - 100).await?;
+        sqlx::query(
+            "INSERT INTO action_events (action_id, event_kind, actor, occurred_at) \
+             VALUES (?, 'suggestion_dismissed', 'user', ?)",
+        )
+        .bind(id)
+        .bind(now - 50)
+        .execute(&pool)
+        .await?;
+        // Newer suggestion — pretending the extractor saw new evidence.
+        let data = serde_json::json!({
+            "status": "cancelled",
+            "confidence": "low",
+            "rationale": "Looks dropped from the plan",
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO action_events \
+             (action_id, event_kind, actor, data_json, occurred_at) \
+             VALUES (?, 'suggested_resolution', 'agent_queued', ?, ?)",
+        )
+        .bind(id)
+        .bind(&data)
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        let rows = list_pending_resolutions(&pool).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].suggested_status, "cancelled");
+        assert_eq!(rows[0].confidence, Confidence::Low);
         Ok(())
     }
 }

@@ -2,7 +2,8 @@ use leptos::prelude::*;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, StatusSnapshot, SyncOutcome,
+    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, PendingResolutionDto,
+    StatusSnapshot, SyncOutcome,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -79,6 +80,45 @@ pub async fn update_action(
     })
     .map_err(|e| e.to_string())?;
     invoke("update_action", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn fetch_pending_resolutions() -> Result<Vec<PendingResolutionDto>, String> {
+    let raw = invoke("list_pending_resolutions", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<PendingResolutionDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct ConfirmResolutionArgs {
+    action_id: i64,
+    new_status: ActionStatus,
+}
+
+pub async fn confirm_resolution(action_id: i64, new_status: ActionStatus) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&ConfirmResolutionArgs {
+        action_id,
+        new_status,
+    })
+    .map_err(|e| e.to_string())?;
+    invoke("confirm_resolution", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct RejectResolutionArgs {
+    action_id: i64,
+}
+
+pub async fn reject_resolution(action_id: i64) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&RejectResolutionArgs { action_id })
+        .map_err(|e| e.to_string())?;
+    invoke("reject_resolution", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     Ok(())

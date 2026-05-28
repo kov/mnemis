@@ -558,6 +558,203 @@ async fn dismiss_records_feedback_and_undo_skip_records_none() -> Result<()> {
     Ok(())
 }
 
+/// Suggestions panel: seed two pending actions, each with a queued
+/// `suggested_resolution` event. Click Confirm on one (it goes to done +
+/// disappears from the active list) and Reject on the other (action stays
+/// pending; suggestion disappears via a `suggestion_dismissed` event).
+#[tokio::test(flavor = "current_thread")]
+async fn suggestions_panel_confirm_applies_and_reject_dismisses() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-suggestions.db");
+    let (confirm_id, reject_id) = {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        seed(&pool).await?;
+        // Reuse the two seeded actions as suggestion targets. Mark both
+        // pending (the high one is auto_claimed by default) so the
+        // suggestions query picks them up alongside.
+        sqlx::query("UPDATE actions SET status = 'pending'")
+            .execute(&pool)
+            .await?;
+        let actions: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, title FROM actions ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(actions.len(), 2);
+        let (confirm_id, _) = actions[0].clone();
+        let (reject_id, _) = actions[1].clone();
+        let now = Utc::now().timestamp();
+        for (id, status_proposal) in [(confirm_id, "done"), (reject_id, "cancelled")] {
+            let data = serde_json::json!({
+                "status": status_proposal,
+                "confidence": "medium",
+                "rationale": "Looks resolved in the window",
+            })
+            .to_string();
+            sqlx::query(
+                "INSERT INTO action_events \
+                 (action_id, event_kind, actor, data_json, occurred_at) \
+                 VALUES (?, 'suggested_resolution', 'agent_queued', ?, ?)",
+            )
+            .bind(id)
+            .bind(&data)
+            .bind(now)
+            .execute(&pool)
+            .await?;
+        }
+        pool.close().await;
+        (confirm_id, reject_id)
+    };
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.suggestions-panel"))
+        .await
+        .context("waiting for suggestions panel to render")?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Sanity: both suggestion rows should be present, identified by their
+    // data-action-id attributes.
+    let counts = client
+        .execute(
+            r#"
+            return JSON.stringify({
+                total: document.querySelectorAll('div.suggestion').length,
+                confirm: document.querySelectorAll(`div.suggestion[data-action-id]`).length,
+            });
+            "#,
+            vec![],
+        )
+        .await?;
+    assert!(
+        counts.as_str().unwrap_or("").contains("\"total\":2"),
+        "expected 2 suggestion rows, got: {counts:?}"
+    );
+
+    // Confirm the first one — action should go to 'done' and the suggestion
+    // row should disappear.
+    let confirm = client
+        .execute(
+            &format!(
+                r#"
+                const row = document.querySelector(`div.suggestion[data-action-id="{confirm_id}"]`);
+                if (!row) {{ return 'missing-row'; }}
+                const btn = Array.from(row.querySelectorAll('button')).find(b => b.textContent.trim() === 'Confirm');
+                if (!btn) {{ return 'missing-confirm'; }}
+                btn.click();
+                return 'ok';
+                "#
+            ),
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        confirm.as_str(),
+        Some("ok"),
+        "Confirm click failed: {confirm:?}"
+    );
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let still = client
+            .execute(
+                &format!(
+                    r#"
+                    return document.querySelector(`div.suggestion[data-action-id="{confirm_id}"]`) ? 'present' : 'gone';
+                    "#
+                ),
+                vec![],
+            )
+            .await?;
+        if still.as_str() == Some("gone") {
+            break;
+        }
+    }
+
+    // Reject the second one — action stays pending, but the suggestion row
+    // should disappear and a 'suggestion_dismissed' event should land.
+    let reject = client
+        .execute(
+            &format!(
+                r#"
+                const row = document.querySelector(`div.suggestion[data-action-id="{reject_id}"]`);
+                if (!row) {{ return 'missing-row'; }}
+                const btn = Array.from(row.querySelectorAll('button')).find(b => b.textContent.trim() === 'Reject');
+                if (!btn) {{ return 'missing-reject'; }}
+                btn.click();
+                return 'ok';
+                "#
+            ),
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        reject.as_str(),
+        Some("ok"),
+        "Reject click failed: {reject:?}"
+    );
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let still = client
+            .execute(
+                &format!(
+                    r#"
+                    return document.querySelector(`div.suggestion[data-action-id="{reject_id}"]`) ? 'present' : 'gone';
+                    "#
+                ),
+                vec![],
+            )
+            .await?;
+        if still.as_str() == Some("gone") {
+            break;
+        }
+    }
+
+    // Verify DB state.
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let confirm_state: (String, Option<i64>) =
+            sqlx::query_as("SELECT status, resolved_at FROM actions WHERE id = ?")
+                .bind(confirm_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(confirm_state.0, "done", "confirmed action should be done");
+        assert!(confirm_state.1.is_some(), "resolved_at should be set");
+
+        let reject_state: (String,) = sqlx::query_as("SELECT status FROM actions WHERE id = ?")
+            .bind(reject_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(reject_state.0, "pending", "rejected action stays pending");
+        let (dismissed_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM action_events \
+             WHERE action_id = ? AND event_kind = 'suggestion_dismissed'",
+        )
+        .bind(reject_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            dismissed_count, 1,
+            "expected one suggestion_dismissed event"
+        );
+        pool.close().await;
+    }
+
+    client.close().await.ok();
+    Ok(())
+}
+
 /// Seed exactly two actions linked to messages: one high-confidence (visible
 /// up front) and one low-confidence (hidden behind the revealer). Matches
 /// the `record_action` insert shape so the same `queries::list_actions` SQL

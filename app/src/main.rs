@@ -12,7 +12,8 @@ use mnemis_engine::embed::{Embedder, OmlxEmbedder};
 use mnemis_engine::llm::LlmClient;
 use mnemis_engine::{config, db, mutations, orchestrator, queries};
 use mnemis_types::{
-    ActionDto, ActionStatus, FeedbackKind, MessageDto, StatusSnapshot, SyncOutcome,
+    ActionDto, ActionStatus, FeedbackKind, MessageDto, PendingResolutionDto, StatusSnapshot,
+    SyncOutcome,
 };
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
@@ -72,6 +73,36 @@ async fn update_action(
     dismissed_reason: Option<String>,
 ) -> Result<(), String> {
     mutations::update_action_status(&state.pool, action_id, new_status, dismissed_reason)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn list_pending_resolutions(
+    state: State<'_, AppState>,
+) -> Result<Vec<PendingResolutionDto>, String> {
+    queries::list_pending_resolutions(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn confirm_resolution(
+    state: State<'_, AppState>,
+    action_id: i64,
+    new_status: ActionStatus,
+) -> Result<(), String> {
+    // Routes through the same status-update path the user buttons use; that
+    // already writes a user-driven 'resolved' event which suppresses the
+    // suggestion via the NOT EXISTS clause in list_pending_resolutions.
+    mutations::update_action_status(&state.pool, action_id, new_status, None)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn reject_resolution(state: State<'_, AppState>, action_id: i64) -> Result<(), String> {
+    mutations::reject_resolution_suggestion(&state.pool, action_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -203,7 +234,10 @@ fn main() {
             get_status,
             sync_now,
             update_action,
-            submit_dismissal_feedback
+            submit_dismissal_feedback,
+            list_pending_resolutions,
+            confirm_resolution,
+            reject_resolution
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
