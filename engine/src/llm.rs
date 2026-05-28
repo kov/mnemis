@@ -69,7 +69,7 @@ struct ResponsesRequest<'a> {
     previous_response_id: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentItem {
     #[serde(rename = "output_text")]
@@ -78,7 +78,7 @@ pub enum ContentItem {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ReasoningContentItem {
     #[serde(rename = "reasoning_text")]
@@ -87,7 +87,7 @@ pub enum ReasoningContentItem {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputItem {
     #[serde(rename = "message")]
@@ -104,7 +104,7 @@ pub enum OutputItem {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResponsesResponse {
     pub id: String,
     pub status: String,

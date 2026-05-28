@@ -32,6 +32,22 @@ impl Config {
             .map(expand_tilde)
             .unwrap_or_else(default_db_path)
     }
+
+    /// `<db_parent>/traces/`. Per-run JSONL trace files live here. Caller
+    /// is responsible for `create_dir_all` (TraceWriter does it).
+    pub fn traces_dir(&self) -> PathBuf {
+        traces_dir_for(&self.db_path())
+    }
+}
+
+/// Derive a traces directory next to a given DB path. Pulled out as a free
+/// function so the Tauri app — which resolves the DB path via env, not
+/// `Config::load` — can compute it the same way.
+pub fn traces_dir_for(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|p| p.join("traces"))
+        .unwrap_or_else(|| PathBuf::from("traces"))
 }
 
 /// Write the LLM section to the configured `config.toml`, preserving the

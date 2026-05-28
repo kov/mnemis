@@ -56,7 +56,7 @@ async fn extracts_explicit_ask_into_high_confidence_action() -> Result<()> {
         mock::no_tools("Recorded one action."),
     ]);
 
-    let outcome = extract_for_channel(&pool, &*llm, ctx.channel_id, &ctx.model).await?;
+    let outcome = extract_for_channel(&pool, &*llm, ctx.channel_id, &ctx.model, None).await?;
     assert_eq!(outcome.result, "ok", "expected ok, got {:?}", outcome);
 
     let actions = fetch_actions(&pool).await?;
@@ -112,7 +112,7 @@ async fn skips_purely_informational_message() -> Result<()> {
         "Nothing to extract — informational only.",
     )]);
 
-    let outcome = extract_for_channel(&pool, &*llm, ctx.channel_id, &ctx.model).await?;
+    let outcome = extract_for_channel(&pool, &*llm, ctx.channel_id, &ctx.model, None).await?;
     assert_eq!(outcome.result, "ok");
 
     let actions = fetch_actions(&pool).await?;

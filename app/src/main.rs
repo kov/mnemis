@@ -26,6 +26,9 @@ pub(crate) struct AppState {
     /// missing, sync_now is the only command that surfaces a clear error;
     /// read-only views continue to work.
     pub llm_stack: Option<LlmStack>,
+    /// Resolved path to the SQLite file, kept so commands can derive the
+    /// traces directory (`<db_parent>/traces/`) without recomputing it.
+    pub db_path: PathBuf,
 }
 
 pub(crate) struct LlmStack {
@@ -217,11 +220,13 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
         .llm_stack
         .as_ref()
         .ok_or_else(|| "No LLM configured. Edit ~/.config/mnemis/config.toml.".to_string())?;
+    let traces = config::traces_dir_for(&state.db_path);
     orchestrator::sync_now(
         &state.pool,
         &stack.llm,
         Arc::clone(&stack.embedder),
         &stack.chat_model,
+        Some(&traces),
     )
     .await
     .map_err(|e| format!("{e:#}"))
@@ -294,7 +299,11 @@ fn main() {
                 }
             };
 
-            app.manage(AppState { pool, llm_stack });
+            app.manage(AppState {
+                pool,
+                llm_stack,
+                db_path: app_data,
+            });
 
             // macOS: tray-resident. Linux/Windows: window-only for now.
             // Linux runtime tray detection is Phase 7.

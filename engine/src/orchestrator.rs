@@ -33,6 +33,7 @@ pub async fn sync_now(
     llm: &dyn LlmTransport,
     embedder: Arc<dyn Embedder>,
     model_name: &str,
+    traces_dir: Option<&std::path::Path>,
 ) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
 
@@ -48,7 +49,17 @@ pub async fn sync_now(
     for (source_id, source_name) in sources {
         let started = Instant::now();
         info!(source_id, source_name = %source_name, "source: start");
-        match sync_one_source(pool, source_id, &source_name, llm, &embedder, model_name).await {
+        match sync_one_source(
+            pool,
+            source_id,
+            &source_name,
+            llm,
+            &embedder,
+            model_name,
+            traces_dir,
+        )
+        .await
+        {
             Ok(counts) => {
                 info!(
                     source_id,
@@ -136,6 +147,7 @@ async fn sync_one_source(
     llm: &dyn LlmTransport,
     embedder: &Arc<dyn Embedder>,
     model_name: &str,
+    traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     let source = build_imap_source(pool, SourceId(source_id)).await?;
     sync_one_source_with(
@@ -146,12 +158,14 @@ async fn sync_one_source(
         llm,
         embedder,
         model_name,
+        traces_dir,
     )
     .await
 }
 
 /// Inner loop, split out so tests can inject a fake `Source` without
 /// touching the keychain or the IMAP transport.
+#[allow(clippy::too_many_arguments)]
 async fn sync_one_source_with(
     pool: &SqlitePool,
     source_id: i64,
@@ -160,6 +174,7 @@ async fn sync_one_source_with(
     llm: &dyn LlmTransport,
     embedder: &Arc<dyn Embedder>,
     model_name: &str,
+    traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
@@ -238,7 +253,7 @@ async fn sync_one_source_with(
         trace!(channel_id, "channel: extracting");
         let mut ch_actions = 0usize;
         let mut ch_extract_err: Option<String> = None;
-        match extract_for_channel(pool, llm, channel_id, model_name).await {
+        match extract_for_channel(pool, llm, channel_id, model_name, traces_dir).await {
             Ok(o) => {
                 ch_actions = o.actions_created;
                 counts.actions_created += o.actions_created as i64;
@@ -374,7 +389,7 @@ mod tests {
             "http://0.0.0.0".to_string(),
             "noop".to_string(),
         ));
-        let out = sync_now(&pool, &llm, embedder, "test-model").await?;
+        let out = sync_now(&pool, &llm, embedder, "test-model", None).await?;
         assert_eq!(out.sources_synced, 0);
         assert_eq!(out.sources_failed, 0);
         assert_eq!(out.messages_ingested, 0);
@@ -481,6 +496,7 @@ mod tests {
             &ContextWindowLlm,
             &embedder,
             "test-model",
+            None,
         )
         .await?;
 

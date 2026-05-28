@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
+use std::path::Path;
 use std::time::Instant;
 use tracing::{debug, trace, warn};
 
@@ -8,10 +9,12 @@ use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 
 pub mod prompt;
 pub mod tools;
+pub mod trace;
 
 use mnemis_types::FeedbackKind;
 use prompt::{ExistingAction, FeedbackExample, PromptInputs, WindowMessage};
 use tools::ExtractionScope;
+use trace::TraceWriter;
 
 pub const PROMPT_VERSION: i64 = 1;
 const WINDOW_LIMIT: i64 = 100;
@@ -30,6 +33,7 @@ pub async fn extract_for_channel(
     llm: &dyn LlmTransport,
     channel_id: i64,
     model_name: &str,
+    traces_dir: Option<&Path>,
 ) -> Result<ExtractionOutcome> {
     let channel = load_channel(pool, channel_id).await?;
     let watermark = load_watermark(pool, channel_id).await?;
@@ -88,7 +92,13 @@ pub async fn extract_for_channel(
         source_id: channel.source_id,
         channel_id,
     };
-    let outcome = run_agent_loop(pool, llm, scope, system_prompt).await;
+    let ran_at = Utc::now().timestamp();
+    let mut writer = traces_dir.map(|dir| TraceWriter::open(dir, ran_at, channel_id));
+    if let Some(w) = writer.as_mut() {
+        w.system_prompt(&system_prompt);
+        w.tools(&tools::definitions());
+    }
+    let outcome = run_agent_loop(pool, llm, scope, system_prompt, writer.as_mut()).await;
 
     // Record the run first either way, then bubble the error so the
     // orchestrator can surface it in SyncOutcome.errors → the toast.
@@ -96,6 +106,9 @@ pub async fn extract_for_channel(
     // in the UI even though they wrote to extraction_runs.
     match outcome {
         Ok((actions_created, summary)) => {
+            if let Some(w) = writer.as_mut() {
+                w.finish(actions_created, summary.as_deref());
+            }
             record_run(
                 pool,
                 channel_id,
@@ -117,6 +130,9 @@ pub async fn extract_for_channel(
         Err(e) => {
             let chain = format!("{e:#}");
             warn!(error = %chain, channel_id, "extraction agent failed");
+            if let Some(w) = writer.as_mut() {
+                w.agent_error(&chain);
+            }
             record_run(
                 pool,
                 channel_id,
@@ -322,6 +338,7 @@ async fn run_agent_loop(
     llm: &dyn LlmTransport,
     scope: ExtractionScope,
     system_prompt: String,
+    mut trace: Option<&mut TraceWriter>,
 ) -> Result<(usize, Option<String>)> {
     let tool_defs = tools::definitions();
     let mut input = vec![InputItem::Message {
@@ -333,20 +350,36 @@ async fn run_agent_loop(
 
     for turn in 0..MAX_AGENT_TURNS {
         let t = Instant::now();
+        let input_for_send = std::mem::take(&mut input);
+        if let Some(w) = trace.as_deref_mut() {
+            w.llm_send(turn, &input_for_send, last_response_id.as_deref());
+        }
         trace!(turn, channel_id = scope.channel_id, "LLM: send");
-        let response = llm
+        let response = match llm
             .send(
                 &system_prompt,
-                std::mem::take(&mut input),
+                input_for_send,
                 &tool_defs,
                 last_response_id.as_deref(),
             )
             .await
-            .with_context(|| format!("LLM send failed on turn {turn}"))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(w) = trace.as_deref_mut() {
+                    w.llm_error(turn, &format!("{e:#}"));
+                }
+                return Err(e).with_context(|| format!("LLM send failed on turn {turn}"));
+            }
+        };
+        let elapsed = t.elapsed().as_secs();
+        if let Some(w) = trace.as_deref_mut() {
+            w.llm_recv(turn, elapsed, &response);
+        }
         trace!(
             turn,
             channel_id = scope.channel_id,
-            secs = t.elapsed().as_secs(),
+            secs = elapsed,
             "LLM: recv"
         );
         last_response_id = Some(response.id);
@@ -386,6 +419,9 @@ async fn run_agent_loop(
             let out = tools::dispatch(pool, scope, &name, &arguments).await;
             if out.recorded_action {
                 actions_created += 1;
+            }
+            if let Some(w) = trace.as_deref_mut() {
+                w.tool_dispatch(turn, &call_id, &name, &arguments, &out.output);
             }
             input.push(InputItem::FunctionCallOutput {
                 call_id,
@@ -638,7 +674,7 @@ mod tests {
             "LLM API error (HTTP 400 Bad Request): Prompt too long: 154806 \
              tokens exceeds max context window of 131072 tokens",
         );
-        let result = extract_for_channel(&pool, &llm, channel_id, "test-model").await;
+        let result = extract_for_channel(&pool, &llm, channel_id, "test-model", None).await;
         let err = result.expect_err("extract_for_channel should return Err when the agent fails");
         let msg = format!("{err:#}");
         assert!(

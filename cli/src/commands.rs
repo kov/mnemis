@@ -136,7 +136,9 @@ pub async fn sync(cfg: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let outcome = orchestrator::sync_now(&pool, &llm, embedder, &cfg.llm.chat_model).await?;
+    let traces = cfg.traces_dir();
+    let outcome =
+        orchestrator::sync_now(&pool, &llm, embedder, &cfg.llm.chat_model, Some(&traces)).await?;
 
     println!(
         "Synced {} source(s) ({} failed), {} channel(s) polled, {} new message(s), \
@@ -222,7 +224,9 @@ pub async fn list_actions(cfg: &Config, status_filter: Option<&str>, json: bool)
 pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
     let llm = build_llm(cfg);
-    let outcome = extract_for_channel(&pool, &llm, channel_id, &cfg.llm.chat_model).await?;
+    let traces = cfg.traces_dir();
+    let outcome =
+        extract_for_channel(&pool, &llm, channel_id, &cfg.llm.chat_model, Some(&traces)).await?;
     println!(
         "result={} actions_created={} up_to_message_id={:?}",
         outcome.result, outcome.actions_created, outcome.up_to_message_id
@@ -230,6 +234,7 @@ pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
     if let Some(s) = outcome.summary {
         println!("summary: {s}");
     }
+    println!("trace dir: {}", traces.display());
     Ok(())
 }
 
