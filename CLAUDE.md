@@ -43,6 +43,8 @@ MNEMIS_TEST_LLM=live \
 # Tauri app
 cargo build -p mnemis-app
 MNEMIS_DB_PATH=/path/to/mnemis.db ./target/debug/mnemis-app
+# MNEMIS_CONFIG_PATH=/path/to/config.toml works the same way for the
+# config file (otherwise defaults to ~/.config/mnemis/config.toml).
 ```
 
 ## UI debugging & integration tests
