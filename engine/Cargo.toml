@@ -28,6 +28,7 @@ hex = "0.4.3"
 dirs = "6.0.0"
 toml = "1.1.2"
 secret-service = { version = "5.0.0", features = ["rt-tokio-crypto-rust"] }
+base64 = "0.22.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

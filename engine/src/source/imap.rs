@@ -92,8 +92,12 @@ impl Source for ImapSource {
         let channels = names
             .iter()
             .map(|n| ChannelInfo {
+                // external_id is what we hand back to the server in later
+                // SELECT calls — it MUST stay in the raw modified-UTF-7
+                // form. `name` is for humans; decode it so accented and
+                // non-Latin mailboxes don't show up as `Ita&APo-`.
                 external_id: n.name().to_string(),
-                name: n.name().to_string(),
+                name: super::imap_utf7::decode_mailbox_name(n.name()),
                 kind: "mailbox".to_string(),
             })
             .collect();

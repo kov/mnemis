@@ -213,7 +213,11 @@ pub async fn list_source_channels(pool: &SqlitePool, source_id: i64) -> Result<V
                     id,
                     source_id,
                     external_id,
-                    name,
+                    // Decode on read so already-stored rows from a pre-fix
+                    // sync (mangled `Ita&APo-` in the DB) render correctly.
+                    // The decoder is idempotent on plain ASCII / already-
+                    // decoded UTF-8, so this is safe to apply unconditionally.
+                    name: crate::source::imap_utf7::decode_mailbox_name(&name),
                     kind,
                     muted: muted != 0,
                     last_synced_at,
@@ -616,6 +620,38 @@ mod tests {
             src[0].muted,
             "all channels muted means source row reads muted"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_source_channels_decodes_imap_utf7_names() -> Result<()> {
+        // Channels already in the DB with mangled modified-UTF-7 names
+        // (e.g. from a sync that ran before the decoder was added) must
+        // still render decoded in the UI, without needing a migration.
+        let (_tmp, pool) = open().await?;
+        let now = Utc::now().timestamp();
+        let (sid,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'INBOX/Ita&APo-', 'INBOX/Ita&APo-', 'mailbox')",
+        )
+        .bind(sid)
+        .execute(&pool)
+        .await?;
+
+        let rows = list_source_channels(&pool, sid).await?;
+        assert_eq!(rows.len(), 1);
+        // The display name is decoded ...
+        assert_eq!(rows[0].name, "INBOX/Itaú");
+        // ... but the external_id stays raw, since that's what the server
+        // expects on the next SELECT.
+        assert_eq!(rows[0].external_id, "INBOX/Ita&APo-");
         Ok(())
     }
 
