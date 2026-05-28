@@ -5,7 +5,7 @@ use leptos::task::spawn_local;
 use leptos::web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use leptos_router::components::A;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
+    ActionDto, ActionStatus, ChannelRowDto, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
     PendingResolutionDto, ProfileIdentifier, SourceHealth, SourceRowDto, StatusSnapshot,
     SyncOutcome, UserProfileDto, summarize_sync_error,
 };
@@ -14,8 +14,9 @@ use wasm_bindgen::JsCast;
 use crate::{
     FirstRunTick, SyncTick, add_imap_source, confidence_class, confirm_resolution, delete_source,
     fetch_actions, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
-    fetch_settings_sources, fetch_status, fetch_user_profile, reject_resolution, run_sync_now,
-    save_llm_config, save_user_profile, set_source_muted, status_label, submit_dismissal_feedback,
+    fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
+    reject_resolution, run_sync_now, save_llm_config, save_user_profile, set_channel_muted,
+    set_channels_muted_bulk, set_source_muted, status_label, submit_dismissal_feedback,
     update_action,
 };
 
@@ -995,6 +996,7 @@ fn SourcesTable(rows: Vec<SourceRowDto>, refetch: Arc<dyn Fn() + Send + Sync>) -
         <table class="sources-table">
             <thead>
                 <tr>
+                    <th></th>
                     <th>"Name"</th>
                     <th>"Kind"</th>
                     <th>"Health"</th>
@@ -1023,6 +1025,8 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
     let id = row.id;
     let health = row.health;
     let muted = RwSignal::new(row.muted);
+    let expanded = RwSignal::new(false);
+
     let on_toggle = {
         let refetch = refetch.clone();
         move |_| {
@@ -1046,8 +1050,15 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
             });
         }
     };
+    let on_expand = move |_| expanded.update(|v| *v = !*v);
+
     view! {
         <tr class="source-row" data-source-id=id.to_string()>
+            <td>
+                <button class="btn btn-ghost source-expand" on:click=on_expand>
+                    {move || if expanded.get() { "▾" } else { "▸" }}
+                </button>
+            </td>
             <td>{row.name.clone()}</td>
             <td>{row.kind.clone()}</td>
             <td>
@@ -1064,5 +1075,221 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
                 <button class="btn btn-ghost" on:click=on_delete>"Delete"</button>
             </td>
         </tr>
+        <Show when=move || expanded.get() fallback=|| view! { <tr style="display:none"></tr> }>
+            <tr class="source-channels-row" data-source-id=id.to_string()>
+                <td></td>
+                <td colspan="5">
+                    <SourceChannels source_id=id />
+                </td>
+            </tr>
+        </Show>
     }
+}
+
+#[component]
+fn SourceChannels(source_id: i64) -> impl IntoView {
+    let channels = LocalResource::new(move || async move {
+        fetch_source_channels(source_id).await
+    });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || channels.refetch());
+    view! {
+        <Suspense fallback=|| view! { <div class="loading">"Loading channels…"</div> }>
+            {move || {
+                let refetch = refetch.clone();
+                channels.get().map(move |res| match res {
+                    Ok(rows) if rows.is_empty() => view! {
+                        <div class="empty">"No channels yet — sync once to discover them."</div>
+                    }.into_any(),
+                    Ok(rows) => view! {
+                        <ChannelsList rows=rows refetch=refetch />
+                    }.into_any(),
+                    Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Tree node for the channel hierarchy. A node may carry a channel of its own
+/// (its full path matches an actual mailbox), have children (paths that
+/// extend it), or both — IMAP folders like `INBOX/Lembrar` are mailboxes
+/// *and* parents of `INBOX/Lembrar/Sub`.
+#[derive(Clone)]
+struct ChannelNode {
+    /// Last path segment, e.g. "Lembrar".
+    label: String,
+    channel: Option<ChannelRowDto>,
+    children: Vec<ChannelNode>,
+}
+
+/// Build the tree, splitting on '/'. Sorted at each level for stable order.
+fn build_tree(rows: Vec<ChannelRowDto>) -> Vec<ChannelNode> {
+    fn insert(siblings: &mut Vec<ChannelNode>, segments: &[&str], row: ChannelRowDto) {
+        let segment = segments[0];
+        let idx = match siblings.iter().position(|n| n.label == segment) {
+            Some(i) => i,
+            None => {
+                siblings.push(ChannelNode {
+                    label: segment.to_string(),
+                    channel: None,
+                    children: Vec::new(),
+                });
+                siblings.len() - 1
+            }
+        };
+        if segments.len() == 1 {
+            siblings[idx].channel = Some(row);
+        } else {
+            insert(&mut siblings[idx].children, &segments[1..], row);
+        }
+    }
+    fn sort_in_place(nodes: &mut [ChannelNode]) {
+        nodes.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        for n in nodes {
+            sort_in_place(&mut n.children);
+        }
+    }
+    let mut roots: Vec<ChannelNode> = Vec::new();
+    for row in rows {
+        let segments: Vec<String> = row
+            .name
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if segments.is_empty() {
+            continue;
+        }
+        let refs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+        insert(&mut roots, &refs, row);
+    }
+    sort_in_place(&mut roots);
+    roots
+}
+
+/// Walk the tree collecting every channel id (skipping pure folders).
+fn collect_channel_ids(nodes: &[ChannelNode], out: &mut Vec<i64>) {
+    for n in nodes {
+        if let Some(c) = &n.channel {
+            out.push(c.id);
+        }
+        collect_channel_ids(&n.children, out);
+    }
+}
+
+#[component]
+fn ChannelsList(
+    rows: Vec<ChannelRowDto>,
+    refetch: Arc<dyn Fn() + Send + Sync>,
+) -> impl IntoView {
+    let tree = build_tree(rows.clone());
+    let all_ids = {
+        let mut v = Vec::new();
+        collect_channel_ids(&tree, &mut v);
+        v
+    };
+    let total = all_ids.len();
+
+    // Deliberately *don't* bump the source-list refetch on channel writes:
+    // remounting the source row from a fresh fetch would collapse the
+    // expanded tree mid-toggle. The source-level "Muted" badge can be
+    // slightly stale until next nav — acceptable trade-off because the user
+    // is now working at channel granularity.
+    let bulk = {
+        let refetch = refetch.clone();
+        move |muted: bool| {
+            let refetch = refetch.clone();
+            let ids = all_ids.clone();
+            spawn_local(async move {
+                let _ = set_channels_muted_bulk(ids, muted).await;
+                refetch();
+            });
+        }
+    };
+    let on_enable_all = {
+        let bulk = bulk.clone();
+        move |_| bulk(false)
+    };
+    let on_disable_all = move |_| bulk(true);
+
+    view! {
+        <div class="channels-toolbar">
+            <button class="btn btn-ghost channels-enable-all" on:click=on_enable_all>"Enable all"</button>
+            <button class="btn btn-ghost channels-disable-all" on:click=on_disable_all>"Disable all"</button>
+            <span class="channels-count">{format!("{total} channel(s)")}</span>
+        </div>
+        <ul class="channels-tree channels-list">
+            {tree.into_iter().map(|node| {
+                render_node(node, refetch.clone())
+            }).collect_view()}
+        </ul>
+    }
+}
+
+fn render_node(node: ChannelNode, refetch: Arc<dyn Fn() + Send + Sync>) -> AnyView {
+    let label = node.label.clone();
+    let children = node.children;
+    let row_view = match node.channel {
+        Some(channel) => {
+            let id = channel.id;
+            let kind = channel.kind.clone();
+            let count = channel.message_count;
+            let muted = RwSignal::new(channel.muted);
+            let on_toggle = {
+                let refetch = refetch.clone();
+                move |_| {
+                    let refetch = refetch.clone();
+                    let next = !muted.get();
+                    spawn_local(async move {
+                        if set_channel_muted(id, next).await.is_ok() {
+                            muted.set(next);
+                        }
+                        refetch();
+                    });
+                }
+            };
+            view! {
+                <li class="channel-row"
+                    data-channel-id=id.to_string()
+                    data-channel-muted=move || muted.get().to_string()>
+                    <input
+                        type="checkbox"
+                        class="channel-checkbox"
+                        prop:checked=move || !muted.get()
+                        on:change=on_toggle
+                    />
+                    <span class="channel-name">{label.clone()}</span>
+                    <span class="channel-kind">{format!("({kind})")}</span>
+                    <span class="channel-count">{format!("{count} msg")}</span>
+                </li>
+            }
+            .into_any()
+        }
+        None => view! {
+            // A pure folder in the hierarchy with no mailbox of its own.
+            // Shouldn't happen in practice (IMAP servers expose folders as
+            // selectable mailboxes), but handled so a misbehaving server
+            // can't crash the tree.
+            <li class="channel-row channel-folder">
+                <span class="channel-name">{label.clone()}</span>
+            </li>
+        }
+        .into_any(),
+    };
+
+    let children_view = if children.is_empty() {
+        ().into_any()
+    } else {
+        let refetch = refetch.clone();
+        view! {
+            <ul class="channel-children">
+                {children.into_iter().map(|c| {
+                    render_node(c, refetch.clone())
+                }).collect_view()}
+            </ul>
+        }
+        .into_any()
+    };
+
+    view! { <>{row_view}{children_view}</> }.into_any()
 }

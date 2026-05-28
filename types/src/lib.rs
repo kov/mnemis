@@ -207,7 +207,8 @@ pub struct LlmConfigDto {
 
 /// One row in the Settings → Sources table. Health is duplicated from
 /// `SourceStatus` for convenience so the settings page doesn't need a second
-/// fetch to colour the row.
+/// fetch to colour the row. `muted` is true when *every* channel on the
+/// source is muted — i.e. the source contributes nothing on sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRowDto {
     pub id: i64,
@@ -217,6 +218,22 @@ pub struct SourceRowDto {
     pub health: SourceHealth,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+/// One channel under a source — surfaces the per-channel mute knob so a user
+/// with a chatty mailbox can silence specific folders without disabling the
+/// whole account. `message_count` lets the UI hint which channels are
+/// actually pulling weight before the user decides what to silence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRowDto {
+    pub id: i64,
+    pub source_id: i64,
+    pub external_id: String,
+    pub name: String,
+    pub kind: String,
+    pub muted: bool,
+    pub last_synced_at: Option<i64>,
+    pub message_count: i64,
 }
 
 /// A resolution the extractor proposed but isn't confident enough to apply

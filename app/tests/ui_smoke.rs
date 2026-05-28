@@ -340,6 +340,286 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     Ok(())
 }
 
+/// Settings → Sources expand-row exposes a per-channel tree with checkboxes
+/// and bulk Enable/Disable buttons. Seed one source with a nested mailbox
+/// (`INBOX` + `INBOX/Lembrar` + `Archive`) so the tree code is exercised,
+/// then pin three things end-to-end:
+///   * one-by-one checkbox toggle persists and leaves siblings alone,
+///   * "Disable all" mutes every channel atomically,
+///   * "Enable all" unmutes every channel atomically.
+#[tokio::test(flavor = "current_thread")]
+async fn settings_sources_per_channel_mute_round_trips() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-channels.db");
+    let (chatty_id, nested_id, quiet_id) = {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        let (sid,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        let mut inserted = Vec::new();
+        for ext in ["INBOX", "INBOX/Lembrar", "Archive"] {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO channels (source_id, external_id, name, kind) \
+                 VALUES (?, ?, ?, 'mailbox') RETURNING id",
+            )
+            .bind(sid)
+            .bind(ext)
+            .bind(ext)
+            .fetch_one(&pool)
+            .await?;
+            inserted.push(id);
+        }
+        let chatty = inserted[0];
+        let nested = inserted[1];
+        let quiet = inserted[2];
+        for ext in ["m1", "m2", "m3"] {
+            sqlx::query(
+                "INSERT INTO messages (channel_id, external_id, posted_at, body, body_format, ingested_at) \
+                 VALUES (?, ?, ?, 'b', 'text', ?)",
+            )
+            .bind(chatty)
+            .bind(ext)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await?;
+        }
+        pool.close().await;
+        (chatty, nested, quiet)
+    };
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    // Navigate Actions → Settings → Sources via the nav links.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/settings"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("ul.settings-home"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('ul.settings-home a[href="/settings/sources"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("table.sources-table tr.source-row"))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Expand the source row.
+    let expand = client
+        .execute(
+            r#"
+            const row = document.querySelector('tr.source-row[data-source-id]');
+            const btn = row.querySelector('button.source-expand');
+            if (!btn) { return 'missing-expand'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(expand.as_str(), Some("ok"));
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("ul.channels-tree li.channel-row"))
+        .await
+        .context("waiting for channels tree to render")?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // All three channels visible — the nested "Lembrar" gets its own row
+    // under INBOX, so the leaf-count matches the seed.
+    let count = client
+        .execute(
+            r#"return String(document.querySelectorAll('li.channel-row').length);"#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(count.as_str(), Some("3"), "expected 3 channel rows");
+
+    // Tree shape: the "Lembrar" row should be inside a nested <ul> that
+    // hangs off the INBOX row's parent <li>. Asserting on the DOM nesting
+    // here is the cheapest way to make sure the tree-builder isn't quietly
+    // flattening or dropping branches.
+    let nested_ok = client
+        .execute(
+            r#"
+            const inbox = Array.from(document.querySelectorAll('li.channel-row'))
+                .find(el => el.querySelector('.channel-name')?.textContent.trim() === 'INBOX');
+            if (!inbox) { return 'no-inbox'; }
+            const nested = inbox.parentElement.querySelector('ul.channel-children li.channel-row .channel-name');
+            return nested ? nested.textContent.trim() : 'no-nested';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        nested_ok.as_str(),
+        Some("Lembrar"),
+        "expected Lembrar nested under INBOX in the tree, got {nested_ok:?}"
+    );
+
+    // 1) Toggle the INBOX checkbox off (mute that one mailbox).
+    let click = client
+        .execute(
+            r#"
+            const li = Array.from(document.querySelectorAll('li.channel-row'))
+                .find(el => el.querySelector('.channel-name')?.textContent.trim() === 'INBOX');
+            if (!li) { return 'missing-li'; }
+            const cb = li.querySelector('input.channel-checkbox');
+            if (!cb) { return 'missing-checkbox'; }
+            cb.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        click.as_str(),
+        Some("ok"),
+        "checkbox click failed: {click:?}"
+    );
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let state = client
+            .execute(
+                r#"
+                const li = Array.from(document.querySelectorAll('li.channel-row'))
+                    .find(el => el.querySelector('.channel-name')?.textContent.trim() === 'INBOX');
+                return li ? li.getAttribute('data-channel-muted') : 'gone';
+                "#,
+                vec![],
+            )
+            .await?;
+        if state.as_str() == Some("true") {
+            break;
+        }
+    }
+
+    // DB: only the INBOX mailbox is muted; the sibling and the nested
+    // child are untouched (no cascading on purpose).
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let muted_of = async |id: i64| -> Result<i64> {
+            let (m,): (i64,) = sqlx::query_as("SELECT muted FROM channels WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?;
+            Ok(m)
+        };
+        assert_eq!(muted_of(chatty_id).await?, 1, "INBOX should be muted");
+        assert_eq!(
+            muted_of(nested_id).await?,
+            0,
+            "INBOX/Lembrar must stay unmuted — toggles don't cascade"
+        );
+        assert_eq!(muted_of(quiet_id).await?, 0, "Archive must stay unmuted");
+        pool.close().await;
+    }
+
+    // 2) "Disable all" mutes every channel in one shot.
+    client
+        .execute(
+            r#"document.querySelector('button.channels-disable-all').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let all_muted = client
+            .execute(
+                r#"
+                const rows = Array.from(document.querySelectorAll('li.channel-row[data-channel-muted]'));
+                return String(rows.every(li => li.getAttribute('data-channel-muted') === 'true'));
+                "#,
+                vec![],
+            )
+            .await?;
+        if all_muted.as_str() == Some("true") {
+            break;
+        }
+    }
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (unmuted_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM channels WHERE muted = 0")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(unmuted_count, 0, "Disable all should mute every channel");
+        pool.close().await;
+    }
+
+    // 3) "Enable all" unmutes every channel in one shot.
+    client
+        .execute(
+            r#"document.querySelector('button.channels-enable-all').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let none_muted = client
+            .execute(
+                r#"
+                const rows = Array.from(document.querySelectorAll('li.channel-row[data-channel-muted]'));
+                return String(rows.every(li => li.getAttribute('data-channel-muted') === 'false'));
+                "#,
+                vec![],
+            )
+            .await?;
+        if none_muted.as_str() == Some("true") {
+            break;
+        }
+    }
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (muted_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM channels WHERE muted = 1")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(muted_count, 0, "Enable all should unmute every channel");
+        pool.close().await;
+    }
+
+    client.close().await.ok();
+    Ok(())
+}
+
 /// Two adjacent flows share one seeded DB: dismissing a pending action with
 /// a comment writes a `dismissal_feedback` row, while undoing an auto-claim
 /// via the Skip path writes none (the user often took the action out of band

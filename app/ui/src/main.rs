@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
+    ActionDto, ActionStatus, ChannelRowDto, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
     PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use serde::Serialize;
@@ -135,6 +135,48 @@ pub async fn set_source_muted(source_id: i64, muted: bool) -> Result<(), String>
     let args = serde_wasm_bindgen::to_value(&SetSourceMutedArgs { source_id, muted })
         .map_err(|e| e.to_string())?;
     invoke("set_source_muted", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn fetch_source_channels(source_id: i64) -> Result<Vec<ChannelRowDto>, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&SourceIdArgs { source_id }).map_err(|e| e.to_string())?;
+    let raw = invoke("list_source_channels", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<ChannelRowDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SetChannelMutedArgs {
+    channel_id: i64,
+    muted: bool,
+}
+
+pub async fn set_channel_muted(channel_id: i64, muted: bool) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetChannelMutedArgs { channel_id, muted })
+        .map_err(|e| e.to_string())?;
+    invoke("set_channel_muted", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct SetChannelsMutedBulkArgs {
+    channel_ids: Vec<i64>,
+    muted: bool,
+}
+
+pub async fn set_channels_muted_bulk(
+    channel_ids: Vec<i64>,
+    muted: bool,
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetChannelsMutedBulkArgs { channel_ids, muted })
+        .map_err(|e| e.to_string())?;
+    invoke("set_channels_muted_bulk", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     Ok(())

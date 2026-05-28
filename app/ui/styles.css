@@ -317,3 +317,40 @@ h1 {
 }
 
 .error { color: #b04040; }
+
+.channels-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+  align-items: center;
+}
+
+.channels-toolbar .channels-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.channels-tree, .channels-tree ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+}
+
+.channels-tree .channel-children {
+  padding-left: 18px;
+  border-left: 1px dotted var(--border);
+  margin-left: 6px;
+}
+
+.channels-tree .channel-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.channels-tree .channel-name { font-weight: 500; }
+.channels-tree .channel-kind { color: var(--muted); font-size: 12px; }
+.channels-tree .channel-count { color: var(--muted); font-size: 12px; }
+.channels-tree .channel-folder { color: var(--muted); font-style: italic; }

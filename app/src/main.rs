@@ -12,8 +12,8 @@ use mnemis_engine::embed::{Embedder, OmlxEmbedder};
 use mnemis_engine::llm::LlmClient;
 use mnemis_engine::{config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto,
-    SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
+    ActionDto, ActionStatus, ChannelRowDto, FeedbackKind, LlmConfigDto, MessageDto,
+    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
@@ -107,6 +107,38 @@ async fn is_first_run(state: State<'_, AppState>) -> Result<bool, String> {
 #[tauri::command]
 async fn list_settings_sources(state: State<'_, AppState>) -> Result<Vec<SourceRowDto>, String> {
     settings::list_sources(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn list_source_channels(
+    state: State<'_, AppState>,
+    source_id: i64,
+) -> Result<Vec<ChannelRowDto>, String> {
+    settings::list_source_channels(&state.pool, source_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_channel_muted(
+    state: State<'_, AppState>,
+    channel_id: i64,
+    muted: bool,
+) -> Result<(), String> {
+    settings::set_channel_muted(&state.pool, channel_id, muted)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_channels_muted_bulk(
+    state: State<'_, AppState>,
+    channel_ids: Vec<i64>,
+    muted: bool,
+) -> Result<(), String> {
+    settings::set_channels_muted_bulk(&state.pool, &channel_ids, muted)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -346,6 +378,9 @@ fn main() {
             set_source_muted,
             delete_source,
             add_imap_source,
+            list_source_channels,
+            set_channel_muted,
+            set_channels_muted_bulk,
             get_llm_config,
             save_llm_config
         ])

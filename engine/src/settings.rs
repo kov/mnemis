@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use mnemis_types::{ProfileIdentifier, SourceHealth, SourceRowDto, UserProfileDto};
+use mnemis_types::{ChannelRowDto, ProfileIdentifier, SourceHealth, SourceRowDto, UserProfileDto};
 use sqlx::SqlitePool;
 
 use crate::secrets;
@@ -148,6 +148,10 @@ pub async fn is_first_run(pool: &SqlitePool) -> Result<bool> {
 }
 
 /// All configured sources, in display order, with mute + health columns.
+/// `muted` is true only when *every* channel on the source is muted — partial
+/// mute states show as unmuted at the source row so the source-level
+/// Mute/Unmute button always means "(un)mute everything," not a partial
+/// state the user can't see from the row alone.
 #[allow(clippy::type_complexity)]
 pub async fn list_sources(pool: &SqlitePool) -> Result<Vec<SourceRowDto>> {
     let rows: Vec<(
@@ -160,9 +164,11 @@ pub async fn list_sources(pool: &SqlitePool) -> Result<Vec<SourceRowDto>> {
         Option<String>,
     )> = sqlx::query_as(
         "SELECT s.id, s.name, s.kind, \
-                    COALESCE((SELECT MAX(c.muted) FROM channels c WHERE c.source_id = s.id), 0), \
-                    s.status, s.last_synced_at, s.last_error \
-             FROM sources s ORDER BY s.id",
+                CASE WHEN EXISTS (SELECT 1 FROM channels WHERE source_id = s.id) \
+                     THEN COALESCE((SELECT MIN(c.muted) FROM channels c WHERE c.source_id = s.id), 0) \
+                     ELSE 0 END, \
+                s.status, s.last_synced_at, s.last_error \
+         FROM sources s ORDER BY s.id",
     )
     .fetch_all(pool)
     .await
@@ -181,6 +187,87 @@ pub async fn list_sources(pool: &SqlitePool) -> Result<Vec<SourceRowDto>> {
             },
         )
         .collect())
+}
+
+/// All channels on a single source, in display order, with mute state and
+/// the message count so the UI can hint which channels are actually pulling
+/// volume before the user decides what to silence. Returns an empty Vec if
+/// the source has no channels yet (e.g. IMAP source where discovery hasn't
+/// run yet).
+#[allow(clippy::type_complexity)]
+pub async fn list_source_channels(pool: &SqlitePool, source_id: i64) -> Result<Vec<ChannelRowDto>> {
+    let rows: Vec<(i64, i64, String, String, String, i64, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT c.id, c.source_id, c.external_id, c.name, c.kind, c.muted, c.last_synced_at, \
+                (SELECT COUNT(*) FROM messages WHERE channel_id = c.id) AS message_count \
+         FROM channels c WHERE c.source_id = ? ORDER BY c.name",
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .context("listing source channels")?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, source_id, external_id, name, kind, muted, last_synced_at, message_count)| {
+                ChannelRowDto {
+                    id,
+                    source_id,
+                    external_id,
+                    name,
+                    kind,
+                    muted: muted != 0,
+                    last_synced_at,
+                    message_count,
+                }
+            },
+        )
+        .collect())
+}
+
+/// Per-channel mute. Independent of the source-level mute helper — toggling
+/// one channel here doesn't affect siblings. The orchestrator skips muted
+/// channels in its `WHERE muted = 0` filter, so the next sync silently drops
+/// the muted ones.
+pub async fn set_channel_muted(pool: &SqlitePool, channel_id: i64, muted: bool) -> Result<()> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM channels WHERE id = ?")
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?;
+    if row.is_none() {
+        anyhow::bail!("channel {channel_id} not found");
+    }
+    sqlx::query("UPDATE channels SET muted = ? WHERE id = ?")
+        .bind(if muted { 1 } else { 0 })
+        .bind(channel_id)
+        .execute(pool)
+        .await
+        .context("updating channel mute")?;
+    Ok(())
+}
+
+/// Bulk per-channel mute. Used by the "Enable all" / "Disable all" buttons
+/// in the channel tree so the UI doesn't have to fan out N round-trips.
+/// Silently no-ops on an empty id list.
+pub async fn set_channels_muted_bulk(
+    pool: &SqlitePool,
+    channel_ids: &[i64],
+    muted: bool,
+) -> Result<()> {
+    if channel_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; channel_ids.len()].join(",");
+    let sql = sqlx::AssertSqlSafe(format!(
+        "UPDATE channels SET muted = ? WHERE id IN ({placeholders})"
+    ));
+    let mut q = sqlx::query(sql).bind(if muted { 1 } else { 0 });
+    for id in channel_ids {
+        q = q.bind(id);
+    }
+    q.execute(pool)
+        .await
+        .context("bulk updating channel mute")?;
+    Ok(())
 }
 
 /// Toggle mute for all channels on a source. Per-channel mute already exists
@@ -424,6 +511,154 @@ mod tests {
         )
         .await?;
         assert!(!is_first_run(&pool).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_source_channels_returns_per_channel_state() -> Result<()> {
+        let (_tmp, pool) = open().await?;
+        let now = Utc::now().timestamp();
+        let (sid,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        // Two channels, one with a couple of messages to exercise message_count.
+        let (ch_inbox,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind, muted) \
+             VALUES (?, 'INBOX', 'INBOX', 'mailbox', 0) RETURNING id",
+        )
+        .bind(sid)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind, muted) \
+             VALUES (?, 'Archive', 'Archive', 'mailbox', 1)",
+        )
+        .bind(sid)
+        .execute(&pool)
+        .await?;
+        for ext in ["m1", "m2", "m3"] {
+            sqlx::query(
+                "INSERT INTO messages (channel_id, external_id, posted_at, body, body_format, ingested_at) \
+                 VALUES (?, ?, ?, 'b', 'text', ?)",
+            )
+            .bind(ch_inbox)
+            .bind(ext)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await?;
+        }
+
+        let rows = list_source_channels(&pool, sid).await?;
+        assert_eq!(rows.len(), 2);
+        // Order is by name, so Archive comes before INBOX alphabetically.
+        let archive = rows.iter().find(|r| r.name == "Archive").unwrap();
+        let inbox = rows.iter().find(|r| r.name == "INBOX").unwrap();
+        assert!(archive.muted);
+        assert_eq!(archive.message_count, 0);
+        assert!(!inbox.muted);
+        assert_eq!(inbox.message_count, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_channel_muted_does_not_affect_siblings() -> Result<()> {
+        // Pin the independence: muting one channel must leave the others
+        // alone. Otherwise per-channel mute is just a confusing alias for
+        // source-level mute.
+        let (_tmp, pool) = open().await?;
+        let now = Utc::now().timestamp();
+        let (sid,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        let (ch_a,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'A', 'A', 'mailbox') RETURNING id",
+        )
+        .bind(sid)
+        .fetch_one(&pool)
+        .await?;
+        let (ch_b,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'B', 'B', 'mailbox') RETURNING id",
+        )
+        .bind(sid)
+        .fetch_one(&pool)
+        .await?;
+
+        set_channel_muted(&pool, ch_a, true).await?;
+        let rows = list_source_channels(&pool, sid).await?;
+        let a = rows.iter().find(|r| r.id == ch_a).unwrap();
+        let b = rows.iter().find(|r| r.id == ch_b).unwrap();
+        assert!(a.muted);
+        assert!(!b.muted, "muting A must not affect B");
+
+        // And the source-level row reflects partial state as unmuted (it's
+        // not "fully muted" because B is still active).
+        let src = list_sources(&pool).await?;
+        assert!(
+            !src[0].muted,
+            "partial channel mute must show source as unmuted"
+        );
+
+        // Mute B too — now source rolls up to muted.
+        set_channel_muted(&pool, ch_b, true).await?;
+        let src = list_sources(&pool).await?;
+        assert!(
+            src[0].muted,
+            "all channels muted means source row reads muted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_channels_muted_bulk_updates_only_listed_channels() -> Result<()> {
+        let (_tmp, pool) = open().await?;
+        let now = Utc::now().timestamp();
+        let (sid,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        let mut ids = Vec::new();
+        for ext in ["INBOX", "INBOX/Lembrar", "Archive"] {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO channels (source_id, external_id, name, kind) \
+                 VALUES (?, ?, ?, 'mailbox') RETURNING id",
+            )
+            .bind(sid)
+            .bind(ext)
+            .bind(ext)
+            .fetch_one(&pool)
+            .await?;
+            ids.push(id);
+        }
+        // Mute only the first two; assert the third is untouched.
+        set_channels_muted_bulk(&pool, &ids[..2], true).await?;
+        let rows = list_source_channels(&pool, sid).await?;
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert!(by_name("INBOX").muted);
+        assert!(by_name("INBOX/Lembrar").muted);
+        assert!(!by_name("Archive").muted);
+
+        // Empty list is a no-op.
+        set_channels_muted_bulk(&pool, &[], false).await?;
+        assert!(by_name("INBOX").muted);
+
+        // Round-trip: unmute everything in one call.
+        set_channels_muted_bulk(&pool, &ids, false).await?;
+        let rows = list_source_channels(&pool, sid).await?;
+        assert!(rows.iter().all(|r| !r.muted));
         Ok(())
     }
 
