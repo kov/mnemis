@@ -2,8 +2,8 @@ use leptos::prelude::*;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, PendingResolutionDto,
-    StatusSnapshot, SyncOutcome,
+    ActionDto, ActionStatus, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
+    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -85,6 +85,120 @@ pub async fn update_action(
     Ok(())
 }
 
+pub async fn fetch_user_profile() -> Result<UserProfileDto, String> {
+    let raw = invoke("get_user_profile", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<UserProfileDto>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SaveProfileArgs {
+    profile: UserProfileDto,
+}
+
+pub async fn save_user_profile(profile: UserProfileDto) -> Result<(), String> {
+    let args =
+        serde_wasm_bindgen::to_value(&SaveProfileArgs { profile }).map_err(|e| e.to_string())?;
+    invoke("save_user_profile", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn fetch_is_first_run() -> Result<bool, String> {
+    let raw = invoke("is_first_run", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<bool>(raw).map_err(|e| e.to_string())
+}
+
+pub async fn fetch_settings_sources() -> Result<Vec<SourceRowDto>, String> {
+    let raw = invoke("list_settings_sources", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<SourceRowDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SourceIdArgs {
+    source_id: i64,
+}
+
+#[derive(Serialize)]
+struct SetSourceMutedArgs {
+    source_id: i64,
+    muted: bool,
+}
+
+pub async fn set_source_muted(source_id: i64, muted: bool) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetSourceMutedArgs { source_id, muted })
+        .map_err(|e| e.to_string())?;
+    invoke("set_source_muted", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct AddImapArgs {
+    name: String,
+    server: String,
+    port: u16,
+    username: String,
+    password: String,
+}
+
+pub async fn add_imap_source(
+    name: String,
+    server: String,
+    port: u16,
+    username: String,
+    password: String,
+) -> Result<i64, String> {
+    let args = serde_wasm_bindgen::to_value(&AddImapArgs {
+        name,
+        server,
+        port,
+        username,
+        password,
+    })
+    .map_err(|e| e.to_string())?;
+    let raw = invoke("add_imap_source", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<i64>(raw).map_err(|e| e.to_string())
+}
+
+pub async fn delete_source(source_id: i64) -> Result<(), String> {
+    let args =
+        serde_wasm_bindgen::to_value(&SourceIdArgs { source_id }).map_err(|e| e.to_string())?;
+    invoke("delete_source", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn fetch_llm_config() -> Result<LlmConfigDto, String> {
+    let raw = invoke("get_llm_config", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<LlmConfigDto>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SaveLlmArgs {
+    cfg: LlmConfigDto,
+}
+
+pub async fn save_llm_config(cfg: LlmConfigDto) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SaveLlmArgs { cfg }).map_err(|e| e.to_string())?;
+    invoke("save_llm_config", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
 pub async fn fetch_pending_resolutions() -> Result<Vec<PendingResolutionDto>, String> {
     let raw = invoke("list_pending_resolutions", JsValue::NULL)
         .await
@@ -153,28 +267,63 @@ fn main() {
     mount_to_body(App);
 }
 
+/// Newtype around the sync-tick signal so contexts don't collide with the
+/// first-run-tick (both are `RwSignal<u32>`).
+#[derive(Clone, Copy)]
+pub struct SyncTick(pub RwSignal<u32>);
+
+/// Bumped only when the profile is saved; the first-run banner refetches
+/// from this so the banner disappears without remounting the profile form
+/// (which would lose the "Saved." toast mid-render).
+#[derive(Clone, Copy)]
+pub struct FirstRunTick(pub RwSignal<u32>);
+
 #[component]
 fn App() -> impl IntoView {
-    // Bumped after every successful sync. Resources that should react to a
-    // sync read this signal so they automatically refetch — saves the user
-    // from having to nav away and back.
-    provide_context(RwSignal::new(0u32));
+    provide_context(SyncTick(RwSignal::new(0u32)));
+    provide_context(FirstRunTick(RwSignal::new(0u32)));
 
     view! {
         <Router>
             <div class="app">
+                <components::FirstRunBanner />
                 <components::StatusPanel />
                 <nav class="nav">
                     <A href="/">"Actions"</A>
                     <A href="/inbox">"Inbox"</A>
+                    <A href="/settings">"Settings"</A>
                 </nav>
                 <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
                     <Route path=path!("/") view=ActionsPage />
                     <Route path=path!("/inbox") view=InboxPage />
+                    <Route path=path!("/settings") view=SettingsPage />
+                    <Route path=path!("/settings/profile") view=SettingsProfilePage />
+                    <Route path=path!("/settings/llm") view=SettingsLlmPage />
+                    <Route path=path!("/settings/sources") view=SettingsSourcesPage />
                 </Routes>
             </div>
         </Router>
     }
+}
+
+#[component]
+fn SettingsPage() -> impl IntoView {
+    view! { <components::SettingsHome /> }
+}
+
+#[component]
+fn SettingsProfilePage() -> impl IntoView {
+    view! { <components::SettingsProfile /> }
+}
+
+#[component]
+fn SettingsLlmPage() -> impl IntoView {
+    view! { <components::SettingsLlm /> }
+}
+
+#[component]
+fn SettingsSourcesPage() -> impl IntoView {
+    view! { <components::SettingsSources /> }
 }
 
 #[component]
@@ -184,7 +333,7 @@ fn ActionsPage() -> impl IntoView {
 
 #[component]
 fn InboxPage() -> impl IntoView {
-    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
     let messages = LocalResource::new(move || {
         // Subscribing to sync_tick here makes the resource re-fetch whenever
         // StatusPanel bumps it after a successful sync.

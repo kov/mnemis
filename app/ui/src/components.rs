@@ -2,21 +2,26 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::web_sys::HtmlTextAreaElement;
+use leptos::web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
+use leptos_router::components::A;
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, FeedbackKind, MessageDto, PendingResolutionDto,
-    SourceHealth, StatusSnapshot, SyncOutcome, summarize_sync_error,
+    ActionDto, ActionStatus, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
+    PendingResolutionDto, ProfileIdentifier, SourceHealth, SourceRowDto, StatusSnapshot,
+    SyncOutcome, UserProfileDto, summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
 use crate::{
-    confidence_class, confirm_resolution, fetch_actions, fetch_pending_resolutions, fetch_status,
-    reject_resolution, run_sync_now, status_label, submit_dismissal_feedback, update_action,
+    FirstRunTick, SyncTick, add_imap_source, confidence_class, confirm_resolution, delete_source,
+    fetch_actions, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
+    fetch_settings_sources, fetch_status, fetch_user_profile, reject_resolution, run_sync_now,
+    save_llm_config, save_user_profile, set_source_muted, status_label, submit_dismissal_feedback,
+    update_action,
 };
 
 #[component]
 pub fn ActionsPage() -> impl IntoView {
-    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
     let actions = LocalResource::new(move || {
         // Subscribing to sync_tick here makes the resource re-fetch whenever
         // StatusPanel bumps it after a successful sync, so the user doesn't
@@ -46,7 +51,7 @@ pub fn ActionsPage() -> impl IntoView {
 /// status; Reject discards the suggestion without changing the action.
 #[component]
 fn SuggestedResolutions() -> impl IntoView {
-    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
     let suggestions = LocalResource::new(move || {
         let _ = sync_tick.get();
         async move { fetch_pending_resolutions().await }
@@ -372,7 +377,7 @@ fn show_button(current: ActionStatus, target: ActionStatus) -> bool {
 
 #[component]
 pub fn StatusPanel() -> impl IntoView {
-    let sync_tick = use_context::<RwSignal<u32>>().expect("sync tick context");
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
     let status = LocalResource::new(move || {
         // Status panel also reacts to sync_tick so source health stays fresh.
         let _ = sync_tick.get();
@@ -570,5 +575,494 @@ fn MessageRow(msg: MessageDto) -> impl IntoView {
             <div class="message-snippet">{msg.snippet.clone()}</div>
             <div class="message-meta">{format!("{source} · {channel}")}</div>
         </div>
+    }
+}
+
+/// First-run banner: shown above everything when no `user_profile` row has
+/// been saved. Disappears the instant the profile is saved (the resource is
+/// keyed off sync_tick which the profile editor bumps on save).
+#[component]
+pub fn FirstRunBanner() -> impl IntoView {
+    // The banner subscribes to its own tick — bumped from the profile-save
+    // handler — so it re-checks `is_first_run` *without* remounting the
+    // profile form (which would discard the "Saved." toast mid-render).
+    let FirstRunTick(first_run_tick) =
+        use_context::<FirstRunTick>().expect("first run tick context");
+    let first_run = LocalResource::new(move || {
+        let _ = first_run_tick.get();
+        async move { fetch_is_first_run().await }
+    });
+    view! {
+        <Suspense fallback=|| view! { <></> }>
+            {move || first_run.get().and_then(|res| match res {
+                Ok(true) => Some(view! {
+                    <div class="first-run-banner">
+                        <span>"Welcome to mnemis. "</span>
+                        <A href="/settings/profile">"Set up your profile"</A>
+                        <span>" to start ingesting."</span>
+                    </div>
+                }.into_any()),
+                _ => None,
+            })}
+        </Suspense>
+    }
+}
+
+/// Settings landing page — links to the sub-sections. Keeps the URL stable
+/// so the first-run banner can deep-link to a specific sub-page.
+#[component]
+pub fn SettingsHome() -> impl IntoView {
+    view! {
+        <h1>"Settings"</h1>
+        <ul class="settings-home">
+            <li><A href="/settings/profile">"Profile"</A>
+                <span class="settings-desc">" — display name + identifiers + extraction context"</span></li>
+            <li><A href="/settings/llm">"LLM"</A>
+                <span class="settings-desc">" — omlx endpoint + models"</span></li>
+            <li><A href="/settings/sources">"Sources"</A>
+                <span class="settings-desc">" — IMAP + chat connectors"</span></li>
+        </ul>
+    }
+}
+
+/// Profile editor: display_name, custom_prompt, identifiers (kind+value rows
+/// the user can add/remove). Save writes through to `user_profile` +
+/// reconciles `contact_identifiers` for the self-contact.
+#[component]
+pub fn SettingsProfile() -> impl IntoView {
+    // Load once on mount; don't subscribe to sync_tick — a refetch would
+    // remount the inner ProfileForm and wipe the in-flight "Saved." toast.
+    let profile = LocalResource::new(|| async move { fetch_user_profile().await });
+    view! {
+        <h1>"Profile"</h1>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || profile.get().map(|res| match res {
+                Ok(p) => view! { <ProfileForm initial=p /> }.into_any(),
+                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+            })}
+        </Suspense>
+    }
+}
+
+#[component]
+fn ProfileForm(initial: UserProfileDto) -> impl IntoView {
+    let display_name = RwSignal::new(initial.display_name.clone());
+    let custom_prompt = RwSignal::new(initial.custom_prompt.clone().unwrap_or_default());
+    let identifiers: RwSignal<Vec<ProfileIdentifier>> = RwSignal::new(initial.identifiers.clone());
+    let toast: RwSignal<Option<String>> = RwSignal::new(None);
+    let FirstRunTick(first_run_tick) =
+        use_context::<FirstRunTick>().expect("first run tick context");
+
+    let name_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let prompt_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+    let new_kind_ref: NodeRef<leptos::html::Select> = NodeRef::new();
+    let new_value_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+
+    let on_add_identifier = move |_| {
+        let kind = new_kind_ref
+            .get()
+            .map(|el| el.unchecked_ref::<HtmlSelectElement>().value())
+            .unwrap_or_else(|| "email".to_string());
+        let value = new_value_ref
+            .get()
+            .map(|el| {
+                el.unchecked_ref::<HtmlInputElement>()
+                    .value()
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if value.is_empty() {
+            return;
+        }
+        identifiers.update(|v| {
+            if !v.iter().any(|i| i.kind == kind && i.value == value) {
+                v.push(ProfileIdentifier {
+                    kind: kind.clone(),
+                    value: value.clone(),
+                });
+            }
+        });
+        if let Some(el) = new_value_ref.get() {
+            el.unchecked_ref::<HtmlInputElement>().set_value("");
+        }
+    };
+
+    let on_save = move |_| {
+        let name = name_ref
+            .get()
+            .map(|el| {
+                el.unchecked_ref::<HtmlInputElement>()
+                    .value()
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_else(|| display_name.get());
+        let prompt = prompt_ref
+            .get()
+            .map(|el| el.unchecked_ref::<HtmlTextAreaElement>().value())
+            .unwrap_or_else(|| custom_prompt.get());
+        let prompt = prompt.trim().to_string();
+        let p = UserProfileDto {
+            display_name: name,
+            custom_prompt: if prompt.is_empty() {
+                None
+            } else {
+                Some(prompt)
+            },
+            identifiers: identifiers.get(),
+        };
+        spawn_local(async move {
+            match save_user_profile(p).await {
+                Ok(_) => {
+                    toast.set(Some("Saved.".to_string()));
+                    // Bump the dedicated first-run tick — NOT sync_tick —
+                    // so the banner re-checks `is_first_run` without
+                    // remounting this form (which would wipe the toast).
+                    first_run_tick.update(|v| *v += 1);
+                }
+                Err(e) => toast.set(Some(format!("Save failed: {e}"))),
+            }
+        });
+    };
+
+    view! {
+        <div class="settings-form" data-form="profile">
+            <label>"Display name"</label>
+            <input
+                class="settings-input"
+                node_ref=name_ref
+                prop:value=move || display_name.get()
+            />
+
+            <label>"Custom prompt (optional)"</label>
+            <textarea
+                class="settings-textarea"
+                node_ref=prompt_ref
+                rows="6"
+                placeholder="Anything the extractor should know about you and your priorities."
+                prop:value=move || custom_prompt.get()
+            />
+
+            <label>"Identifiers"</label>
+            <div class="identifiers-list">
+                <For
+                    each=move || identifiers.get()
+                    key=|i| format!("{}:{}", i.kind, i.value)
+                    children=move |i: ProfileIdentifier| {
+                        let kind = i.kind.clone();
+                        let value = i.value.clone();
+                        let to_remove = (kind.clone(), value.clone());
+                        let on_remove = move |_| {
+                            let to_remove = to_remove.clone();
+                            identifiers.update(|v| {
+                                v.retain(|cur| !(cur.kind == to_remove.0 && cur.value == to_remove.1));
+                            });
+                        };
+                        view! {
+                            <div class="identifier-row">
+                                <span class="identifier-kind">{kind}</span>
+                                <span class="identifier-value">{value}</span>
+                                <button class="btn btn-ghost" on:click=on_remove>"Remove"</button>
+                            </div>
+                        }
+                    }
+                />
+            </div>
+
+            <div class="identifier-add">
+                <select class="settings-select" node_ref=new_kind_ref>
+                    <option value="email">"email"</option>
+                    <option value="mattermost_handle">"mattermost_handle"</option>
+                    <option value="discord_id">"discord_id"</option>
+                    <option value="phone">"phone"</option>
+                </select>
+                <input class="settings-input" node_ref=new_value_ref placeholder="value" />
+                <button class="btn btn-secondary" on:click=on_add_identifier>"Add"</button>
+            </div>
+
+            <div class="settings-actions">
+                <button class="btn btn-primary" on:click=on_save>"Save profile"</button>
+            </div>
+            {move || toast.get().map(|t| view! { <div class="settings-toast">{t}</div> })}
+        </div>
+    }
+}
+
+/// LLM config editor. Writes to `config.toml`; the user is told the change
+/// takes effect on next app restart since `LlmStack` is built once at
+/// startup. (Deferring hot-reload is fine for now — settings is rare.)
+#[component]
+pub fn SettingsLlm() -> impl IntoView {
+    let cfg = LocalResource::new(|| async move { fetch_llm_config().await });
+    view! {
+        <h1>"LLM"</h1>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || cfg.get().map(|res| match res {
+                Ok(c) => view! { <LlmForm initial=c /> }.into_any(),
+                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+            })}
+        </Suspense>
+    }
+}
+
+#[component]
+fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
+    let base_url = RwSignal::new(initial.base_url.clone());
+    let chat = RwSignal::new(initial.chat_model.clone());
+    let embed = RwSignal::new(initial.embedding_model.clone());
+    let token = RwSignal::new(initial.bearer_token.clone().unwrap_or_default());
+    let config_path = initial.config_path.clone();
+    let toast: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let base_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let chat_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let embed_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let token_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+
+    let on_save = move |_| {
+        let pull = |r: NodeRef<leptos::html::Input>, default: String| -> String {
+            r.get()
+                .map(|el| {
+                    el.unchecked_ref::<HtmlInputElement>()
+                        .value()
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or(default)
+        };
+        let cfg = LlmConfigDto {
+            base_url: pull(base_ref, base_url.get()),
+            chat_model: pull(chat_ref, chat.get()),
+            embedding_model: pull(embed_ref, embed.get()),
+            bearer_token: {
+                let v = pull(token_ref, token.get());
+                if v.is_empty() { None } else { Some(v) }
+            },
+            config_path: String::new(),
+        };
+        spawn_local(async move {
+            match save_llm_config(cfg).await {
+                Ok(_) => toast.set(Some("Saved. Restart the app to apply.".to_string())),
+                Err(e) => toast.set(Some(format!("Save failed: {e}"))),
+            }
+        });
+    };
+
+    view! {
+        <div class="settings-form" data-form="llm">
+            <div class="settings-hint">{format!("Writes to {config_path}")}</div>
+            <label>"Base URL"</label>
+            <input class="settings-input" node_ref=base_ref prop:value=move || base_url.get() />
+            <label>"Chat model"</label>
+            <input class="settings-input" node_ref=chat_ref prop:value=move || chat.get() />
+            <label>"Embedding model"</label>
+            <input class="settings-input" node_ref=embed_ref prop:value=move || embed.get() />
+            <label>"Bearer token (optional)"</label>
+            <input class="settings-input" node_ref=token_ref prop:value=move || token.get() />
+            <div class="settings-actions">
+                <button class="btn btn-primary" on:click=on_save>"Save LLM config"</button>
+            </div>
+            {move || toast.get().map(|t| view! { <div class="settings-toast">{t}</div> })}
+        </div>
+    }
+}
+
+/// Sources list with per-source mute + delete + an Add IMAP modal.
+#[component]
+pub fn SettingsSources() -> impl IntoView {
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
+    let sources = LocalResource::new(move || {
+        let _ = sync_tick.get();
+        async move { fetch_settings_sources().await }
+    });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sources.refetch());
+    let refetch_for_table = refetch.clone();
+    let refetch_for_modal = refetch.clone();
+    let add_open = RwSignal::new(false);
+    let on_add = move |_| add_open.set(true);
+    view! {
+        <h1>"Sources"</h1>
+        <div class="settings-actions">
+            <button class="btn btn-primary" on:click=on_add>"Add IMAP source"</button>
+        </div>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || {
+                let refetch = refetch_for_table.clone();
+                sources.get().map(move |res| match res {
+                    Ok(rows) if rows.is_empty() => view! {
+                        <div class="empty">
+                            "No sources configured yet."
+                        </div>
+                    }.into_any(),
+                    Ok(rows) => view! { <SourcesTable rows=rows refetch=refetch /> }.into_any(),
+                    Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                })
+            }}
+        </Suspense>
+        <Show when=move || add_open.get() fallback=|| view! { <></> }>
+            {
+                let refetch = refetch_for_modal.clone();
+                view! {
+                    <AddImapModal
+                        on_close=Arc::new(move |added| {
+                            add_open.set(false);
+                            if added {
+                                refetch();
+                            }
+                        })
+                    />
+                }
+            }
+        </Show>
+    }
+}
+
+/// IMAP add modal. Pure form — no validation beyond "name/server/username
+/// non-empty". The Tauri command writes to the DB + keychain; channel
+/// discovery happens on the next sync.
+#[component]
+fn AddImapModal(on_close: Arc<dyn Fn(bool) + Send + Sync>) -> impl IntoView {
+    let toast: RwSignal<Option<String>> = RwSignal::new(None);
+    let name_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let server_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let port_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let user_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let pass_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+
+    let on_close_cancel = on_close.clone();
+    let on_cancel = move |_| on_close_cancel(false);
+
+    let on_close_save = on_close.clone();
+    let on_save = move |_| {
+        let pull = |r: NodeRef<leptos::html::Input>| -> String {
+            r.get()
+                .map(|el| {
+                    el.unchecked_ref::<HtmlInputElement>()
+                        .value()
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_default()
+        };
+        let name = pull(name_ref);
+        let server = pull(server_ref);
+        let port_str = pull(port_ref);
+        let username = pull(user_ref);
+        let password = pass_ref
+            .get()
+            .map(|el| el.unchecked_ref::<HtmlInputElement>().value())
+            .unwrap_or_default();
+        if name.is_empty() || server.is_empty() || username.is_empty() {
+            toast.set(Some("Name, server, and username are required.".to_string()));
+            return;
+        }
+        let port: u16 = port_str.parse().unwrap_or(993);
+        let on_close = on_close_save.clone();
+        spawn_local(async move {
+            match add_imap_source(name, server, port, username, password).await {
+                Ok(_) => on_close(true),
+                Err(e) => toast.set(Some(format!("Add failed: {e}"))),
+            }
+        });
+    };
+
+    view! {
+        <div class="add-source-modal" data-source-kind="imap">
+            <div class="modal-title">"Add IMAP source"</div>
+            <label>"Name (display)"</label>
+            <input class="settings-input" node_ref=name_ref placeholder="work" />
+            <label>"Server"</label>
+            <input class="settings-input" node_ref=server_ref placeholder="imap.example.com" />
+            <label>"Port"</label>
+            <input class="settings-input" node_ref=port_ref placeholder="993" />
+            <label>"Username"</label>
+            <input class="settings-input" node_ref=user_ref placeholder="you@example.com" />
+            <label>"Password"</label>
+            <input class="settings-input" node_ref=pass_ref type="password" />
+            <div class="settings-actions">
+                <button class="btn btn-ghost" on:click=on_cancel>"Cancel"</button>
+                <button class="btn btn-primary" on:click=on_save>"Add source"</button>
+            </div>
+            {move || toast.get().map(|t| view! { <div class="settings-toast">{t}</div> })}
+        </div>
+    }
+}
+
+#[component]
+fn SourcesTable(rows: Vec<SourceRowDto>, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
+    view! {
+        <table class="sources-table">
+            <thead>
+                <tr>
+                    <th>"Name"</th>
+                    <th>"Kind"</th>
+                    <th>"Health"</th>
+                    <th>"Muted"</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                <For
+                    each=move || rows.clone()
+                    key=|s| s.id
+                    children={
+                        let refetch = refetch.clone();
+                        move |s: SourceRowDto| view! {
+                            <SourceRowView row=s refetch=refetch.clone() />
+                        }
+                    }
+                />
+            </tbody>
+        </table>
+    }
+}
+
+#[component]
+fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
+    let id = row.id;
+    let health = row.health;
+    let muted = RwSignal::new(row.muted);
+    let on_toggle = {
+        let refetch = refetch.clone();
+        move |_| {
+            let refetch = refetch.clone();
+            let next = !muted.get();
+            spawn_local(async move {
+                if set_source_muted(id, next).await.is_ok() {
+                    muted.set(next);
+                }
+                refetch();
+            });
+        }
+    };
+    let on_delete = {
+        let refetch = refetch.clone();
+        move |_| {
+            let refetch = refetch.clone();
+            spawn_local(async move {
+                let _ = delete_source(id).await;
+                refetch();
+            });
+        }
+    };
+    view! {
+        <tr class="source-row" data-source-id=id.to_string()>
+            <td>{row.name.clone()}</td>
+            <td>{row.kind.clone()}</td>
+            <td>
+                <span class=format!("badge {}", health_class(health))>
+                    {health_label(health)}
+                </span>
+            </td>
+            <td>
+                <button class="btn btn-ghost" on:click=on_toggle>
+                    {move || if muted.get() { "Unmute" } else { "Mute" }}
+                </button>
+            </td>
+            <td>
+                <button class="btn btn-ghost" on:click=on_delete>"Delete"</button>
+            </td>
+        </tr>
     }
 }

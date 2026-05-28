@@ -755,6 +755,380 @@ async fn suggestions_panel_confirm_applies_and_reject_dismisses() -> Result<()> 
     Ok(())
 }
 
+/// First-run banner: fresh DB (no user_profile, no sources) shows the welcome
+/// banner with a link to the profile settings. After the profile is saved
+/// (here directly via SQL — the form interaction is covered separately) the
+/// banner disappears on a refresh / sync_tick bump.
+#[tokio::test(flavor = "current_thread")]
+async fn first_run_banner_appears_on_empty_db() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-firstrun.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        // Deliberately empty — no user_profile row, no sources.
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.first-run-banner"))
+        .await
+        .context("waiting for first-run banner")?;
+
+    let banner = client
+        .find(Locator::Css("div.first-run-banner"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        banner.contains("welcome") && banner.contains("profile"),
+        "banner text: {banner}"
+    );
+
+    // The link inside the banner must route to /settings/profile so the user
+    // can act on the prompt with a single click.
+    let href = client
+        .execute(
+            r#"
+            const a = document.querySelector('div.first-run-banner a');
+            return a ? a.getAttribute('href') : null;
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        href.as_str(),
+        Some("/settings/profile"),
+        "banner link should point at the profile page, got: {href:?}"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
+
+/// Profile editor round-trip: load empty form, fill it, save, assert the
+/// `user_profile` + `contact_identifiers` rows landed, and confirm the
+/// first-run banner is gone.
+#[tokio::test(flavor = "current_thread")]
+async fn profile_editor_saves_and_clears_first_run_banner() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-profile.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    // Navigate to the profile page via the banner link.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.first-run-banner a"))
+        .await?;
+    let nav = client
+        .execute(
+            r#"
+            const a = document.querySelector('div.first-run-banner a');
+            if (!a) { return 'missing'; }
+            a.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(nav.as_str(), Some("ok"));
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.settings-form[data-form='profile']"))
+        .await
+        .context("waiting for profile form")?;
+
+    // Fill the form, add one identifier, save.
+    let fill = client
+        .execute(
+            r#"
+            const form = document.querySelector("div.settings-form[data-form='profile']");
+            const name = form.querySelector('input.settings-input');
+            name.value = 'Gustavo';
+            name.dispatchEvent(new Event('input', { bubbles: true }));
+            const prompt = form.querySelector('textarea.settings-textarea');
+            prompt.value = 'Ana is my direct report.';
+            prompt.dispatchEvent(new Event('input', { bubbles: true }));
+
+            // Add identifier: select kind=email, value=g@x.com, click Add.
+            const addRow = form.querySelector('div.identifier-add');
+            const value = addRow.querySelector('input.settings-input');
+            value.value = 'g@x.com';
+            value.dispatchEvent(new Event('input', { bubbles: true }));
+            const addBtn = Array.from(addRow.querySelectorAll('button')).find(b => b.textContent.trim() === 'Add');
+            addBtn.click();
+
+            // Save.
+            const saveBtn = Array.from(form.querySelectorAll('button')).find(b => b.textContent.trim() === 'Save profile');
+            saveBtn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(fill.as_str(), Some("ok"), "fill+save script: {fill:?}");
+
+    // Wait for the toast.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.settings-toast"))
+        .await
+        .context("waiting for save toast")?;
+
+    // Banner should be gone now (sync_tick was bumped on save).
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if client
+            .find(Locator::Css("div.first-run-banner"))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    assert!(
+        client
+            .find(Locator::Css("div.first-run-banner"))
+            .await
+            .is_err(),
+        "first-run banner should have disappeared after the profile save"
+    );
+
+    // DB state.
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (name, custom): (String, Option<String>) =
+            sqlx::query_as("SELECT display_name, custom_prompt FROM user_profile WHERE id = 1")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(name, "Gustavo");
+        assert!(custom.as_deref().unwrap_or("").contains("direct report"));
+
+        let (ident_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM contact_identifiers ci \
+             JOIN contacts c ON c.id = ci.contact_id \
+             WHERE c.relationship = 'self' AND ci.kind = 'email' AND ci.value = 'g@x.com'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(ident_count, 1, "expected the email identifier to be saved");
+        pool.close().await;
+    }
+
+    client.close().await.ok();
+    Ok(())
+}
+
+/// Sources page surfaces seeded sources, the Add IMAP modal opens cleanly,
+/// and the mute toggle round-trips through the DB. The add path itself
+/// isn't exercised end-to-end because writing to the keychain requires a
+/// live secret-service over D-Bus, which the headless test harness doesn't
+/// provide. Engine-side `add_imap_source` is unit-tested elsewhere.
+#[tokio::test(flavor = "current_thread")]
+async fn settings_sources_lists_and_modal_opens() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-sources.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             SELECT id, 'INBOX', 'INBOX', 'mailbox' FROM sources WHERE name = 'work'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    // Navigate to /settings/sources.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await?;
+    let go = client
+        .execute(
+            r#"
+            const a = document.querySelector('nav.nav a[href="/settings"]');
+            if (!a) { return 'missing-nav'; }
+            a.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(go.as_str(), Some("ok"));
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("ul.settings-home"))
+        .await
+        .context("waiting for settings home")?;
+    let go2 = client
+        .execute(
+            r#"
+            const a = document.querySelector('ul.settings-home a[href="/settings/sources"]');
+            if (!a) { return 'missing-link'; }
+            a.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(go2.as_str(), Some("ok"));
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("table.sources-table"))
+        .await
+        .context("waiting for sources table")?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let body = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default();
+    assert!(
+        body.contains("work"),
+        "expected the seeded source name in sources table, got: {body}"
+    );
+
+    // Toggle mute: click the Mute button, assert it flipped to "Unmute".
+    let mute = client
+        .execute(
+            r#"
+            const row = document.querySelector('tr.source-row[data-source-id]');
+            const btn = Array.from(row.querySelectorAll('button')).find(b => b.textContent.trim() === 'Mute');
+            if (!btn) { return 'missing-mute'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(mute.as_str(), Some("ok"));
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let label = client
+            .execute(
+                r#"
+                const row = document.querySelector('tr.source-row[data-source-id]');
+                const btn = Array.from(row.querySelectorAll('button')).find(b =>
+                    b.textContent.trim() === 'Mute' || b.textContent.trim() === 'Unmute');
+                return btn ? btn.textContent.trim() : 'gone';
+                "#,
+                vec![],
+            )
+            .await?;
+        if label.as_str() == Some("Unmute") {
+            break;
+        }
+    }
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (muted,): (i64,) =
+            sqlx::query_as("SELECT MAX(muted) FROM channels WHERE source_id IN (SELECT id FROM sources WHERE name = 'work')")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(muted, 1, "channels should be muted in DB");
+        pool.close().await;
+    }
+
+    // Open the Add IMAP modal — don't submit (would need keychain).
+    let open = client
+        .execute(
+            r#"
+            const btn = Array.from(document.querySelectorAll('button'))
+                .find(b => b.textContent.trim() === 'Add IMAP source');
+            if (!btn) { return 'missing'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(open.as_str(), Some("ok"));
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(
+            "div.add-source-modal[data-source-kind='imap']",
+        ))
+        .await
+        .context("waiting for add-source modal")?;
+    let modal_inputs = client
+        .execute(
+            r#"
+            const modal = document.querySelector("div.add-source-modal[data-source-kind='imap']");
+            return String(modal.querySelectorAll('input.settings-input').length);
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        modal_inputs.as_str(),
+        Some("5"),
+        "modal should expose name/server/port/username/password inputs"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
+
 /// Seed exactly two actions linked to messages: one high-confidence (visible
 /// up front) and one low-confidence (hidden behind the revealer). Matches
 /// the `record_action` insert shape so the same `queries::list_actions` SQL

@@ -10,10 +10,10 @@ use anyhow::Context;
 use mnemis_engine::config::Config;
 use mnemis_engine::embed::{Embedder, OmlxEmbedder};
 use mnemis_engine::llm::LlmClient;
-use mnemis_engine::{config, db, mutations, orchestrator, queries};
+use mnemis_engine::{config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, FeedbackKind, MessageDto, PendingResolutionDto, StatusSnapshot,
-    SyncOutcome,
+    ActionDto, ActionStatus, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto,
+    SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
@@ -75,6 +75,98 @@ async fn update_action(
     mutations::update_action_status(&state.pool, action_id, new_status, dismissed_reason)
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn get_user_profile(state: State<'_, AppState>) -> Result<UserProfileDto, String> {
+    settings::get_user_profile(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn save_user_profile(
+    state: State<'_, AppState>,
+    profile: UserProfileDto,
+) -> Result<(), String> {
+    settings::save_user_profile(&state.pool, &profile)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn is_first_run(state: State<'_, AppState>) -> Result<bool, String> {
+    settings::is_first_run(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn list_settings_sources(state: State<'_, AppState>) -> Result<Vec<SourceRowDto>, String> {
+    settings::list_sources(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_source_muted(
+    state: State<'_, AppState>,
+    source_id: i64,
+    muted: bool,
+) -> Result<(), String> {
+    settings::set_source_muted(&state.pool, source_id, muted)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn add_imap_source(
+    state: State<'_, AppState>,
+    name: String,
+    server: String,
+    port: u16,
+    username: String,
+    password: String,
+) -> Result<i64, String> {
+    settings::add_imap_source(&state.pool, &name, &server, port, &username, &password)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn delete_source(state: State<'_, AppState>, source_id: i64) -> Result<(), String> {
+    settings::delete_source(&state.pool, source_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn get_llm_config(_state: State<'_, AppState>) -> Result<LlmConfigDto, String> {
+    let cfg_path = config::default_config_path();
+    match config::load(None) {
+        Ok(cfg) => Ok(LlmConfigDto {
+            base_url: cfg.llm.base_url,
+            chat_model: cfg.llm.chat_model,
+            embedding_model: cfg.llm.embedding_model,
+            bearer_token: cfg.llm.bearer_token,
+            config_path: cfg_path.display().to_string(),
+        }),
+        Err(_) => Ok(LlmConfigDto {
+            config_path: cfg_path.display().to_string(),
+            ..Default::default()
+        }),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn save_llm_config(cfg: LlmConfigDto) -> Result<(), String> {
+    config::save_llm(&config::LlmSection {
+        base_url: cfg.base_url,
+        chat_model: cfg.chat_model,
+        embedding_model: cfg.embedding_model,
+        bearer_token: cfg.bearer_token.filter(|s| !s.trim().is_empty()),
+    })
+    .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -237,7 +329,16 @@ fn main() {
             submit_dismissal_feedback,
             list_pending_resolutions,
             confirm_resolution,
-            reject_resolution
+            reject_resolution,
+            get_user_profile,
+            save_user_profile,
+            is_first_run,
+            list_settings_sources,
+            set_source_muted,
+            delete_source,
+            add_imap_source,
+            get_llm_config,
+            save_llm_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
