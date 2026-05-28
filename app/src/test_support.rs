@@ -9,6 +9,7 @@
 //!   - `tests/ui_smoke.rs` (CI-bound regression test)
 
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,10 +18,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use fantoccini::{Client, ClientBuilder};
 use serde_json::{Map, Value};
-
-/// Default port `tauri-driver` listens on. Single test process at a time;
-/// if you ever parallelise UI tests, randomise this.
-pub const TAURI_DRIVER_PORT: u16 = 4444;
 
 /// JS injected at session start: patches `console.{log,warn,error,info,debug}`
 /// and listens for `error` / `unhandledrejection` so we can later read
@@ -78,6 +75,7 @@ pub struct Harness {
     #[allow(dead_code)]
     weston: Option<WestonGuard>,
     driver: Child,
+    driver_port: u16,
 }
 
 /// Wraps a weston child + its socket name; on drop, kills weston and removes
@@ -153,10 +151,21 @@ impl Harness {
             None
         };
 
+        // Allocate two free ports — one for tauri-driver itself, one for
+        // the WebKitWebDriver it spawns under the hood. Both default to
+        // hard-coded values (4444 / 4445), which would collide if two
+        // harnesses ran at the same time. We bind a TcpListener on port 0,
+        // capture the OS-chosen port, then drop the listener so tauri-driver
+        // can claim it. Small TOCTOU window in theory; fine in practice.
+        let driver_port = pick_free_port().context("allocating tauri-driver port")?;
+        let native_port = pick_free_port().context("allocating WebKitWebDriver port")?;
+
         let mut driver_cmd = Command::new("tauri-driver");
         driver_cmd
             .arg("--port")
-            .arg(TAURI_DRIVER_PORT.to_string())
+            .arg(driver_port.to_string())
+            .arg("--native-port")
+            .arg(native_port.to_string())
             .arg("--native-driver")
             .arg(&opts.webkit_driver)
             .stdout(Stdio::null())
@@ -167,6 +176,10 @@ impl Harness {
         for (k, v) in &app_env {
             driver_cmd.env(k, v);
         }
+        // Disable the app's single-instance routing for tests: it'd
+        // otherwise make a second app process defer to the first, breaking
+        // parallel UI tests.
+        driver_cmd.env("MNEMIS_NO_SINGLE_INSTANCE", "1");
         if let Some(w) = &weston {
             // Wayland routing for the headless weston compositor. Same
             // child-only rule: don't pollute the test process.
@@ -192,8 +205,12 @@ impl Harness {
             )
         })?;
 
-        wait_for_tcp_port(TAURI_DRIVER_PORT, Duration::from_secs(5)).await?;
-        Ok(Self { weston, driver })
+        wait_for_tcp_port(driver_port, Duration::from_secs(5)).await?;
+        Ok(Self {
+            weston,
+            driver,
+            driver_port,
+        })
     }
 
     /// Open a new WebDriver session pointing at the given Tauri app binary.
@@ -211,7 +228,7 @@ impl Harness {
 
         let client = ClientBuilder::native()
             .capabilities(caps)
-            .connect(&format!("http://localhost:{TAURI_DRIVER_PORT}"))
+            .connect(&format!("http://localhost:{}", self.driver_port))
             .await
             .map_err(|e| anyhow!("connecting to tauri-driver: {e}"))?;
 
@@ -263,6 +280,17 @@ async fn spawn_weston() -> Result<WestonGuard> {
         "weston did not create socket {} within 5s",
         socket.display()
     )
+}
+
+/// Ask the OS for a free TCP port by binding to port 0 and reading back
+/// what it gave us, then release it so the caller can re-bind. There is a
+/// small race between drop and re-bind, but for test infrastructure this
+/// is the standard pattern and good enough.
+fn pick_free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("binding to port 0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 async fn wait_for_tcp_port(port: u16, timeout: Duration) -> Result<()> {

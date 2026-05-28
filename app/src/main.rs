@@ -110,15 +110,22 @@ fn main() {
     // it at end of main would race with Tauri's shutdown.
     Box::leak(Box::new(rt));
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let mut builder = tauri::Builder::default();
+    // Single-instance routing is the right UX for end users, but it would
+    // serialize concurrent UI tests (each spawned app would defer to the
+    // first one's window). The harness sets MNEMIS_NO_SINGLE_INSTANCE so
+    // each test gets its own fresh app process.
+    if std::env::var_os("MNEMIS_NO_SINGLE_INSTANCE").is_none() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: surface and focus the existing window instead.
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
             }
-        }))
+        }));
+    }
+    builder
         .setup(|app| {
             let app_data = resolve_db_path(app)?;
             if let Some(parent) = app_data.parent() {
