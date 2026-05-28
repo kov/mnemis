@@ -24,6 +24,22 @@
 
 * { box-sizing: border-box; }
 
+/* App-wide link defaults. Without these the browser falls back to its
+   built-in blue (and a near-black visited purple) which is almost invisible
+   on our dark background. The `:visited` rule has to repeat the color
+   instead of inheriting because UA stylesheets target :visited with high
+   specificity. */
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:visited {
+  color: var(--accent);
+}
+a:hover {
+  text-decoration: underline;
+}
+
 html, body {
   margin: 0;
   padding: 0;
