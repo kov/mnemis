@@ -349,7 +349,9 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
         })
         .collect();
 
-    let _ = source_id; // suppress unused warning until we use it elsewhere
+    // Match what extract_for_channel feeds the model — the dump is only
+    // useful as a regression aid if the two prompts stay in sync.
+    let feedback = mnemis_engine::extract::load_feedback_for(&pool, source_id, channel_id).await?;
     let inputs = prompt::PromptInputs {
         source_kind: &source_kind,
         channel_name: &channel_name,
@@ -358,6 +360,7 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
         custom_prompt: custom.as_deref(),
         current_time: Utc::now(),
         existing_actions: &existing,
+        feedback: &feedback,
         window: &window,
     };
     println!("{}", prompt::build(&inputs));

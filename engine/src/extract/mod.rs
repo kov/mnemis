@@ -9,7 +9,8 @@ use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 pub mod prompt;
 pub mod tools;
 
-use prompt::{ExistingAction, PromptInputs, WindowMessage};
+use mnemis_types::FeedbackKind;
+use prompt::{ExistingAction, FeedbackExample, PromptInputs, WindowMessage};
 use tools::ExtractionScope;
 
 pub const PROMPT_VERSION: i64 = 1;
@@ -57,6 +58,7 @@ pub async fn extract_for_channel(
     let up_to = window.last().map(|m| m.id);
     let existing = load_existing_actions(pool, channel_id).await?;
     let profile = load_user_profile_for(pool, &channel.source_kind).await?;
+    let feedback = load_feedback_for(pool, channel.source_id, channel_id).await?;
 
     let window_for_prompt: Vec<WindowMessage> = window
         .iter()
@@ -77,6 +79,7 @@ pub async fn extract_for_channel(
         custom_prompt: profile.custom_prompt.as_deref(),
         current_time: Utc::now(),
         existing_actions: &existing,
+        feedback: &feedback,
         window: &window_for_prompt,
     };
     let system_prompt = prompt::build(&inputs);
@@ -228,6 +231,42 @@ async fn load_existing_actions(pool: &SqlitePool, channel_id: i64) -> Result<Vec
             title,
             details,
             due_at: due_at.and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0)),
+        })
+        .collect())
+}
+
+/// Pull the most-recent feedback rows the extractor should consider as
+/// negative examples. Scoping is union-of-three (channel + source + global),
+/// capped at ~10 newest overall — the design note in `v2-redesign` keeps the
+/// budget tight so the section doesn't crowd the window. Both
+/// `FeedbackKind::Dismissed` and `FeedbackKind::WrongAutoClaim` rows are
+/// returned together; the prompt builder groups them.
+pub async fn load_feedback_for(
+    pool: &SqlitePool,
+    source_id: i64,
+    channel_id: i64,
+) -> Result<Vec<FeedbackExample>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT kind, example_text, reason FROM dismissal_feedback \
+         WHERE (scope_kind = 'channel' AND scope_id = ?) \
+            OR (scope_kind = 'source'  AND scope_id = ?) \
+            OR  scope_kind = 'global' \
+         ORDER BY created_at DESC LIMIT 10",
+    )
+    .bind(channel_id)
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .context("loading dismissal_feedback")?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(kind, example_text, reason)| {
+            FeedbackKind::parse(&kind).map(|kind| FeedbackExample {
+                kind,
+                example_text,
+                reason,
+            })
         })
         .collect())
 }
@@ -697,6 +736,119 @@ mod tests {
         let kinds: Vec<String> = kinds.into_iter().map(|(k,)| k).collect();
         assert_eq!(kinds, vec!["created".to_string(), "amended".to_string()]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_feedback_for_pulls_channel_source_and_global_capped() -> Result<()> {
+        // Pin the scoping rule + cap: union of channel + source + global,
+        // ordered by most-recent, capped at 10. The extractor renders these
+        // as negative examples; a too-loose cap or wrong scoping makes the
+        // section worse than useless.
+        let (_tmp, pool, source_id, channel_id) = setup().await?;
+
+        // Seed another source + channel that should NOT contribute.
+        let (other_source,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'other', 'kc/other', ?) RETURNING id",
+        )
+        .bind(Utc::now().timestamp())
+        .fetch_one(&pool)
+        .await?;
+        let (other_channel,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'INBOX', 'INBOX', 'mailbox') RETURNING id",
+        )
+        .bind(other_source)
+        .fetch_one(&pool)
+        .await?;
+
+        let now = Utc::now().timestamp();
+        let insert = |scope_kind: &'static str,
+                      scope_id: Option<i64>,
+                      kind: &'static str,
+                      example: String,
+                      ts: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO dismissal_feedback \
+                     (scope_kind, scope_id, example_text, reason, created_at, kind) \
+                     VALUES (?, ?, ?, '', ?, ?)",
+                )
+                .bind(scope_kind)
+                .bind(scope_id)
+                .bind(example)
+                .bind(ts)
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .map(|_| ())
+            }
+        };
+        // In-scope (channel + source + global).
+        insert(
+            "channel",
+            Some(channel_id),
+            "dismissed",
+            "ch-row".into(),
+            now,
+        )
+        .await?;
+        insert(
+            "source",
+            Some(source_id),
+            "wrong_auto_claim",
+            "src-row".into(),
+            now - 1,
+        )
+        .await?;
+        insert("global", None, "dismissed", "glob-row".into(), now - 2).await?;
+        // Out-of-scope (other source + other channel) must be excluded.
+        insert(
+            "channel",
+            Some(other_channel),
+            "dismissed",
+            "other-ch".into(),
+            now,
+        )
+        .await?;
+        insert(
+            "source",
+            Some(other_source),
+            "dismissed",
+            "other-src".into(),
+            now,
+        )
+        .await?;
+        // Cap: insert 12 more in-scope rows and assert the loader returns 10.
+        for i in 0..12 {
+            insert(
+                "channel",
+                Some(channel_id),
+                "dismissed",
+                format!("noise-{i}"),
+                now + 100 + i,
+            )
+            .await?;
+        }
+
+        let rows = load_feedback_for(&pool, source_id, channel_id).await?;
+        assert_eq!(rows.len(), 10, "cap not honored");
+        // No leakage from the unrelated source/channel.
+        for f in &rows {
+            assert!(
+                !f.example_text.starts_with("other-"),
+                "leaked out-of-scope feedback: {}",
+                f.example_text
+            );
+        }
+        // Kinds round-trip.
+        assert!(
+            rows.iter()
+                .any(|f| matches!(f.kind, FeedbackKind::Dismissed)),
+            "no dismissed row returned"
+        );
         Ok(())
     }
 

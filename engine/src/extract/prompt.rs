@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use mnemis_types::FeedbackKind;
 
 /// Max chars of a message body rendered into the window. A single huge email
 /// (financial daily reports, mailing-list digests) can otherwise blow the
@@ -15,6 +16,10 @@ pub struct PromptInputs<'a> {
     pub custom_prompt: Option<&'a str>,
     pub current_time: DateTime<Utc>,
     pub existing_actions: &'a [ExistingAction],
+    /// Recent rows from `dismissal_feedback`, already scoped + capped by the
+    /// caller. Each becomes a labelled negative example so the model learns
+    /// to avoid analogous items going forward.
+    pub feedback: &'a [FeedbackExample],
     pub window: &'a [WindowMessage],
 }
 
@@ -25,12 +30,32 @@ pub struct ExistingAction {
     pub due_at: Option<DateTime<Utc>>,
 }
 
+pub struct FeedbackExample {
+    pub kind: FeedbackKind,
+    pub example_text: String,
+    /// User comment; may be empty (the dialog's Skip path writes no row at
+    /// all, but a Submit with an empty textarea still inserts a row with
+    /// `reason=""`. Treat empty as "no learning signal beyond the example").
+    pub reason: String,
+}
+
 pub struct WindowMessage {
     pub external_id: String,
     pub posted_at: DateTime<Utc>,
     pub author: String,
     pub subject: Option<String>,
     pub body: String,
+}
+
+fn render_feedback_row(out: &mut String, f: &FeedbackExample) {
+    // Squash multi-line example_text to a single bullet so the section stays
+    // scannable for the model; the reason (when present) goes on its own line.
+    let single_line = f.example_text.replace('\n', " ").trim().to_string();
+    out.push_str(&format!("- {single_line}\n"));
+    let reason = f.reason.trim();
+    if !reason.is_empty() {
+        out.push_str(&format!("  reason: {reason}\n"));
+    }
 }
 
 pub fn build(inputs: &PromptInputs) -> String {
@@ -98,6 +123,39 @@ pub fn build(inputs: &PromptInputs) -> String {
                 .map(|d| format!(" — {d}"))
                 .unwrap_or_default();
             out.push_str(&format!("[A-{}] {}{}{}\n", a.id, a.title, due, details));
+        }
+        out.push('\n');
+    }
+
+    if !inputs.feedback.is_empty() {
+        out.push_str(
+            "# Negative examples from past feedback\n\
+             The user previously told you these were wrong. Use them to calibrate \
+             what NOT to surface or auto-claim from this channel. If a comment is \
+             present it's the user's reason; if not, treat the example itself as \
+             the only signal.\n",
+        );
+        let dismissed: Vec<&FeedbackExample> = inputs
+            .feedback
+            .iter()
+            .filter(|f| matches!(f.kind, FeedbackKind::Dismissed))
+            .collect();
+        let wrong_auto: Vec<&FeedbackExample> = inputs
+            .feedback
+            .iter()
+            .filter(|f| matches!(f.kind, FeedbackKind::WrongAutoClaim))
+            .collect();
+        if !dismissed.is_empty() {
+            out.push_str("## Dismissed — \"this isn't an action item for me\"\n");
+            for f in &dismissed {
+                render_feedback_row(&mut out, f);
+            }
+        }
+        if !wrong_auto.is_empty() {
+            out.push_str("## Wrongly auto-claimed — \"don't auto-claim items like this\"\n");
+            for f in &wrong_auto {
+                render_feedback_row(&mut out, f);
+            }
         }
         out.push('\n');
     }
@@ -182,6 +240,7 @@ mod tests {
             custom_prompt: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
+            feedback: &[],
             window: &[WindowMessage {
                 external_id: "msg-1".to_string(),
                 posted_at: dt(1_699_999_000),
@@ -214,6 +273,7 @@ mod tests {
             custom_prompt: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
+            feedback: &[],
             window: &[WindowMessage {
                 external_id: "msg-huge".to_string(),
                 posted_at: dt(1_699_999_000),
@@ -248,6 +308,7 @@ mod tests {
             custom_prompt: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
+            feedback: &[],
             window: &[WindowMessage {
                 external_id: "msg-tiny".to_string(),
                 posted_at: dt(1_699_999_000),
@@ -276,6 +337,7 @@ mod tests {
                 details: Some("Ana asked Monday".to_string()),
                 due_at: Some(dt(1_700_500_000)),
             }],
+            feedback: &[],
             window: &[],
         };
         let rendered = build(&inputs);
@@ -293,9 +355,75 @@ mod tests {
             custom_prompt: Some("   "),
             current_time: dt(1_700_000_000),
             existing_actions: &[],
+            feedback: &[],
             window: &[],
         };
         let rendered = build(&inputs);
         assert!(!rendered.contains("# Context (user-provided)"));
+    }
+
+    #[test]
+    fn renders_feedback_grouped_by_kind_with_reasons_when_present() {
+        let inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            current_time: dt(1_700_000_000),
+            existing_actions: &[],
+            feedback: &[
+                FeedbackExample {
+                    kind: FeedbackKind::Dismissed,
+                    example_text: "Billing reminder: pay invoice 42".to_string(),
+                    reason: "billing emails aren't actionable for me".to_string(),
+                },
+                FeedbackExample {
+                    kind: FeedbackKind::WrongAutoClaim,
+                    // Empty reason: user took the action out of band; the
+                    // example itself is the only learning signal.
+                    example_text: "Confirm meeting with Sam".to_string(),
+                    reason: String::new(),
+                },
+            ],
+            window: &[],
+        };
+        let rendered = build(&inputs);
+        assert!(
+            rendered.contains("# Negative examples"),
+            "feedback section header missing. prompt:\n{rendered}"
+        );
+        assert!(rendered.contains("## Dismissed"));
+        assert!(rendered.contains("Billing reminder: pay invoice 42"));
+        assert!(rendered.contains("reason: billing emails aren't actionable"));
+        assert!(rendered.contains("## Wrongly auto-claimed"));
+        assert!(rendered.contains("Confirm meeting with Sam"));
+        // Empty reasons render without the "reason:" line — would just
+        // confuse the model otherwise.
+        let after_sam = rendered
+            .split("Confirm meeting with Sam")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            !after_sam.starts_with("\n  reason:"),
+            "empty reason should not be rendered. context:\n{after_sam}"
+        );
+    }
+
+    #[test]
+    fn omits_feedback_section_when_empty() {
+        let inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            current_time: dt(1_700_000_000),
+            existing_actions: &[],
+            feedback: &[],
+            window: &[],
+        };
+        let rendered = build(&inputs);
+        assert!(!rendered.contains("Negative examples"));
     }
 }
