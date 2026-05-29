@@ -9,7 +9,8 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use super::{
-    ChannelInfo, Cursor, ImportedAuthor, ImportedMessage, PollBatch, Source, SourceId, SourceKind,
+    ChannelInfo, Cursor, ImportedAuthor, ImportedMessage, PollBatch, Recipient, Source, SourceId,
+    SourceKind,
 };
 
 /// How many recent UIDs to pull on first poll or after UIDVALIDITY change.
@@ -177,6 +178,8 @@ impl Source for ImapSource {
                         .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0))
                         .unwrap_or_else(Utc::now);
                     let author = parse_author(msg.from());
+                    let mut recipients = parse_recipients(msg.to(), "to");
+                    recipients.extend(parse_recipients(msg.cc(), "cc"));
                     let message_id = msg
                         .message_id()
                         .map(|s| s.to_string())
@@ -190,6 +193,7 @@ impl Source for ImapSource {
                         subject,
                         body,
                         body_format: "text".to_string(),
+                        recipients,
                         raw_json: None,
                         flags,
                     });
@@ -256,6 +260,8 @@ impl Source for ImapSource {
             .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0))
             .unwrap_or_else(Utc::now);
         let author = parse_author(msg.from());
+        let mut recipients = parse_recipients(msg.to(), "to");
+        recipients.extend(parse_recipients(msg.cc(), "cc"));
         let message_id = msg
             .message_id()
             .map(|s| s.to_string())
@@ -271,6 +277,7 @@ impl Source for ImapSource {
             subject,
             body,
             body_format: "text".to_string(),
+            recipients,
             raw_json: None,
             flags,
         })
@@ -288,6 +295,39 @@ fn parse_author(addr: Option<&mail_parser::Address>) -> Option<ImportedAuthor> {
         display_name: first.name.as_deref().map(|s| s.to_string()),
         handle: None,
     })
+}
+
+/// Flatten a To/Cc header (list or group form) into `Recipient`s tagged with
+/// `kind`. Returns empty when the header is absent.
+fn parse_recipients(addr: Option<&mail_parser::Address>, kind: &str) -> Vec<Recipient> {
+    use mail_parser::Address;
+    let Some(addr) = addr else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match addr {
+        Address::List(list) => {
+            for a in list.iter() {
+                out.push(Recipient {
+                    kind: kind.to_string(),
+                    name: a.name.as_deref().map(str::to_string),
+                    address: a.address.as_deref().map(str::to_string),
+                });
+            }
+        }
+        Address::Group(groups) => {
+            for g in groups.iter() {
+                for a in g.addresses.iter() {
+                    out.push(Recipient {
+                        kind: kind.to_string(),
+                        name: a.name.as_deref().map(str::to_string),
+                        address: a.address.as_deref().map(str::to_string),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 fn parse_flags(flags: impl Iterator<Item = String>) -> u32 {

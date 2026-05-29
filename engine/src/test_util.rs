@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use crate::llm::{
     ContentItem, InputItem, LlmClient, LlmTransport, OutputItem, ResponsesResponse, ToolDef,
 };
+use crate::source::Recipient;
 
 // ---------- MockLlm ------------------------------------------------------
 
@@ -105,6 +106,16 @@ pub mod mock {
         turn(vec![OutputItem::FunctionCall {
             call_id: "mock-call".to_string(),
             name: "resolve_action".to_string(),
+            arguments: args,
+        }])
+    }
+
+    /// A turn that issues a single batch `fetch_messages` tool call.
+    pub fn fetch_messages(external_ids: &[&str]) -> ResponsesResponse {
+        let args = json!({ "external_ids": external_ids }).to_string();
+        turn(vec![OutputItem::FunctionCall {
+            call_id: "mock-call".to_string(),
+            name: "fetch_messages".to_string(),
             arguments: args,
         }])
     }
@@ -221,12 +232,21 @@ pub async fn seed_minimal(pool: &SqlitePool) -> Result<SeedCtx> {
     })
 }
 
+/// A to/cc addressee for a seeded message: (kind "to"|"cc", name, address).
+pub struct SeedRecipient<'a> {
+    pub kind: &'a str,
+    pub name: &'a str,
+    pub address: &'a str,
+}
+
 pub struct SeedMessage<'a> {
     pub external_id: &'a str,
     pub author_email: &'a str,
     pub author_name: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
+    /// to/cc addressees serialized into `recipients_json`. Usually `&[]`.
+    pub recipients: &'a [SeedRecipient<'a>],
 }
 
 /// Insert messages into the channel, upserting authors as needed. Messages
@@ -262,10 +282,25 @@ pub async fn seed_messages(
             }
         };
 
+        let recipients_json: Option<String> = if m.recipients.is_empty() {
+            None
+        } else {
+            let recs: Vec<Recipient> = m
+                .recipients
+                .iter()
+                .map(|r| Recipient {
+                    kind: r.kind.to_string(),
+                    name: Some(r.name.to_string()),
+                    address: Some(r.address.to_string()),
+                })
+                .collect();
+            Some(serde_json::to_string(&recs)?)
+        };
+
         sqlx::query(
             "INSERT INTO messages \
-             (channel_id, external_id, author_id, posted_at, subject, body, body_format, ingested_at, flags) \
-             VALUES (?, ?, ?, ?, ?, ?, 'text', ?, 0)",
+             (channel_id, external_id, author_id, posted_at, subject, body, body_format, recipients_json, ingested_at, flags) \
+             VALUES (?, ?, ?, ?, ?, ?, 'text', ?, ?, 0)",
         )
         .bind(channel_id)
         .bind(m.external_id)
@@ -273,6 +308,7 @@ pub async fn seed_messages(
         .bind(base + idx as i64)
         .bind(m.subject)
         .bind(m.body)
+        .bind(recipients_json.as_deref())
         .bind(base)
         .execute(pool)
         .await?;

@@ -1,11 +1,7 @@
 use chrono::{DateTime, Utc};
 use mnemis_types::FeedbackKind;
 
-/// Max chars of a message body rendered into the window. A single huge email
-/// (financial daily reports, mailing-list digests) can otherwise blow the
-/// model's context window. The model still has `fetch_message` to pull the
-/// full body when it actually needs it.
-const BODY_PROMPT_CAP_CHARS: usize = 4000;
+use crate::source::Recipient;
 
 /// Inputs for prompt assembly. Pure-data so we can unit-test rendering.
 pub struct PromptInputs<'a> {
@@ -43,8 +39,14 @@ pub struct WindowMessage {
     pub external_id: String,
     pub posted_at: DateTime<Utc>,
     pub author: String,
+    /// to/cc addressees, so the model can tell whether the user is a direct
+    /// recipient (strong signal) or merely cc'd. Empty for chat sources.
+    pub recipients: Vec<Recipient>,
     pub subject: Option<String>,
-    pub body: String,
+    /// Short preview of the body — the full body is NOT in the window.
+    /// The model calls `fetch_messages` to read the full text of any message
+    /// that looks like it might carry an ask (metadata-first extraction).
+    pub snippet: String,
 }
 
 fn render_feedback_row(out: &mut String, f: &FeedbackExample) {
@@ -61,9 +63,13 @@ fn render_feedback_row(out: &mut String, f: &FeedbackExample) {
 pub fn build(inputs: &PromptInputs) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "You are mnemis's action extractor. Your job is to identify action items \
-         from the recent activity in this {} channel and record each via the \
-         record_action tool.\n\n",
+        "You are mnemis's action extractor. Below is *metadata* for the recent \
+         messages in this {} channel — sender, recipients, subject, and a short \
+         snippet of each, but NOT the full body. Triage the metadata, call \
+         fetch_messages to read the full text of anything that might carry an ask, \
+         and record each genuine action item via record_action. Dismiss obvious \
+         non-actionables (newsletters, FYIs, idle chatter) from the metadata alone — \
+         don't fetch what you can already tell is noise.\n\n",
         inputs.source_kind
     ));
 
@@ -164,8 +170,12 @@ pub fn build(inputs: &PromptInputs) -> String {
 
     out.push_str(
         "# Tools\n\
-         - search_messages(query): keyword/semantic search across recent messages for context\n\
-         - fetch_message(external_id): full body of one message\n\
+         - fetch_messages(external_ids[]): read the full bodies of one or more messages by \
+           external_id. Batch the ids — pass several at once to save round-trips. The window \
+           shows only snippets, so call this before recording an action whenever the snippet \
+           alone doesn't confirm the ask. There's a per-run fetch budget, so fetch what looks \
+           promising, not everything.\n\
+         - search_messages(query): keyword/semantic search across recent messages for prior context\n\
          - record_action(title, details, confidence, rationale, due_at?, evidence_external_ids[]): \
            record one action. Returns {\"action_id\": \"A-N\", ...} — hold onto the A-N id if \
            you might need to revise the same action later in this response.\n\
@@ -178,18 +188,21 @@ pub fn build(inputs: &PromptInputs) -> String {
            High-confidence applies immediately; medium/low queues a suggestion for the user. \
            Use this when you'd otherwise just record nothing about an item that's clearly resolved.\n\n\
          # Process\n\
-         1. Read the window below.\n\
-         2. For each actionable thing: judge against the criteria. Use the tools if you need prior context.\n\
-         3. Create exactly one action per actionable item. If you later spot the same item \
-            being mentioned again (or with more detail), amend the existing action via \
-            update_action rather than recording another one.\n\
+         1. Scan the metadata window below. Dismiss obvious non-actionables from sender, \
+            subject, and snippet alone.\n\
+         2. For anything that might carry an ask but whose snippet doesn't settle it, \
+            fetch_messages the full body (batch the ids in one call). Use search_messages for \
+            prior context if you need it.\n\
+         3. Judge each candidate against the criteria. Create exactly one action per actionable \
+            item; if the same item recurs (or you learn more), amend it via update_action rather \
+            than recording it twice.\n\
          4. Stop when finished. Your final message MUST reflect what you actually did — if \
             you recorded actions, summarize them briefly; if you recorded none, say so. Do \
             not say \"no actions found\" after calling record_action.\n\n",
     );
 
     out.push_str(&format!(
-        "# Window — channel \"{}\" ({} new messages)\n\n",
+        "# Window — channel \"{}\" ({} new messages, metadata only)\n\n",
         inputs.channel_name,
         inputs.window.len()
     ));
@@ -201,31 +214,51 @@ pub fn build(inputs: &PromptInputs) -> String {
             m.posted_at.to_rfc3339(),
             m.author
         ));
+        render_recipients(&mut out, &m.recipients, inputs.user_identifiers);
         if let Some(s) = &m.subject
             && !s.is_empty()
         {
             out.push_str(&format!("Subject: {s}\n"));
         }
-        if m.body.len() > BODY_PROMPT_CAP_CHARS {
-            // Cap on byte length, but slice on a char boundary so we don't
-            // panic on multi-byte UTF-8 (matters for non-ASCII bodies).
-            let mut end = BODY_PROMPT_CAP_CHARS;
-            while !m.body.is_char_boundary(end) {
-                end -= 1;
-            }
-            out.push_str(&m.body[..end]);
-            out.push_str(&format!(
-                "\n[... {} chars truncated; fetch_message(\"{}\") for full body]",
-                m.body.len() - end,
-                m.external_id,
-            ));
-        } else {
-            out.push_str(&m.body);
-        }
-        out.push_str("\n---\n");
+        out.push_str(&format!("Snippet: {}\n", m.snippet));
+        out.push_str("---\n");
     }
 
     out
+}
+
+/// Render `To:`/`Cc:` lines for a message, tagging any addressee whose address
+/// matches one of the user's identifiers with `(you)` — the direct-recipient
+/// signal the model uses to tell "addressed to me" from "merely cc'd". Emits
+/// nothing for a kind with no recipients (e.g. chat sources have none).
+fn render_recipients(out: &mut String, recipients: &[Recipient], user_identifiers: &[String]) {
+    let is_self = |r: &Recipient| {
+        r.address
+            .as_deref()
+            .is_some_and(|a| user_identifiers.iter().any(|id| id.eq_ignore_ascii_case(a)))
+    };
+    for (kind, label) in [("to", "To"), ("cc", "Cc")] {
+        let people: Vec<String> = recipients
+            .iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| {
+                let who = match (r.name.as_deref(), r.address.as_deref()) {
+                    (Some(n), Some(a)) => format!("{n} <{a}>"),
+                    (Some(n), None) => n.to_string(),
+                    (None, Some(a)) => a.to_string(),
+                    (None, None) => "?".to_string(),
+                };
+                if is_self(r) {
+                    format!("{who} (you)")
+                } else {
+                    who
+                }
+            })
+            .collect();
+        if !people.is_empty() {
+            out.push_str(&format!("{label}: {}\n", people.join(", ")));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +267,17 @@ mod tests {
 
     fn dt(ts: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(ts, 0).unwrap()
+    }
+
+    fn msg(external_id: &str, subject: Option<&str>, snippet: &str) -> WindowMessage {
+        WindowMessage {
+            external_id: external_id.to_string(),
+            posted_at: dt(1_699_999_000),
+            author: "Ana <ana@example.com>".to_string(),
+            recipients: Vec::new(),
+            subject: subject.map(str::to_string),
+            snippet: snippet.to_string(),
+        }
     }
 
     #[test]
@@ -247,13 +291,11 @@ mod tests {
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             feedback: &[],
-            window: &[WindowMessage {
-                external_id: "msg-1".to_string(),
-                posted_at: dt(1_699_999_000),
-                author: "Ana <ana@example.com>".to_string(),
-                subject: Some("Hello".to_string()),
-                body: "Can you take a pass by Friday?".to_string(),
-            }],
+            window: &[msg(
+                "msg-1",
+                Some("Hello"),
+                "Can you take a pass by Friday?",
+            )],
         };
         let rendered = build(&inputs);
         assert!(rendered.contains("Display name: Gustavo"));
@@ -265,12 +307,11 @@ mod tests {
     }
 
     #[test]
-    fn long_message_bodies_are_capped_with_a_marker_pointing_to_fetch_message() {
-        // Pin: a single huge body must not flood the prompt. The model still
-        // has fetch_message available if it needs the full content. This is
-        // the bound that keeps a backlog of long emails from blowing the
-        // context window (observed: 100 messages × ~3K tokens each).
-        let huge = "X".repeat(50_000);
+    fn window_shows_snippet_and_frames_fetch_messages_as_the_body_path() {
+        // Pin metadata-first: the window carries only a snippet (never the full
+        // body), and the prompt must tell the model to fetch_messages for the
+        // real text. This is the bound that keeps a backlog of long emails from
+        // blowing the context window.
         let inputs = PromptInputs {
             source_kind: "imap",
             channel_name: "INBOX",
@@ -280,52 +321,71 @@ mod tests {
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             feedback: &[],
-            window: &[WindowMessage {
-                external_id: "msg-huge".to_string(),
-                posted_at: dt(1_699_999_000),
-                author: "Ana".to_string(),
-                subject: Some("Daily report".to_string()),
-                body: huge,
-            }],
+            window: &[msg(
+                "msg-1",
+                Some("Daily report"),
+                "First 200 chars of the body…",
+            )],
         };
         let rendered = build(&inputs);
-        let body_x_count = rendered.matches('X').count();
         assert!(
-            body_x_count < 10_000,
-            "body should be truncated; saw {body_x_count} X chars"
+            rendered.contains("Snippet: First 200 chars of the body…"),
+            "the window should render the snippet line"
+        );
+        // The full body is never in the window; fetch_messages is the path.
+        assert!(
+            rendered.contains("fetch_messages"),
+            "prompt must point the model at fetch_messages for full bodies"
         );
         assert!(
-            rendered.contains("truncated"),
-            "truncation marker missing from prompt"
-        );
-        assert!(
-            rendered.contains("fetch_message(\"msg-huge\")"),
-            "marker should tell the model how to get the full body"
+            rendered.contains("metadata only"),
+            "the window header should flag that only metadata is shown"
         );
     }
 
     #[test]
-    fn short_message_bodies_are_left_untouched() {
+    fn renders_to_cc_and_marks_the_user_as_a_direct_recipient() {
+        // The direct-recipient-vs-cc signal: an addressee matching one of the
+        // user's identifiers is tagged "(you)" so the model can weight an
+        // ask addressed *to* the user over one they were merely cc'd on.
         let inputs = PromptInputs {
             source_kind: "imap",
             channel_name: "INBOX",
             user_display_name: "Gustavo",
-            user_identifiers: &[],
+            user_identifiers: &["gustavo@example.com".to_string()],
             custom_prompt: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             feedback: &[],
             window: &[WindowMessage {
-                external_id: "msg-tiny".to_string(),
+                external_id: "msg-1".to_string(),
                 posted_at: dt(1_699_999_000),
-                author: "Ana".to_string(),
-                subject: None,
-                body: "Short ask".to_string(),
+                author: "Ana <ana@example.com>".to_string(),
+                recipients: vec![
+                    Recipient {
+                        kind: "to".to_string(),
+                        name: Some("Gustavo".to_string()),
+                        address: Some("gustavo@example.com".to_string()),
+                    },
+                    Recipient {
+                        kind: "cc".to_string(),
+                        name: Some("Bob".to_string()),
+                        address: Some("bob@example.com".to_string()),
+                    },
+                ],
+                subject: Some("Review".to_string()),
+                snippet: "please take a look".to_string(),
             }],
         };
         let rendered = build(&inputs);
-        assert!(rendered.contains("Short ask"));
-        assert!(!rendered.contains("truncated"));
+        assert!(
+            rendered.contains("To: Gustavo <gustavo@example.com> (you)"),
+            "direct recipient matching a user identifier should be tagged (you). prompt:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Cc: Bob <bob@example.com>"),
+            "cc line should render without a (you) tag for non-self addressees"
+        );
     }
 
     #[test]

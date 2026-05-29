@@ -34,7 +34,7 @@ cargo build                          # builds engine, cli, types
 cargo test                           # all unit + integration tests (mock LLM)
 MNEMIS_TEST_LLM=live \
   MNEMIS_TEST_LLM_URL=http://alface:1234/v1 \
-  MNEMIS_TEST_LLM_MODEL=gemma-4-26b-a4b-it-4bit \
+  MNEMIS_TEST_LLM_MODEL=qwen3.5-35b-a3b-4bit \
   cargo test --test extract          # live LLM mode
 
 # Frontend (wasm bundle)

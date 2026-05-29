@@ -47,6 +47,7 @@ async fn extracts_explicit_ask_into_high_confidence_action() -> Result<()> {
             subject: "Q3 roadmap draft",
             body: "Hi, can you take a pass on the Q3 roadmap draft by EOD Wednesday? \
                    I want to send it to the team Thursday morning. — Ana",
+            recipients: &[],
         }],
     )
     .await?;
@@ -112,6 +113,7 @@ async fn skips_purely_informational_message() -> Result<()> {
             subject: "Weekly engineering newsletter",
             body: "This week's newsletter: release 4.2 shipped Tuesday, perf wins on the \
                    indexer, upcoming offsite logistics. No questions asked, no deadlines.",
+            recipients: &[],
         }],
     )
     .await?;

@@ -136,6 +136,7 @@ mod tests {
             subject: Some("S".to_string()),
             body: "hello world".to_string(),
             body_format: "text".to_string(),
+            recipients: Vec::new(),
             raw_json: None,
             flags: 0,
         };

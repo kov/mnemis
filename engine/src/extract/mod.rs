@@ -6,6 +6,7 @@ use std::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
+use crate::source::Recipient;
 
 pub mod prompt;
 pub mod tools;
@@ -20,19 +21,30 @@ pub const PROMPT_VERSION: i64 = 1;
 const WINDOW_LIMIT: i64 = 100;
 const MAX_AGENT_TURNS: usize = 20;
 
+/// Chars of body preview shown per message in the metadata-first window.
+/// The full body is never in the window — the model fetches it on demand
+/// with `fetch_messages`. Matches `search_messages`' snippet length so the
+/// model sees a consistent preview size whichever path surfaced the message.
+/// Public so the CLI `dump_prompt` command can reproduce the exact window.
+pub const SNIPPET_CHARS: usize = 200;
+
 /// Default server context window (tokens) assumed when `[llm]
 /// max_context_tokens` isn't set. omlx commonly defaults a local model to
 /// 32k; the budget math derives the window size from this.
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_768;
 
-/// Fraction of the server context window we let the *initial* message window
-/// occupy. The rest is reserved for the prompt scaffolding (preamble,
-/// existing actions, feedback) and — the part that bit us — the agent loop's
-/// multi-turn growth: every tool call, tool output, and the model's
-/// (server-retained) reasoning piles onto the context across turns. A
-/// ~15k-token window grew to 37k by turn 1 in practice, so a quarter of the
-/// budget is the conservative default; the retry-down path in
-/// [`extract_for_channel`] catches the cases this still under-estimates.
+/// Fraction of the server context window we let a batch's *bodies* occupy.
+/// Under metadata-first extraction the initial window is just metadata +
+/// snippets (tiny), but the model fetches full bodies on demand and — because
+/// turns thread server-side, append-only — every fetched body stays in context
+/// for the rest of the run. So this fraction now bounds the *fetch
+/// accumulation*: `split_into_batches` packs each batch so its bodies sum under
+/// this, and the same value caps `fetch_messages` per run. The rest of the
+/// context is reserved for scaffolding (preamble, existing actions, feedback)
+/// and the agent loop's multi-turn growth (tool calls, the model's
+/// server-retained reasoning). A quarter is the conservative default; the
+/// retry-down path in [`extract_for_channel`] catches the cases this
+/// under-estimates.
 const WINDOW_CONTEXT_FRACTION: f64 = 0.25;
 
 /// Rough chars-per-token used to convert the token budget into the
@@ -40,9 +52,9 @@ const WINDOW_CONTEXT_FRACTION: f64 = 0.25;
 /// side (English prose is ~4) so the estimate errs toward smaller windows.
 const CHARS_PER_TOKEN: usize = 4;
 
-/// Per-batch character budget for the extraction window, derived from the
-/// server's context window. Kept as chars because that's what we can cheaply
-/// measure without a tokenizer.
+/// Per-batch character budget — also the per-run `fetch_messages` budget —
+/// derived from the server's context window. Kept as chars because that's what
+/// we can cheaply measure without a tokenizer.
 pub fn window_char_budget_for(max_context_tokens: usize) -> usize {
     ((max_context_tokens as f64 * WINDOW_CONTEXT_FRACTION) as usize).saturating_mul(CHARS_PER_TOKEN)
 }
@@ -142,7 +154,16 @@ pub async fn extract_for_channel(
 
     while let Some(batch) = queue.pop_front() {
         let result = extract_one_batch(
-            pool, llm, &channel, channel_id, model_name, &profile, &feedback, &batch, traces_dir,
+            pool,
+            llm,
+            &channel,
+            channel_id,
+            model_name,
+            &profile,
+            &feedback,
+            &batch,
+            window_char_budget,
+            traces_dir,
         )
         .await
         .map_err(|e| e.context(format!("channel {channel_id}")))?;
@@ -184,10 +205,14 @@ pub async fn extract_for_channel(
     })
 }
 
-/// Greedily pack the window into batches whose combined message text stays
-/// under `char_budget`. A single message that already exceeds the budget
-/// still gets its own batch (we never drop messages or stall), so the
-/// budget is a soft target, not a hard cap.
+/// Greedily pack the window into batches whose combined message bodies stay
+/// under `char_budget`. We cost by full *body* length (plus subject) even
+/// though the window only renders snippets, because the budget bounds the
+/// worst case where the model fetches every message in the batch — sizing
+/// batches this way guarantees a run can fetch all its bodies without blowing
+/// the fetch budget. A single message that already exceeds the budget still
+/// gets its own batch (we never drop messages or stall), so the budget is a
+/// soft target, not a hard cap.
 fn split_into_batches(window: Vec<WindowRow>, char_budget: usize) -> Vec<Vec<WindowRow>> {
     let mut batches: Vec<Vec<WindowRow>> = Vec::new();
     let mut current: Vec<WindowRow> = Vec::new();
@@ -231,6 +256,7 @@ async fn extract_one_batch(
     profile: &UserProfile,
     feedback: &[FeedbackExample],
     batch: &[WindowRow],
+    window_char_budget: usize,
     traces_dir: Option<&Path>,
 ) -> Result<BatchResult> {
     let up_to = batch.last().map(|m| m.id);
@@ -244,8 +270,9 @@ async fn extract_one_batch(
             external_id: m.external_id.clone(),
             posted_at: DateTime::<Utc>::from_timestamp(m.posted_at, 0).unwrap_or_else(Utc::now),
             author: m.author_display.clone().unwrap_or_else(|| "?".to_string()),
+            recipients: m.recipients.clone(),
             subject: m.subject.clone(),
-            body: m.body.clone(),
+            snippet: tools::snippet(&m.body, SNIPPET_CHARS),
         })
         .collect();
 
@@ -272,7 +299,18 @@ async fn extract_one_batch(
         w.system_prompt(&system_prompt);
         w.tools(&tools::definitions());
     }
-    let outcome = run_agent_loop(pool, llm, scope, system_prompt, writer.as_mut()).await;
+    // The batch's bodies sum to under window_char_budget (split_into_batches
+    // packs to that), so the same value as the fetch budget lets the model
+    // fetch every message in this batch without over-contexting.
+    let outcome = run_agent_loop(
+        pool,
+        llm,
+        scope,
+        system_prompt,
+        window_char_budget,
+        writer.as_mut(),
+    )
+    .await;
 
     // Record the run first either way, then bubble the error so the
     // orchestrator can surface it in SyncOutcome.errors → the toast.
@@ -378,8 +416,11 @@ struct WindowRow {
     external_id: String,
     posted_at: i64,
     subject: Option<String>,
+    /// Full body — kept for snippet generation and batch-cost accounting
+    /// (worst-case fetch size), but NOT rendered into the window.
     body: String,
     author_display: Option<String>,
+    recipients: Vec<Recipient>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -388,12 +429,21 @@ async fn load_window(
     channel_id: i64,
     watermark: Option<i64>,
 ) -> Result<Vec<WindowRow>> {
-    let rows: Vec<(i64, String, i64, Option<String>, String, Option<String>)> = sqlx::query_as(
-        "SELECT m.id, m.external_id, m.posted_at, m.subject, m.body, p.display_name \
-         FROM messages m \
-         LEFT JOIN people p ON p.id = m.author_id \
-         WHERE m.channel_id = ? AND m.id > ? \
-         ORDER BY m.id ASC LIMIT ?",
+    let rows: Vec<(
+        i64,
+        String,
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT m.id, m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
+             m.recipients_json \
+             FROM messages m \
+             LEFT JOIN people p ON p.id = m.author_id \
+             WHERE m.channel_id = ? AND m.id > ? \
+             ORDER BY m.id ASC LIMIT ?",
     )
     .bind(channel_id)
     .bind(watermark.unwrap_or(0))
@@ -404,13 +454,22 @@ async fn load_window(
     Ok(rows
         .into_iter()
         .map(
-            |(id, external_id, posted_at, subject, body, author_display)| WindowRow {
-                id,
-                external_id,
-                posted_at,
-                subject,
-                body,
-                author_display,
+            |(id, external_id, posted_at, subject, body, author_display, recipients_json)| {
+                // Tolerate NULL / malformed recipients_json — recipients are a
+                // triage hint, never load-bearing for correctness.
+                let recipients = recipients_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<Recipient>>(s).ok())
+                    .unwrap_or_default();
+                WindowRow {
+                    id,
+                    external_id,
+                    posted_at,
+                    subject,
+                    body,
+                    author_display,
+                    recipients,
+                }
             },
         )
         .collect())
@@ -527,6 +586,7 @@ async fn run_agent_loop(
     llm: &dyn LlmTransport,
     scope: ExtractionScope,
     system_prompt: String,
+    fetch_budget_chars: usize,
     mut trace: Option<&mut TraceWriter>,
 ) -> Result<(usize, Option<String>)> {
     let tool_defs = tools::definitions();
@@ -536,6 +596,10 @@ async fn run_agent_loop(
     }];
     let mut last_response_id: Option<String> = None;
     let mut actions_created = 0usize;
+    // Bounds the total fetched-body chars this run can accumulate in the
+    // server-threaded context. The batch was sized so its bodies fit under
+    // this; the cap is the backstop for re-fetches / search_messages pulls.
+    let mut fetch_budget = tools::FetchBudget::new(fetch_budget_chars);
 
     for turn in 0..MAX_AGENT_TURNS {
         let t = Instant::now();
@@ -605,7 +669,7 @@ async fn run_agent_loop(
 
         for (call_id, name, arguments) in function_calls {
             debug!(name = %name, call_id = %call_id, "dispatching tool");
-            let out = tools::dispatch(pool, scope, &name, &arguments).await;
+            let out = tools::dispatch(pool, scope, &mut fetch_budget, &name, &arguments).await;
             if out.recorded_action {
                 actions_created += 1;
             }
@@ -752,6 +816,7 @@ mod tests {
             subject: Some("Hello".to_string()),
             body: "Please take a look".to_string(),
             body_format: "text".to_string(),
+            recipients: Vec::new(),
             raw_json: None,
             flags: 0,
         };
@@ -787,7 +852,14 @@ mod tests {
             source_id,
             channel_id,
         };
-        let out = tools::dispatch(&pool, scope, "record_action", &args).await;
+        let out = tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "record_action",
+            &args,
+        )
+        .await;
         assert!(out.recorded_action);
 
         let actions: (i64, String, String, String) =
@@ -839,7 +911,14 @@ mod tests {
             source_id,
             channel_id,
         };
-        let out = tools::dispatch(&pool, scope, "record_action", &args).await;
+        let out = tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "record_action",
+            &args,
+        )
+        .await;
         assert!(!out.recorded_action);
         assert!(out.output.contains("error"));
 
@@ -869,6 +948,7 @@ mod tests {
             subject: Some("Follow-up".to_string()),
             body: "And one more thing".to_string(),
             body_format: "text".to_string(),
+            recipients: Vec::new(),
             raw_json: None,
             flags: 0,
         };
@@ -894,6 +974,7 @@ mod tests {
             subject: None,
             body: "x".repeat(body_len),
             author_display: None,
+            recipients: Vec::new(),
         }
     }
 
@@ -1178,7 +1259,14 @@ mod tests {
             "evidence_external_ids": ["msg-1"]
         })
         .to_string();
-        let created = tools::dispatch(&pool, scope, "record_action", &create_args).await;
+        let created = tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "record_action",
+            &create_args,
+        )
+        .await;
         assert!(created.recorded_action);
         let created_json: serde_json::Value = serde_json::from_str(&created.output)?;
         let action_ref = created_json
@@ -1195,7 +1283,14 @@ mod tests {
             "evidence_external_ids": ["msg-2"]
         })
         .to_string();
-        let updated = tools::dispatch(&pool, scope, "update_action", &update_args).await;
+        let updated = tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "update_action",
+            &update_args,
+        )
+        .await;
         assert!(
             !updated.output.contains("error"),
             "update_action returned an error: {}",
@@ -1284,7 +1379,14 @@ mod tests {
             "evidence_external_ids": ["msg-1"],
         })
         .to_string();
-        let out = tools::dispatch(&pool, scope, "resolve_action", &args).await;
+        let out = tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "resolve_action",
+            &args,
+        )
+        .await;
         assert!(
             !out.output.contains("error"),
             "resolve_action errored: {}",
@@ -1344,7 +1446,14 @@ mod tests {
             "evidence_external_ids": ["msg-1"],
         })
         .to_string();
-        let out = tools::dispatch(&pool, scope, "resolve_action", &args).await;
+        let out = tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "resolve_action",
+            &args,
+        )
+        .await;
         assert!(
             !out.output.contains("\"error\""),
             "unexpected error: {}",
@@ -1519,7 +1628,14 @@ mod tests {
             source_id,
             channel_id,
         };
-        tools::dispatch(&pool, scope, "record_action", &args).await;
+        tools::dispatch(
+            &pool,
+            scope,
+            &mut tools::FetchBudget::unlimited(),
+            "record_action",
+            &args,
+        )
+        .await;
 
         let (status, actor): (String, String) = sqlx::query_as(
             "SELECT a.status, ae.actor FROM actions a \

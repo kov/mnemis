@@ -102,11 +102,19 @@ async fn insert_message_if_new(
         return Ok(None);
     }
 
+    // NULL when there are no recipients (chat sources, or mail without to/cc)
+    // so empty rows stay clean and the projection can skip the section.
+    let recipients_json = if msg.recipients.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&msg.recipients).context("serializing recipients")?)
+    };
+
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO messages \
          (channel_id, external_id, parent_external_id, author_id, posted_at, \
-          subject, body, body_format, raw_json, flags, ingested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+          subject, body, body_format, recipients_json, raw_json, flags, ingested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(channel_id)
     .bind(&msg.external_id)
@@ -116,6 +124,7 @@ async fn insert_message_if_new(
     .bind(msg.subject.as_deref())
     .bind(&msg.body)
     .bind(&msg.body_format)
+    .bind(recipients_json.as_deref())
     .bind(msg.raw_json.as_deref())
     .bind(msg.flags as i64)
     .bind(ingested_at)
@@ -212,6 +221,7 @@ mod tests {
             subject: Some(subject.to_string()),
             body: body.to_string(),
             body_format: "text".to_string(),
+            recipients: Vec::new(),
             raw_json: None,
             flags: 0,
         }

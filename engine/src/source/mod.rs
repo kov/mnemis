@@ -34,6 +34,21 @@ pub struct ImportedAuthor {
     pub handle: Option<String>,
 }
 
+/// One addressee of a message. Serialized into `messages.recipients_json` at
+/// ingest and read back by the extractor's window projection, where "am I a
+/// direct (to) recipient or just cc'd?" is a strong triage signal. Unlike
+/// authors, recipients aren't deduped into the `people` table — they're a
+/// display/triage hint, not a join target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recipient {
+    /// "to" | "cc"
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportedMessage {
     pub external_id: String,
@@ -44,6 +59,9 @@ pub struct ImportedMessage {
     pub body: String,
     /// 'text' | 'markdown' | 'html'
     pub body_format: String,
+    /// to/cc addressees, captured at ingest. Empty when the source doesn't
+    /// carry recipient headers (chat sources) or none were present.
+    pub recipients: Vec<Recipient>,
     pub raw_json: Option<String>,
     pub flags: u32,
 }

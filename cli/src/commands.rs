@@ -303,25 +303,47 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     .and_then(|(o,)| o);
 
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, i64, Option<String>, String, Option<String>)> = sqlx::query_as(
-        "SELECT m.external_id, m.posted_at, m.subject, m.body, p.display_name \
-         FROM messages m LEFT JOIN people p ON p.id = m.author_id \
-         WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT 100",
+    let rows: Vec<(
+        String,
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
+             m.recipients_json \
+             FROM messages m LEFT JOIN people p ON p.id = m.author_id \
+             WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT 100",
     )
     .bind(channel_id)
     .bind(watermark.unwrap_or(0))
     .fetch_all(&pool)
     .await?;
 
+    // Mirror extract_for_channel's projection: metadata + snippet, recipients
+    // parsed from recipients_json — not the full body (that's fetch_messages).
     let window: Vec<prompt::WindowMessage> = rows
         .into_iter()
         .map(
-            |(external_id, posted_at, subject, body, author)| prompt::WindowMessage {
-                external_id,
-                posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0).unwrap_or_else(Utc::now),
-                author: author.unwrap_or_else(|| "?".to_string()),
-                subject,
-                body,
+            |(external_id, posted_at, subject, body, author, recipients_json)| {
+                prompt::WindowMessage {
+                    external_id,
+                    posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
+                        .unwrap_or_else(Utc::now),
+                    author: author.unwrap_or_else(|| "?".to_string()),
+                    recipients: recipients_json
+                        .as_deref()
+                        .and_then(|s| {
+                            serde_json::from_str::<Vec<mnemis_engine::source::Recipient>>(s).ok()
+                        })
+                        .unwrap_or_default(),
+                    subject,
+                    snippet: mnemis_engine::extract::tools::snippet(
+                        &body,
+                        mnemis_engine::extract::SNIPPET_CHARS,
+                    ),
+                }
             },
         )
         .collect();

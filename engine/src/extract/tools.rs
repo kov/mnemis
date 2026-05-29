@@ -14,6 +14,47 @@ pub struct ExtractionScope {
     pub channel_id: i64,
 }
 
+/// Per-run cap on how many characters of message bodies the agent may pull via
+/// `fetch_messages`. Because turns are threaded server-side (append-only via
+/// `previous_response_id`), every fetched body stays in context for the rest of
+/// the run; without a cap a fetch-happy run would re-create the context
+/// overflow the batching is meant to prevent. `split_into_batches` already
+/// sizes each batch so all its bodies fit under this cap, so in the common case
+/// the model can fetch its entire batch — this is the backstop against
+/// pathological cases (re-fetches, pulling many `search_messages` hits).
+#[derive(Debug)]
+pub struct FetchBudget {
+    used_chars: usize,
+    cap_chars: usize,
+}
+
+impl FetchBudget {
+    pub fn new(cap_chars: usize) -> Self {
+        Self {
+            used_chars: 0,
+            cap_chars,
+        }
+    }
+
+    /// An effectively unlimited budget — for tests and direct tool calls that
+    /// don't exercise the fetch path.
+    pub fn unlimited() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    /// Charge `chars` against the budget, returning whether it fit (and
+    /// recording it if so). The first charge of a run always succeeds — even if
+    /// it alone exceeds the cap — so a run can always make progress on at least
+    /// one body (mirrors `split_into_batches`' lone-oversize-message rule).
+    fn try_charge(&mut self, chars: usize) -> bool {
+        if self.used_chars > 0 && self.used_chars.saturating_add(chars) > self.cap_chars {
+            return false;
+        }
+        self.used_chars = self.used_chars.saturating_add(chars);
+        true
+    }
+}
+
 pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef::function(
@@ -30,20 +71,29 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         ),
         ToolDef::function(
-            "fetch_message".to_string(),
-            "Fetch the full body of a single message by its external_id.".to_string(),
+            "fetch_messages".to_string(),
+            "Fetch the full bodies of one or more messages by external_id. Batch the ids — \
+             pass several at once to save round-trips. The window shows only snippets, so \
+             call this before recording an action whenever a snippet alone doesn't confirm \
+             the ask. Returns {\"messages\": [...], \"not_found\": [...]} plus \"over_budget\" \
+             ids and a notice if the per-run fetch budget is hit."
+                .to_string(),
             json!({
                 "type": "object",
                 "properties": {
-                    "external_id": { "type": "string" }
+                    "external_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                    }
                 },
-                "required": ["external_id"]
+                "required": ["external_ids"]
             }),
         ),
         ToolDef::function(
             "record_action".to_string(),
             "Record one action item. evidence_external_ids must reference at least one \
-             message visible in the window or fetched via fetch_message. Returns \
+             message visible in the window or fetched via fetch_messages. Returns \
              {\"action_id\": \"A-N\", \"status\": ...} — keep the action_id if you may \
              want to amend the same action later in this response (use update_action)."
                 .to_string(),
@@ -126,12 +176,13 @@ pub struct DispatchOutput {
 pub async fn dispatch(
     pool: &SqlitePool,
     scope: ExtractionScope,
+    fetch_budget: &mut FetchBudget,
     name: &str,
     arguments: &str,
 ) -> DispatchOutput {
     let result = match name {
         "search_messages" => search_messages(pool, scope, arguments).await,
-        "fetch_message" => fetch_message(pool, scope, arguments).await,
+        "fetch_messages" => fetch_messages(pool, scope, fetch_budget, arguments).await,
         "record_action" => match record_action(pool, scope, arguments).await {
             Ok(json) => {
                 return DispatchOutput {
@@ -206,7 +257,7 @@ async fn search_messages(
 
 #[derive(Deserialize)]
 struct FetchArgs {
-    external_id: String,
+    external_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -219,40 +270,64 @@ struct FetchedMessage {
 }
 
 #[allow(clippy::type_complexity)]
-async fn fetch_message(
+async fn fetch_messages(
     pool: &SqlitePool,
     scope: ExtractionScope,
+    budget: &mut FetchBudget,
     arguments: &str,
 ) -> Result<String> {
-    let args: FetchArgs = serde_json::from_str(arguments).context("parsing fetch_message args")?;
-    let row: Option<(String, i64, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body \
-         FROM messages m \
-         LEFT JOIN people p ON p.id = m.author_id \
-         JOIN channels c ON c.id = m.channel_id \
-         WHERE m.external_id = ? AND c.source_id = ?",
-    )
-    .bind(&args.external_id)
-    .bind(scope.source_id)
-    .fetch_optional(pool)
-    .await
-    .context("fetch_message lookup failed")?;
+    let args: FetchArgs = serde_json::from_str(arguments).context("parsing fetch_messages args")?;
 
-    match row {
-        Some((external_id, posted_at, author, subject, body)) => {
-            let fetched = FetchedMessage {
-                external_id,
-                posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_default(),
-                author,
-                subject,
-                body,
-            };
-            Ok(serde_json::to_string(&fetched)?)
+    let mut messages = Vec::new();
+    let mut not_found = Vec::new();
+    let mut over_budget = Vec::new();
+
+    for ext_id in &args.external_ids {
+        let row: Option<(String, i64, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body \
+             FROM messages m \
+             LEFT JOIN people p ON p.id = m.author_id \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE m.external_id = ? AND c.source_id = ?",
+        )
+        .bind(ext_id)
+        .bind(scope.source_id)
+        .fetch_optional(pool)
+        .await
+        .context("fetch_messages lookup failed")?;
+
+        match row {
+            None => not_found.push(ext_id.clone()),
+            Some((external_id, posted_at, author, subject, body)) => {
+                if !budget.try_charge(body.len()) {
+                    over_budget.push(ext_id.clone());
+                    continue;
+                }
+                messages.push(FetchedMessage {
+                    external_id,
+                    posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_default(),
+                    author,
+                    subject,
+                    body,
+                });
+            }
         }
-        None => Ok(json!({ "error": "message not found" }).to_string()),
     }
+
+    let mut result = json!({
+        "messages": messages,
+        "not_found": not_found,
+    });
+    if !over_budget.is_empty() {
+        result["over_budget"] = json!(over_budget);
+        result["notice"] = json!(
+            "Per-run fetch budget exhausted — decide on the remaining messages from their \
+             metadata, or record from what you've already read."
+        );
+    }
+    Ok(serde_json::to_string(&result)?)
 }
 
 #[derive(Deserialize)]
@@ -718,10 +793,91 @@ async fn resolve_action(
     .to_string())
 }
 
-fn snippet(text: &str, max: usize) -> String {
+/// Truncate `text` to `max` chars (collapsing newlines) with an ellipsis when
+/// cut. Public so the CLI `dump_prompt` command and the window projection share
+/// one snippet definition rather than drifting.
+pub fn snippet(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.replace('\n', " ");
     }
     let truncated: String = text.chars().take(max).collect();
     format!("{}…", truncated.replace('\n', " "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::test_util::{SeedMessage, seed_messages, seed_minimal};
+    use tempfile::TempDir;
+
+    async fn db_with_messages(bodies: &[(&str, &str)]) -> (TempDir, SqlitePool, ExtractionScope) {
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let ctx = seed_minimal(&pool).await.unwrap();
+        let msgs: Vec<SeedMessage> = bodies
+            .iter()
+            .map(|(id, body)| SeedMessage {
+                external_id: id,
+                author_email: "ana@example.com",
+                author_name: "Ana",
+                subject: "S",
+                body,
+                recipients: &[],
+            })
+            .collect();
+        seed_messages(&pool, ctx.source_id, ctx.channel_id, &msgs)
+            .await
+            .unwrap();
+        let scope = ExtractionScope {
+            source_id: ctx.source_id,
+            channel_id: ctx.channel_id,
+        };
+        (tmp, pool, scope)
+    }
+
+    #[tokio::test]
+    async fn fetch_messages_returns_bodies_and_flags_missing() {
+        let (_tmp, pool, scope) = db_with_messages(&[("msg-a", "the full body of A")]).await;
+        let mut budget = FetchBudget::unlimited();
+        let args = json!({ "external_ids": ["msg-a", "msg-missing"] }).to_string();
+        let out = fetch_messages(&pool, scope, &mut budget, &args)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["messages"][0]["external_id"], "msg-a");
+        assert!(
+            v["messages"][0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("full body of A")
+        );
+        assert_eq!(v["not_found"][0], "msg-missing");
+    }
+
+    #[tokio::test]
+    async fn fetch_messages_respects_the_fetch_budget() {
+        let big = "x".repeat(100);
+        let (_tmp, pool, scope) =
+            db_with_messages(&[("msg-a", big.as_str()), ("msg-b", big.as_str())]).await;
+        // Cap fits one 100-char body but not two.
+        let mut budget = FetchBudget::new(150);
+        let args = json!({ "external_ids": ["msg-a", "msg-b"] }).to_string();
+        let out = fetch_messages(&pool, scope, &mut budget, &args)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["messages"].as_array().unwrap().len(),
+            1,
+            "only the first body should fit the budget: {out}"
+        );
+        assert_eq!(v["messages"][0]["external_id"], "msg-a");
+        assert_eq!(v["over_budget"][0], "msg-b");
+        assert!(
+            v["notice"].is_string(),
+            "a budget-exhausted notice should be present: {out}"
+        );
+    }
 }
