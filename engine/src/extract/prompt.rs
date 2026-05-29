@@ -177,8 +177,13 @@ pub fn build(inputs: &PromptInputs) -> String {
            promising, not everything.\n\
          - search_messages(query): keyword/semantic search across recent messages for prior context\n\
          - record_action(title, details, confidence, rationale, due_at?, evidence_external_ids[]): \
-           record one action. Returns {\"action_id\": \"A-N\", ...} — hold onto the A-N id if \
-           you might need to revise the same action later in this response.\n\
+           record one concrete action the user must take. Returns {\"action_id\": \"A-N\", ...} — \
+           hold onto the A-N id if you might need to revise the same action later in this response. \
+           Never call this to report the *absence* of actions: if nothing is actionable, record \
+           nothing and say so in your final message. Set due_at to an ISO 8601 timestamp whenever \
+           the message gives a concrete date or deadline (\"by Friday\", \"vence 16/06/2026\", \
+           \"expires soon — 06/12\"); resolve relative dates against the current time above. Leave \
+           it null only when there is genuinely no date.\n\
          - update_action(action_id, ...): amend an action you already recorded (or one from \
            the Existing list above). Pass only the fields you want to change; extra evidence \
            is appended, not replaced. Use this whenever you'd otherwise be tempted to record \
@@ -197,8 +202,9 @@ pub fn build(inputs: &PromptInputs) -> String {
             item; if the same item recurs (or you learn more), amend it via update_action rather \
             than recording it twice.\n\
          4. Stop when finished. Your final message MUST reflect what you actually did — if \
-            you recorded actions, summarize them briefly; if you recorded none, say so. Do \
-            not say \"no actions found\" after calling record_action.\n\n",
+            you recorded actions, summarize them briefly; if nothing was actionable, record \
+            NOTHING and just say so here. A \"no actions found\" note belongs in this message, \
+            never via record_action.\n\n",
     );
 
     out.push_str(&format!(
@@ -304,6 +310,39 @@ mod tests {
         assert!(rendered.contains("Subject: Hello"));
         assert!(rendered.contains("by Friday"));
         assert!(rendered.contains("# Window"));
+    }
+
+    #[test]
+    fn prompt_forbids_recording_non_actions_and_asks_for_due_dates() {
+        // Two extraction-quality guards live in the prompt: (1) the model must
+        // never record_action a "no actions found" entry — absence is reported
+        // in the final message; (2) when a message states a concrete date, the
+        // action must carry a due_at (it powers calendar sync). Pin both so a
+        // later prompt edit can't silently drop them.
+        let inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            current_time: dt(1_700_000_000),
+            existing_actions: &[],
+            feedback: &[],
+            window: &[msg("msg-1", Some("Hi"), "Anything to do?")],
+        };
+        let rendered = build(&inputs);
+        assert!(
+            rendered.contains("Never call this to report the *absence* of actions"),
+            "prompt must forbid recording a non-action as an action"
+        );
+        assert!(
+            rendered.contains("never via record_action"),
+            "process step must route no-action turns to the final message, not record_action"
+        );
+        assert!(
+            rendered.contains("Set due_at to an ISO 8601 timestamp whenever"),
+            "prompt must tell the model to capture concrete dates into due_at"
+        );
     }
 
     #[test]
