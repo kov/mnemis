@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
@@ -20,6 +20,16 @@ use trace::TraceWriter;
 pub const PROMPT_VERSION: i64 = 1;
 const WINDOW_LIMIT: i64 = 100;
 const MAX_AGENT_TURNS: usize = 20;
+
+/// How many times a turn's LLM send is retried when it fails with a *transient*
+/// server stall (empty body / timeout) — 2 retries = 3 attempts total. omlx
+/// stalls when it throttles under memory pressure and clears once it evicts a
+/// model, so the same request usually succeeds within a retry or two.
+const STALL_RETRIES: usize = 2;
+
+/// Base backoff between stall retries, multiplied by the attempt number so the
+/// second retry waits longer — giving omlx time to evict a model and recover.
+const STALL_BACKOFF: Duration = Duration::from_secs(3);
 
 /// Chars of body preview shown per message in the metadata-first window.
 /// The full body is never in the window — the model fetches it on demand
@@ -80,6 +90,19 @@ enum BatchResult {
 /// (omlx: `Prompt too long: N tokens exceeds max context window of M`).
 fn is_context_overflow(err_chain: &str) -> bool {
     err_chain.contains("max context window") || err_chain.contains("Prompt too long")
+}
+
+/// True when an error chain is a *transient* server stall rather than a
+/// deterministic failure: omlx accepts the request, emits an HTTP 200, then
+/// stalls/aborts generation when it throttles under memory pressure — surfacing
+/// as an empty response body or a request/body-read timeout. These clear once
+/// the server recovers (often after it evicts a model), so the turn is safe to
+/// retry. Deterministic failures (context overflow, malformed request) do not
+/// match and bubble straight to the caller. See the `v1-gotchas` memory.
+fn is_transient_stall(err_chain: &str) -> bool {
+    err_chain.contains("empty response body")
+        || err_chain.contains("stalled")
+        || err_chain.contains("timed out")
 }
 
 #[derive(Debug)]
@@ -590,39 +613,67 @@ async fn run_agent_loop(
     mut trace: Option<&mut TraceWriter>,
 ) -> Result<(usize, Option<String>)> {
     let tool_defs = tools::definitions();
-    let mut input = vec![InputItem::Message {
+    // The full conversation, rebuilt client-side each turn instead of threaded
+    // server-side via `previous_response_id`. Threading wedged omlx on the
+    // occasional stuck continuation — re-POSTing the same response id was
+    // futile — and it replayed the model's prior reasoning, which Qwen/Gemma
+    // mishandle. Reconstructing ourselves means every turn (and every retry) is
+    // a fresh request with no stuck server-side state to inherit, and we
+    // control what's replayed: the assistant's messages and tool calls, but
+    // never its reasoning (the reasoning-replay rule — see the v1-gotchas
+    // memory).
+    let mut history = vec![InputItem::Message {
         role: Role::User,
         content: "Process the messages in the window. Record any actions you find.".to_string(),
     }];
-    let mut last_response_id: Option<String> = None;
     let mut actions_created = 0usize;
-    // Bounds the total fetched-body chars this run can accumulate in the
-    // server-threaded context. The batch was sized so its bodies fit under
-    // this; the cap is the backstop for re-fetches / search_messages pulls.
+    // Bounds the total fetched-body chars this run accumulates in `history`.
+    // The batch was sized so its bodies fit under this; the cap is the backstop
+    // for re-fetches / search_messages pulls.
     let mut fetch_budget = tools::FetchBudget::new(fetch_budget_chars);
 
     for turn in 0..MAX_AGENT_TURNS {
         let t = Instant::now();
-        let input_for_send = std::mem::take(&mut input);
         if let Some(w) = trace.as_deref_mut() {
-            w.llm_send(turn, &input_for_send, last_response_id.as_deref());
+            w.llm_send(turn, &history, None);
         }
         trace!(turn, channel_id = scope.channel_id, "LLM: send");
-        let response = match llm
-            .send(
-                &system_prompt,
-                input_for_send,
-                &tool_defs,
-                last_response_id.as_deref(),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(w) = trace.as_deref_mut() {
-                    w.llm_error(turn, &format!("{e:#}"));
+        // A wedged omlx server accepts the request, emits an HTTP 200, then
+        // stalls — surfacing as an empty body or timeout. Often transient, so
+        // retry with backoff before giving up. Deterministic failures (context
+        // overflow, bad request) are not retried — they bubble straight to the
+        // caller's split-down path.
+        let mut attempt = 0usize;
+        let response = loop {
+            match llm
+                .send(&system_prompt, history.clone(), &tool_defs, None)
+                .await
+            {
+                Ok(r) => break r,
+                Err(e) => {
+                    let chain = format!("{e:#}");
+                    if is_transient_stall(&chain) && attempt < STALL_RETRIES {
+                        attempt += 1;
+                        warn!(
+                            turn,
+                            attempt,
+                            channel_id = scope.channel_id,
+                            "LLM stalled (empty body / timeout); retrying after backoff"
+                        );
+                        if let Some(w) = trace.as_deref_mut() {
+                            w.llm_error(
+                                turn,
+                                &format!("transient stall, retry {attempt}: {chain}"),
+                            );
+                        }
+                        tokio::time::sleep(STALL_BACKOFF * attempt as u32).await;
+                        continue;
+                    }
+                    if let Some(w) = trace.as_deref_mut() {
+                        w.llm_error(turn, &chain);
+                    }
+                    return Err(e).with_context(|| format!("LLM send failed on turn {turn}"));
                 }
-                return Err(e).with_context(|| format!("LLM send failed on turn {turn}"));
             }
         };
         let elapsed = t.elapsed().as_secs();
@@ -635,8 +686,11 @@ async fn run_agent_loop(
             secs = elapsed,
             "LLM: recv"
         );
-        last_response_id = Some(response.id);
 
+        // Append the assistant's turn to `history` in output order — its text
+        // message and tool calls, but NOT its reasoning — then dispatch the
+        // calls. The `FunctionCallOutput`s pushed afterwards carry the same
+        // `call_id`s, so the next turn replays a well-formed exchange.
         let mut function_calls = Vec::new();
         let mut text_parts = Vec::new();
         for item in response.output {
@@ -645,12 +699,27 @@ async fn run_agent_loop(
                     call_id,
                     name,
                     arguments,
-                } => function_calls.push((call_id, name, arguments)),
+                } => {
+                    history.push(InputItem::FunctionCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                    function_calls.push((call_id, name, arguments));
+                }
                 OutputItem::Message { content } => {
+                    let mut msg = String::new();
                     for c in content {
                         if let crate::llm::ContentItem::OutputText { text } = c {
-                            text_parts.push(text);
+                            msg.push_str(&text);
                         }
+                    }
+                    if !msg.is_empty() {
+                        history.push(InputItem::Message {
+                            role: Role::Assistant,
+                            content: msg.clone(),
+                        });
+                        text_parts.push(msg);
                     }
                 }
                 OutputItem::Reasoning | OutputItem::Unknown => {}
@@ -676,7 +745,7 @@ async fn run_agent_loop(
             if let Some(w) = trace.as_deref_mut() {
                 w.tool_dispatch(turn, &call_id, &name, &arguments, &out.output);
             }
-            input.push(InputItem::FunctionCallOutput {
+            history.push(InputItem::FunctionCallOutput {
                 call_id,
                 output: out.output,
             });
@@ -780,6 +849,46 @@ mod tests {
                 .pop_front()
                 .expect("SequencedLlm: send() called more times than scripted");
             step.map_err(|m| anyhow::anyhow!(m))
+        }
+    }
+
+    /// Records the `input` and `previous_response_id` of every `send`, replaying
+    /// scripted responses in order. Lets a test assert how the agent loop builds
+    /// each request — e.g. that it reconstructs history client-side and never
+    /// threads via `previous_response_id`.
+    struct CapturingLlm {
+        steps: std::sync::Mutex<std::collections::VecDeque<ResponsesResponse>>,
+        seen: std::sync::Mutex<Vec<(Vec<crate::llm::InputItem>, Option<String>)>>,
+    }
+
+    impl CapturingLlm {
+        fn new(steps: Vec<ResponsesResponse>) -> Self {
+            Self {
+                steps: std::sync::Mutex::new(steps.into()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmTransport for CapturingLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            input: Vec<crate::llm::InputItem>,
+            _tools: &[crate::llm::ToolDef],
+            previous_response_id: Option<&str>,
+        ) -> Result<ResponsesResponse> {
+            self.seen
+                .lock()
+                .expect("CapturingLlm poisoned")
+                .push((input, previous_response_id.map(str::to_string)));
+            self.steps
+                .lock()
+                .expect("CapturingLlm poisoned")
+                .pop_front()
+                .map(Ok)
+                .expect("CapturingLlm: send() called more times than scripted")
         }
     }
 
@@ -1161,6 +1270,125 @@ mod tests {
         assert_eq!(
             load_watermark(&pool, channel_id).await.unwrap(),
             Some(last_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_for_channel_retries_through_a_transient_server_stall() {
+        // omlx under memory pressure accepts the request then stalls, which the
+        // transport surfaces as an empty body. That's transient, so the turn is
+        // retried in place and the channel still extracts — no error run is left
+        // behind and the watermark advances. (Contrast the overflow test above,
+        // where a *deterministic* over-context failure splits the batch instead.)
+        let (_tmp, pool, _source_id, channel_id) = setup().await.unwrap();
+        let last_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM messages WHERE channel_id = ?")
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // First send stalls (empty body); the retry succeeds.
+        let llm = SequencedLlm::new(vec![
+            Err(
+                "LLM returned an empty response body (HTTP 200 OK); the server accepted \
+                 the request then produced no output"
+                    .to_string(),
+            ),
+            Ok(crate::test_util::mock::no_tools("ok")),
+        ]);
+
+        let outcome = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await
+        .expect("a transient stall should be retried, not surfaced");
+        assert_eq!(outcome.result, "ok");
+        assert_eq!(outcome.up_to_message_id, Some(last_id));
+
+        let (err_runs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM extraction_runs WHERE channel_id = ? AND result = 'error'",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(err_runs, 0, "a retried stall must not leave an error run");
+        assert_eq!(
+            load_watermark(&pool, channel_id).await.unwrap(),
+            Some(last_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_reconstructs_history_client_side_without_threading() {
+        // Extraction rebuilds the conversation itself instead of threading via
+        // previous_response_id: every send carries the full history (no response
+        // id), replaying the assistant's tool calls and their outputs but never
+        // its reasoning. Pins that contract so a future refactor can't silently
+        // reintroduce server-side threading or replay reasoning.
+        let (_tmp, pool, _source_id, channel_id) = setup().await.unwrap();
+
+        let llm = CapturingLlm::new(vec![
+            // Turn 0: a reasoning item (must NOT be replayed) + a fetch call.
+            crate::test_util::mock::turn(vec![
+                OutputItem::Reasoning,
+                OutputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "fetch_messages".to_string(),
+                    arguments: serde_json::json!({ "external_ids": ["m1"] }).to_string(),
+                },
+            ]),
+            // Turn 1: no calls → the loop ends.
+            crate::test_util::mock::no_tools("done"),
+        ]);
+
+        let outcome = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await
+        .expect("loop should finish");
+        assert_eq!(outcome.result, "ok");
+
+        let seen = llm.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "two turns sent");
+        assert!(
+            seen.iter().all(|(_, prev)| prev.is_none()),
+            "must never thread via previous_response_id"
+        );
+        // Turn 0 is just the kickoff user message.
+        assert_eq!(seen[0].0.len(), 1, "turn 0 is the kickoff message only");
+        // Turn 1 replays the prior exchange — user msg + the assistant's
+        // fetch_messages call + its output — and nothing else (reasoning dropped).
+        let t1 = &seen[1].0;
+        assert_eq!(
+            t1.len(),
+            3,
+            "turn 1 should be exactly [user, function_call, function_call_output]; got {t1:?}"
+        );
+        assert!(matches!(
+            &t1[0],
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&t1[1], InputItem::FunctionCall { name, .. } if name == "fetch_messages"),
+            "the assistant's tool call must be replayed"
+        );
+        assert!(
+            matches!(&t1[2], InputItem::FunctionCallOutput { call_id, .. } if call_id == "c1"),
+            "the tool output must follow with the matching call_id"
         );
     }
 

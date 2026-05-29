@@ -5,11 +5,19 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Default total request timeout for an LLM call. A degraded local server can
-/// accept a request and then never respond *or close the socket*; with no
-/// timeout (reqwest's default) a single `send()` wedges the whole sync
-/// indefinitely. 5 minutes is far above the ~2min worst-case prefill we've
-/// measured on batched windows, so it only fires on a genuinely stuck server.
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// accept a request, emit an HTTP 200, then stall mid-generation — omlx does
+/// this when it throttles under memory pressure (it eventually aborts the
+/// request). With no timeout (reqwest's default) a single `send()` wedges the
+/// whole sync indefinitely.
+///
+/// Under metadata-first extraction the prompt is tiny (metadata + snippets),
+/// so prefill is fast and a healthy turn completes in well under a minute —
+/// measured against a live omlx server the slowest *legitimate* generation was
+/// ~42s, so a request still running at 60s is stalled, not slow. The agent
+/// loop treats that timeout as a *transient stall* and retries (see
+/// `STALL_RETRIES` in `extract`), so a short timeout that fails fast and
+/// retries beats one long dead wait per channel.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 /// Build the HTTP client with a request timeout. Falls back to a default
 /// client (no timeout) only if the TLS/backend init fails — never panics
@@ -48,6 +56,15 @@ pub enum Role {
 pub enum InputItem {
     #[serde(rename = "message")]
     Message { role: Role, content: String },
+    /// A prior assistant tool call, replayed when we reconstruct the
+    /// conversation client-side (see `extract::run_agent_loop`). Its `call_id`
+    /// must match the `FunctionCallOutput` that follows it.
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
 }
@@ -146,6 +163,7 @@ pub struct LlmClient {
     base_url: String,
     model: String,
     bearer_token: Option<String>,
+    timeout_secs: u64,
 }
 
 impl LlmClient {
@@ -155,12 +173,14 @@ impl LlmClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             bearer_token: None,
+            timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 
     /// Override the request timeout (seconds). Rebuilds the HTTP client.
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.http = build_http_client(secs);
+        self.timeout_secs = secs;
         self
     }
 
@@ -194,11 +214,44 @@ impl LlmTransport for LlmClient {
             req = req.bearer_auth(token);
         }
 
-        let resp = req.send().await?;
+        let resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                anyhow::anyhow!(
+                    "LLM request timed out after {}s before any response (server stalled): {e}",
+                    self.timeout_secs
+                )
+            } else {
+                anyhow::Error::new(e).context("LLM request failed")
+            }
+        })?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = match resp.text().await {
+            Ok(t) => t,
+            // The headers arrived (so `status` is set) but the body stalled and
+            // the read timed out — a half-sent response from a server that
+            // wedged mid-generation (omlx does this under memory pressure, but
+            // also on the occasional stuck `previous_response_id` continuation
+            // even when memory is fine).
+            Err(e) if e.is_timeout() => bail!(
+                "LLM response stalled mid-body and timed out after {}s \
+                 (server wedged mid-generation): {e}",
+                self.timeout_secs
+            ),
+            Err(e) => return Err(anyhow::Error::new(e).context("reading LLM response body")),
+        };
         if !status.is_success() {
             bail!("LLM API error (HTTP {status}): {text}");
+        }
+        // A 2xx with an empty body is the server accepting the request and then
+        // producing nothing — it stalled/aborted generation (omlx does this
+        // under memory pressure, or on a wedged continuation). Name it plainly
+        // so it isn't mistaken for a parse bug (`serde_json::from_str("")`
+        // reports a cryptic "EOF at line 1").
+        if text.trim().is_empty() {
+            bail!(
+                "LLM returned an empty response body (HTTP {status}); the server accepted \
+                 the request then produced no output — the server wedged mid-generation"
+            );
         }
 
         serde_json::from_str(&text).with_context(|| format!("failed to parse LLM response: {text}"))

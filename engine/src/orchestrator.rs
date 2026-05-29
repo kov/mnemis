@@ -1,6 +1,12 @@
-//! End-to-end sync: for each enabled source, poll → ingest → embed →
-//! extract. Used by both the CLI's `sync` command and the desktop app's
-//! manual "Sync now" button.
+//! End-to-end sync. For each enabled source we phase the work: poll + ingest
+//! every channel, then embed all the new messages in one pass, then extract
+//! every channel. Embedding and extraction use *different* models on the omlx
+//! server; interleaving them per-channel kept both the embedding model and the
+//! large chat model resident the whole sync, pinning the server at its memory
+//! ceiling and throttling generation (see the omlx memory-enforcer note in the
+//! `v1-gotchas` memory). Phasing lets the long extract pass run chat-only.
+//! Used by both the CLI's `sync` command and the desktop app's manual "Sync
+//! now" button.
 //!
 //! The implementation is deliberately blocking-per-source so callers get a
 //! single aggregate `SyncOutcome` back. Per-channel progress streaming (for
@@ -196,6 +202,12 @@ async fn sync_one_source_with(
 
     let total_channels = channels.len();
     let mut counts = SourceCounts::default();
+
+    // Phase 1 — poll + ingest every channel, remembering which ones got new
+    // messages so we only extract those. No embedding or extraction inline
+    // here: keeping them out of this loop is what avoids holding both the
+    // embed and chat models resident at once (see the module doc).
+    let mut to_extract: Vec<(i64, String)> = Vec::new();
     for (idx, (channel_id, external_id, cursor)) in channels.into_iter().enumerate() {
         counts.channels_polled += 1;
         let ch_started = Instant::now();
@@ -203,7 +215,7 @@ async fn sync_one_source_with(
             channel_id,
             channel = %external_id,
             progress = format!("{}/{total_channels}", idx + 1),
-            "channel: start"
+            "channel: poll"
         );
         let cursor = cursor.map(Cursor);
         let batch = match source.poll(&external_id, cursor.as_ref()).await {
@@ -224,7 +236,6 @@ async fn sync_one_source_with(
 
         let inserted = ingest_batch(pool, SourceId(source_id), channel_id, &batch).await?;
         counts.messages_ingested += inserted as i64;
-        trace!(channel_id, ingested = inserted, "channel: ingested");
 
         if inserted == 0 {
             info!(
@@ -232,37 +243,42 @@ async fn sync_one_source_with(
                 channel = %external_id,
                 ingested = 0,
                 secs = ch_started.elapsed().as_secs(),
-                "channel: done"
+                "channel: no new messages"
             );
             continue;
         }
+        trace!(channel_id, ingested = inserted, "channel: ingested");
+        to_extract.push((channel_id, external_id));
+    }
 
-        let mut ch_embedded = 0i64;
-        let mut ch_embed_err: Option<String> = None;
-        match drain_once(pool, embedder.as_ref()).await {
-            Ok(n) => {
-                ch_embedded = n as i64;
-                counts.embeddings_drained += n as i64;
-                trace!(channel_id, embedded = n, "channel: embedded");
-            }
-            Err(e) => {
-                ch_embed_err = Some(format!("{e:#}"));
-                warn!(
-                    error = format!("{e:#}"),
-                    channel_id,
-                    channel = %external_id,
-                    "channel: embed failed"
-                );
-                counts.errors.push(format!(
-                    "source '{source_name}' channel '{external_id}': embed failed: {e:#}"
-                ));
+    // Phase 2 — embed everything ingested this cycle in a single pass, while
+    // the embedding model is the only one that needs to be hot. `drain_once`
+    // records per-entry failures and keeps them queued (returning Ok), so a
+    // single transport error surfaces once at the source level rather than
+    // once per channel.
+    match drain_once(pool, embedder.as_ref()).await {
+        Ok(n) => {
+            counts.embeddings_drained += n as i64;
+            if n > 0 {
+                trace!(source_id, embedded = n, "source: embedded new messages");
             }
         }
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                source_id, "source: embed pass failed"
+            );
+            counts
+                .errors
+                .push(format!("source '{source_name}': embed failed: {e:#}"));
+        }
+    }
 
+    // Phase 3 — extract each channel that ingested new messages. Only the chat
+    // model is exercised now, so the embed model can stay evicted.
+    for (channel_id, external_id) in to_extract {
         let ex_started = Instant::now();
-        trace!(channel_id, "channel: extracting");
-        let mut ch_actions = 0usize;
-        let mut ch_extract_err: Option<String> = None;
+        trace!(channel_id, channel = %external_id, "channel: extracting");
         match extract_for_channel(
             pool,
             llm,
@@ -274,10 +290,10 @@ async fn sync_one_source_with(
         .await
         {
             Ok(o) => {
-                ch_actions = o.actions_created;
                 counts.actions_created += o.actions_created as i64;
-                trace!(
+                info!(
                     channel_id,
+                    channel = %external_id,
                     actions = o.actions_created,
                     result = o.result,
                     secs = ex_started.elapsed().as_secs(),
@@ -285,7 +301,6 @@ async fn sync_one_source_with(
                 );
             }
             Err(e) => {
-                ch_extract_err = Some(format!("{e:#}"));
                 warn!(
                     error = format!("{e:#}"),
                     channel_id,
@@ -298,18 +313,6 @@ async fn sync_one_source_with(
                 ));
             }
         }
-
-        info!(
-            channel_id,
-            channel = %external_id,
-            ingested = inserted,
-            embedded = ch_embedded,
-            actions = ch_actions,
-            embed_err = ch_embed_err.is_some(),
-            extract_err = ch_extract_err.is_some(),
-            secs = ch_started.elapsed().as_secs(),
-            "channel: done"
-        );
     }
 
     Ok(counts)
