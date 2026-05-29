@@ -35,6 +35,7 @@ pub(crate) struct LlmStack {
     pub llm: LlmClient,
     pub embedder: Arc<dyn Embedder>,
     pub chat_model: String,
+    pub window_char_budget: usize,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -200,6 +201,11 @@ async fn save_llm_config(cfg: LlmConfigDto) -> Result<(), String> {
         chat_model: cfg.chat_model,
         embedding_model: cfg.embedding_model,
         bearer_token: cfg.bearer_token.filter(|s| !s.trim().is_empty()),
+        // None → save_llm keeps whatever's already in the file. This form
+        // edits neither max_context_tokens nor request_timeout_secs
+        // (config.toml-only knobs for now).
+        max_context_tokens: None,
+        request_timeout_secs: None,
     })
     .map_err(|e| format!("{e:#}"))
 }
@@ -258,6 +264,7 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
         &stack.llm,
         Arc::clone(&stack.embedder),
         &stack.chat_model,
+        stack.window_char_budget,
         Some(&traces),
     )
     .await
@@ -389,7 +396,8 @@ fn main() {
 }
 
 fn build_llm_stack(cfg: &Config) -> LlmStack {
-    let mut llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone());
+    let mut llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone())
+        .with_timeout(cfg.llm.resolved_request_timeout_secs());
     if let Some(t) = &cfg.llm.bearer_token {
         llm = llm.with_bearer_token(t.clone());
     }
@@ -401,6 +409,9 @@ fn build_llm_stack(cfg: &Config) -> LlmStack {
         llm,
         embedder: Arc::new(embedder),
         chat_model: cfg.llm.chat_model.clone(),
+        window_char_budget: mnemis_engine::extract::window_char_budget_for(
+            cfg.llm.resolved_max_context_tokens(),
+        ),
     }
 }
 

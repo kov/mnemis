@@ -16,6 +16,36 @@ pub struct LlmSection {
     pub embedding_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// The server's context window, in tokens. The extractor derives its
+    /// per-batch message-window budget from this (reserving headroom for the
+    /// prompt scaffolding and the agent loop's multi-turn growth) and splits
+    /// larger windows into sequential batches so no single call overflows the
+    /// server. `None` falls back to [`crate::extract::DEFAULT_MAX_CONTEXT_TOKENS`].
+    /// Set it to whatever your omlx/model is actually configured for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<usize>,
+    /// Total per-request timeout for chat/extraction LLM calls, in seconds.
+    /// A degraded server can accept a request and never answer; without this
+    /// the sync hangs forever. `None` falls back to
+    /// [`crate::llm::DEFAULT_REQUEST_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
+}
+
+impl LlmSection {
+    /// Resolve the configured server context window, falling back to the
+    /// engine default when unset.
+    pub fn resolved_max_context_tokens(&self) -> usize {
+        self.max_context_tokens
+            .unwrap_or(crate::extract::DEFAULT_MAX_CONTEXT_TOKENS)
+    }
+
+    /// Resolve the configured request timeout, falling back to the engine
+    /// default when unset.
+    pub fn resolved_request_timeout_secs(&self) -> u64 {
+        self.request_timeout_secs
+            .unwrap_or(crate::llm::DEFAULT_REQUEST_TIMEOUT_SECS)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -60,11 +90,20 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
-    let paths = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str::<Config>(&text)
-            .map(|c| c.paths)
-            .unwrap_or_default(),
-        Err(_) => PathsSection::default(),
+    // Preserve sections the caller didn't supply: the `[paths]` block and
+    // max_context_tokens, both of which are config-file-only knobs the LLM
+    // settings form never touches. Without this, saving from the UI would
+    // silently wipe a hand-edited max_context_tokens.
+    let (paths, existing_max_ctx, existing_timeout) = match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(c) => (
+                c.paths,
+                c.llm.max_context_tokens,
+                c.llm.request_timeout_secs,
+            ),
+            Err(_) => (PathsSection::default(), None, None),
+        },
+        Err(_) => (PathsSection::default(), None, None),
     };
     let cfg = Config {
         llm: LlmSection {
@@ -72,6 +111,8 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
             chat_model: llm.chat_model.clone(),
             embedding_model: llm.embedding_model.clone(),
             bearer_token: llm.bearer_token.clone(),
+            max_context_tokens: llm.max_context_tokens.or(existing_max_ctx),
+            request_timeout_secs: llm.request_timeout_secs.or(existing_timeout),
         },
         paths,
     };

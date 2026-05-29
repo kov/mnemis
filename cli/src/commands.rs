@@ -137,8 +137,15 @@ pub async fn sync(cfg: &Config) -> Result<()> {
     }
 
     let traces = cfg.traces_dir();
-    let outcome =
-        orchestrator::sync_now(&pool, &llm, embedder, &cfg.llm.chat_model, Some(&traces)).await?;
+    let outcome = orchestrator::sync_now(
+        &pool,
+        &llm,
+        embedder,
+        &cfg.llm.chat_model,
+        mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens()),
+        Some(&traces),
+    )
+    .await?;
 
     println!(
         "Synced {} source(s) ({} failed), {} channel(s) polled, {} new message(s), \
@@ -225,8 +232,15 @@ pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
     let llm = build_llm(cfg);
     let traces = cfg.traces_dir();
-    let outcome =
-        extract_for_channel(&pool, &llm, channel_id, &cfg.llm.chat_model, Some(&traces)).await?;
+    let outcome = extract_for_channel(
+        &pool,
+        &llm,
+        channel_id,
+        &cfg.llm.chat_model,
+        mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens()),
+        Some(&traces),
+    )
+    .await?;
     println!(
         "result={} actions_created={} up_to_message_id={:?}",
         outcome.result, outcome.actions_created, outcome.up_to_message_id
@@ -247,7 +261,8 @@ pub async fn embed_once(cfg: &Config) -> Result<()> {
 }
 
 fn build_llm(cfg: &Config) -> LlmClient {
-    let llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone());
+    let llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone())
+        .with_timeout(cfg.llm.resolved_request_timeout_secs());
     match &cfg.llm.bearer_token {
         Some(t) => llm.with_bearer_token(t.clone()),
         None => llm,

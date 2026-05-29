@@ -20,6 +20,56 @@ pub const PROMPT_VERSION: i64 = 1;
 const WINDOW_LIMIT: i64 = 100;
 const MAX_AGENT_TURNS: usize = 20;
 
+/// Default server context window (tokens) assumed when `[llm]
+/// max_context_tokens` isn't set. omlx commonly defaults a local model to
+/// 32k; the budget math derives the window size from this.
+pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_768;
+
+/// Fraction of the server context window we let the *initial* message window
+/// occupy. The rest is reserved for the prompt scaffolding (preamble,
+/// existing actions, feedback) and — the part that bit us — the agent loop's
+/// multi-turn growth: every tool call, tool output, and the model's
+/// (server-retained) reasoning piles onto the context across turns. A
+/// ~15k-token window grew to 37k by turn 1 in practice, so a quarter of the
+/// budget is the conservative default; the retry-down path in
+/// [`extract_for_channel`] catches the cases this still under-estimates.
+const WINDOW_CONTEXT_FRACTION: f64 = 0.25;
+
+/// Rough chars-per-token used to convert the token budget into the
+/// char-based measure `split_into_batches` works in. Deliberately on the low
+/// side (English prose is ~4) so the estimate errs toward smaller windows.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Per-batch character budget for the extraction window, derived from the
+/// server's context window. Kept as chars because that's what we can cheaply
+/// measure without a tokenizer.
+pub fn window_char_budget_for(max_context_tokens: usize) -> usize {
+    ((max_context_tokens as f64 * WINDOW_CONTEXT_FRACTION) as usize).saturating_mul(CHARS_PER_TOKEN)
+}
+
+/// Char budget used by tests and as the fallback when nothing is configured.
+/// Equals [`window_char_budget_for`]\([`DEFAULT_MAX_CONTEXT_TOKENS`]\).
+pub const DEFAULT_WINDOW_CHAR_BUDGET: usize = DEFAULT_MAX_CONTEXT_TOKENS / 4 * CHARS_PER_TOKEN;
+
+/// What a single batch attempt resolved to. `Overflow` means the agent hit
+/// the server's context limit and the batch is splittable — the caller
+/// halves it and retries — so no `extraction_runs` row is written for the
+/// discarded attempt.
+enum BatchResult {
+    Done {
+        actions: usize,
+        summary: Option<String>,
+        up_to: Option<i64>,
+    },
+    Overflow,
+}
+
+/// True when an error chain is the server rejecting an oversize prompt
+/// (omlx: `Prompt too long: N tokens exceeds max context window of M`).
+fn is_context_overflow(err_chain: &str) -> bool {
+    err_chain.contains("max context window") || err_chain.contains("Prompt too long")
+}
+
 #[derive(Debug)]
 pub struct ExtractionOutcome {
     pub result: &'static str,
@@ -33,6 +83,7 @@ pub async fn extract_for_channel(
     llm: &dyn LlmTransport,
     channel_id: i64,
     model_name: &str,
+    window_char_budget: usize,
     traces_dir: Option<&Path>,
 ) -> Result<ExtractionOutcome> {
     let channel = load_channel(pool, channel_id).await?;
@@ -59,12 +110,135 @@ pub async fn extract_for_channel(
         });
     }
 
-    let up_to = window.last().map(|m| m.id);
-    let existing = load_existing_actions(pool, channel_id).await?;
+    // Static-per-channel inputs: load once, reused across batches.
     let profile = load_user_profile_for(pool, &channel.source_kind).await?;
     let feedback = load_feedback_for(pool, channel.source_id, channel_id).await?;
 
-    let window_for_prompt: Vec<WindowMessage> = window
+    // Split the window so no single LLM call carries a prompt large enough
+    // to time out / OOM / over-context the server. Each batch is its own
+    // extractor session that records its own extraction_runs row (advancing
+    // the watermark), so a mid-window failure leaves earlier batches
+    // committed and the rest to be retried next sync.
+    //
+    // The char budget is only an estimate of where the *full* prompt
+    // (window + scaffolding + multi-turn growth) lands, so a batch can still
+    // overflow at turn N. When that happens we halve the offending batch and
+    // re-run the pieces — a work queue, not a fixed list, so a split feeds
+    // straight back in.
+    let initial = split_into_batches(window, window_char_budget);
+    if initial.len() > 1 {
+        debug!(
+            channel_id,
+            batches = initial.len(),
+            budget = window_char_budget,
+            "extract: window split into batches"
+        );
+    }
+    let mut queue: std::collections::VecDeque<Vec<WindowRow>> = initial.into();
+
+    let mut total_actions = 0usize;
+    let mut last_summary: Option<String> = None;
+    let mut last_up_to = watermark;
+
+    while let Some(batch) = queue.pop_front() {
+        let result = extract_one_batch(
+            pool, llm, &channel, channel_id, model_name, &profile, &feedback, &batch, traces_dir,
+        )
+        .await
+        .map_err(|e| e.context(format!("channel {channel_id}")))?;
+        match result {
+            BatchResult::Done {
+                actions,
+                summary,
+                up_to,
+            } => {
+                total_actions += actions;
+                if summary.is_some() {
+                    last_summary = summary;
+                }
+                last_up_to = up_to;
+            }
+            BatchResult::Overflow => {
+                // extract_one_batch only returns Overflow for a splittable
+                // (len > 1) batch. Halve it and process the halves next, in
+                // order, ahead of the rest of the queue.
+                let mut left = batch;
+                let right = left.split_off(left.len() / 2);
+                warn!(
+                    channel_id,
+                    left = left.len(),
+                    right = right.len(),
+                    "extract: batch over context window, splitting and retrying"
+                );
+                queue.push_front(right);
+                queue.push_front(left);
+            }
+        }
+    }
+
+    Ok(ExtractionOutcome {
+        result: "ok",
+        actions_created: total_actions,
+        up_to_message_id: last_up_to,
+        summary: last_summary,
+    })
+}
+
+/// Greedily pack the window into batches whose combined message text stays
+/// under `char_budget`. A single message that already exceeds the budget
+/// still gets its own batch (we never drop messages or stall), so the
+/// budget is a soft target, not a hard cap.
+fn split_into_batches(window: Vec<WindowRow>, char_budget: usize) -> Vec<Vec<WindowRow>> {
+    let mut batches: Vec<Vec<WindowRow>> = Vec::new();
+    let mut current: Vec<WindowRow> = Vec::new();
+    let mut current_chars = 0usize;
+
+    for msg in window {
+        let cost = msg.subject.as_deref().map_or(0, str::len) + msg.body.len();
+        // Start a new batch when adding this message would blow the budget,
+        // but only if the current batch already has something — otherwise a
+        // lone oversize message would loop forever.
+        if !current.is_empty() && current_chars + cost > char_budget {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars += cost;
+        current.push(msg);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Run one batch as a self-contained extractor session: build the prompt
+/// from just this batch's messages, run the agent loop, and record an
+/// `extraction_runs` row (advancing the watermark to the batch's last
+/// message on success, or an `error` row on a terminal failure).
+///
+/// Returns `BatchResult::Overflow` (without recording a run) when the agent
+/// hit the server's context limit and the batch is splittable — the caller
+/// halves it and retries. A non-context failure, or an over-context failure
+/// on a single-message batch (nothing left to split), records an `error` run
+/// and is returned as `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn extract_one_batch(
+    pool: &SqlitePool,
+    llm: &dyn LlmTransport,
+    channel: &ChannelInfo,
+    channel_id: i64,
+    model_name: &str,
+    profile: &UserProfile,
+    feedback: &[FeedbackExample],
+    batch: &[WindowRow],
+    traces_dir: Option<&Path>,
+) -> Result<BatchResult> {
+    let up_to = batch.last().map(|m| m.id);
+    // Reload existing actions per batch so a later batch can see (and dedup
+    // against) actions an earlier batch in this same sync just recorded.
+    let existing = load_existing_actions(pool, channel_id).await?;
+
+    let window_for_prompt: Vec<WindowMessage> = batch
         .iter()
         .map(|m| WindowMessage {
             external_id: m.external_id.clone(),
@@ -83,7 +257,7 @@ pub async fn extract_for_channel(
         custom_prompt: profile.custom_prompt.as_deref(),
         current_time: Utc::now(),
         existing_actions: &existing,
-        feedback: &feedback,
+        feedback,
         window: &window_for_prompt,
     };
     let system_prompt = prompt::build(&inputs);
@@ -120,11 +294,10 @@ pub async fn extract_for_channel(
                 summary.clone(),
             )
             .await?;
-            Ok(ExtractionOutcome {
-                result: "ok",
-                actions_created,
-                up_to_message_id: up_to,
+            Ok(BatchResult::Done {
+                actions: actions_created,
                 summary,
+                up_to,
             })
         }
         Err(e) => {
@@ -132,6 +305,18 @@ pub async fn extract_for_channel(
             warn!(error = %chain, channel_id, "extraction agent failed");
             if let Some(w) = writer.as_mut() {
                 w.agent_error(&chain);
+            }
+            // Over-context on a splittable batch isn't a real failure — let
+            // the caller halve it and retry. Don't record a run for the
+            // discarded attempt (the trace already captured the agent_error);
+            // the sub-batches will record their own.
+            if is_context_overflow(&chain) && batch.len() > 1 {
+                debug!(
+                    channel_id,
+                    messages = batch.len(),
+                    "extract: batch overflowed context, deferring to caller for split"
+                );
+                return Ok(BatchResult::Overflow);
             }
             record_run(
                 pool,
@@ -144,7 +329,7 @@ pub async fn extract_for_channel(
                 Some(chain.clone()),
             )
             .await?;
-            Err(e.context(format!("channel {channel_id}")))
+            Err(e)
         }
     }
 }
@@ -174,9 +359,13 @@ async fn load_channel(pool: &SqlitePool, channel_id: i64) -> Result<ChannelInfo>
 
 async fn load_watermark(pool: &SqlitePool, channel_id: i64) -> Result<Option<i64>> {
     let row: Option<(Option<i64>,)> = sqlx::query_as(
+        // Tie-break on id DESC: batched extraction records several runs for
+        // one channel that can share a `ran_at` second, and we need the
+        // last-inserted (highest watermark) to win — otherwise the next sync
+        // re-processes messages an earlier batch already handled.
         "SELECT up_to_message_id FROM extraction_runs \
          WHERE channel_id = ? AND result IN ('ok', 'no_activity') \
-         ORDER BY ran_at DESC LIMIT 1",
+         ORDER BY ran_at DESC, id DESC LIMIT 1",
     )
     .bind(channel_id)
     .fetch_optional(pool)
@@ -400,7 +589,7 @@ async fn run_agent_loop(
                         }
                     }
                 }
-                OutputItem::Reasoning { .. } | OutputItem::Unknown => {}
+                OutputItem::Reasoning | OutputItem::Unknown => {}
             }
         }
 
@@ -492,6 +681,41 @@ mod tests {
             _previous_response_id: Option<&str>,
         ) -> Result<ResponsesResponse> {
             bail!("{}", self.0)
+        }
+    }
+
+    /// A transport whose per-`send` results are scripted in order: `Err(msg)`
+    /// bails with that message, `Ok(resp)` returns it. Lets a test interleave
+    /// a context-overflow failure with subsequent successes to exercise the
+    /// split-and-retry path.
+    struct SequencedLlm {
+        steps: std::sync::Mutex<std::collections::VecDeque<Result<ResponsesResponse, String>>>,
+    }
+
+    impl SequencedLlm {
+        fn new(steps: Vec<Result<ResponsesResponse, String>>) -> Self {
+            Self {
+                steps: std::sync::Mutex::new(steps.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::llm::LlmTransport for SequencedLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            _input: Vec<crate::llm::InputItem>,
+            _tools: &[crate::llm::ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<ResponsesResponse> {
+            let step = self
+                .steps
+                .lock()
+                .expect("SequencedLlm poisoned")
+                .pop_front()
+                .expect("SequencedLlm: send() called more times than scripted");
+            step.map_err(|m| anyhow::anyhow!(m))
         }
     }
 
@@ -662,6 +886,234 @@ mod tests {
         Ok(())
     }
 
+    fn window_row(id: i64, body_len: usize) -> WindowRow {
+        WindowRow {
+            id,
+            external_id: format!("m{id}"),
+            posted_at: 1_700_000_000 + id,
+            subject: None,
+            body: "x".repeat(body_len),
+            author_display: None,
+        }
+    }
+
+    #[test]
+    fn split_into_batches_packs_greedily_under_budget() {
+        // Three 40-char messages, budget 100 → [m1,m2] then [m3].
+        let window = vec![window_row(1, 40), window_row(2, 40), window_row(3, 40)];
+        let batches = split_into_batches(window, 100);
+        let shape: Vec<Vec<i64>> = batches
+            .iter()
+            .map(|b| b.iter().map(|m| m.id).collect())
+            .collect();
+        assert_eq!(shape, vec![vec![1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn split_into_batches_gives_oversize_message_its_own_batch() {
+        // A single message bigger than the whole budget must not stall or be
+        // dropped — it gets a batch to itself.
+        let window = vec![window_row(1, 10), window_row(2, 500), window_row(3, 10)];
+        let batches = split_into_batches(window, 100);
+        let shape: Vec<Vec<i64>> = batches
+            .iter()
+            .map(|b| b.iter().map(|m| m.id).collect())
+            .collect();
+        assert_eq!(shape, vec![vec![1], vec![2], vec![3]]);
+    }
+
+    #[tokio::test]
+    async fn extract_for_channel_splits_window_into_batches() {
+        // With a tiny budget each message lands in its own batch; every batch
+        // is a self-contained extractor session that records its own
+        // extraction_runs row and advances the watermark. Pin: N messages →
+        // N runs, watermark ends at the last message.
+        let (_tmp, pool, source_id, channel_id) = setup().await.unwrap();
+        ingest_extra_message(&pool, source_id, channel_id, "msg-2")
+            .await
+            .unwrap();
+        ingest_extra_message(&pool, source_id, channel_id, "msg-3")
+            .await
+            .unwrap();
+
+        let last_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM messages WHERE channel_id = ?")
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // One scripted "no tool calls, just finish" turn per batch session.
+        let llm = crate::test_util::MockLlm::new(vec![
+            crate::test_util::mock::no_tools("nothing here"),
+            crate::test_util::mock::no_tools("nothing here"),
+            crate::test_util::mock::no_tools("nothing here"),
+        ]);
+
+        let outcome = extract_for_channel(&pool, &llm, channel_id, "test-model", 1, None)
+            .await
+            .expect("multi-batch extraction should succeed");
+        assert_eq!(outcome.result, "ok");
+        assert_eq!(outcome.up_to_message_id, Some(last_id));
+
+        let (run_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM extraction_runs WHERE channel_id = ? AND result = 'ok'",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_count, 3, "expected one extraction_runs row per batch");
+
+        // Next sync sees an empty window — the watermark drained everything.
+        let watermark = load_watermark(&pool, channel_id).await.unwrap();
+        assert_eq!(watermark, Some(last_id));
+    }
+
+    #[tokio::test]
+    async fn extract_for_channel_stops_at_failing_batch_and_keeps_prior_watermark() {
+        // If a middle batch fails, earlier batches stay committed (their
+        // watermark holds) and the failing batch + remainder are left for the
+        // next sync. Here the first batch's session fails on turn 0, so the
+        // watermark must NOT advance past the original (None).
+        let (_tmp, pool, source_id, channel_id) = setup().await.unwrap();
+        ingest_extra_message(&pool, source_id, channel_id, "msg-2")
+            .await
+            .unwrap();
+
+        let llm =
+            FailingLlm("error sending request for url: connection closed before message completed");
+        let result = extract_for_channel(&pool, &llm, channel_id, "test-model", 1, None).await;
+        assert!(result.is_err(), "a failing batch should bubble an error");
+
+        // No successful run recorded → watermark stays unset, so the next
+        // sync retries from the top.
+        let watermark = load_watermark(&pool, channel_id).await.unwrap();
+        assert_eq!(watermark, None);
+
+        let (err_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM extraction_runs WHERE channel_id = ? AND result = 'error'",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(err_count, 1, "the failing batch should record an error run");
+    }
+
+    #[test]
+    fn window_char_budget_reserves_headroom_below_context() {
+        // The window gets a quarter of the context (in tokens), converted to
+        // chars — leaving the rest for scaffolding + multi-turn growth.
+        assert_eq!(window_char_budget_for(32_768), 32_768);
+        assert_eq!(window_char_budget_for(8_000), 8_000);
+        // Always strictly under the full context in token terms.
+        assert!(window_char_budget_for(32_768) / CHARS_PER_TOKEN < 32_768);
+        // The documented default matches the derivation for the default ctx.
+        assert_eq!(
+            DEFAULT_WINDOW_CHAR_BUDGET,
+            window_char_budget_for(DEFAULT_MAX_CONTEXT_TOKENS)
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_for_channel_retries_smaller_on_context_overflow() {
+        // The char budget only estimates where the *full* prompt lands, so a
+        // batch can still overflow at the server. When it does, the batch is
+        // halved and the pieces re-run — turning one over-context failure into
+        // two successful sub-batches, with no error run left behind.
+        let (_tmp, pool, source_id, channel_id) = setup().await.unwrap();
+        ingest_extra_message(&pool, source_id, channel_id, "msg-2")
+            .await
+            .unwrap();
+        let last_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM messages WHERE channel_id = ?")
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Big budget → both messages start in one batch. First send is the
+        // server rejecting it as over-context; the two halves then succeed.
+        let llm = SequencedLlm::new(vec![
+            Err(
+                "LLM API error (HTTP 400 Bad Request): Prompt too long: 37172 tokens \
+                 exceeds max context window of 32768 tokens"
+                    .to_string(),
+            ),
+            Ok(crate::test_util::mock::no_tools("ok")),
+            Ok(crate::test_util::mock::no_tools("ok")),
+        ]);
+
+        let outcome = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await
+        .expect("split-and-retry should recover");
+        assert_eq!(outcome.result, "ok");
+        assert_eq!(outcome.up_to_message_id, Some(last_id));
+
+        let (ok_runs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM extraction_runs WHERE channel_id = ? AND result = 'ok'",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ok_runs, 2, "the two halves should each record an ok run");
+
+        let (err_runs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM extraction_runs WHERE channel_id = ? AND result = 'error'",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            err_runs, 0,
+            "the discarded over-context attempt must not leave an error run"
+        );
+
+        assert_eq!(
+            load_watermark(&pool, channel_id).await.unwrap(),
+            Some(last_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_for_channel_surfaces_unsplittable_overflow() {
+        // A single message that overflows the context can't be split further,
+        // so the error is recorded and surfaced rather than looping.
+        let (_tmp, pool, _source_id, channel_id) = setup().await.unwrap();
+        let llm = SequencedLlm::new(vec![Err("LLM API error (HTTP 400 Bad Request): \
+             Prompt too long: 40000 tokens exceeds max context window of 32768 tokens"
+            .to_string())]);
+
+        let result = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "an unsplittable overflow should surface");
+
+        let (err_runs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM extraction_runs WHERE channel_id = ? AND result = 'error'",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(err_runs, 1);
+        assert_eq!(load_watermark(&pool, channel_id).await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn extract_for_channel_propagates_agent_failure() -> Result<()> {
         // Pin: when the LLM call fails (e.g. context window exceeded), the
@@ -674,7 +1126,15 @@ mod tests {
             "LLM API error (HTTP 400 Bad Request): Prompt too long: 154806 \
              tokens exceeds max context window of 131072 tokens",
         );
-        let result = extract_for_channel(&pool, &llm, channel_id, "test-model", None).await;
+        let result = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await;
         let err = result.expect_err("extract_for_channel should return Err when the agent fails");
         let msg = format!("{err:#}");
         assert!(

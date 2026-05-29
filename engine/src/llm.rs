@@ -1,6 +1,25 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// Default total request timeout for an LLM call. A degraded local server can
+/// accept a request and then never respond *or close the socket*; with no
+/// timeout (reqwest's default) a single `send()` wedges the whole sync
+/// indefinitely. 5 minutes is far above the ~2min worst-case prefill we've
+/// measured on batched windows, so it only fires on a genuinely stuck server.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// Build the HTTP client with a request timeout. Falls back to a default
+/// client (no timeout) only if the TLS/backend init fails — never panics
+/// during app startup.
+fn build_http_client(timeout_secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// Abstraction over the LLM transport so tests can swap in a scripted mock
 /// while production uses the real omlx HTTP client.
@@ -78,28 +97,39 @@ pub enum ContentItem {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ReasoningContentItem {
-    #[serde(rename = "reasoning_text")]
-    ReasoningText { text: String },
-    #[serde(other)]
-    Unknown,
+/// Treat an explicit `null` (or an absent field) as `T::default()`. omlx
+/// returns *every* output-item field on *every* item, set to `null` when it
+/// doesn't apply — so a `Vec` field we expect can arrive as `null`, which a
+/// plain `Vec` deserialize rejects with "invalid type: null, expected a
+/// sequence". This maps that to an empty collection.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputItem {
     #[serde(rename = "message")]
-    Message { content: Vec<ContentItem> },
+    Message {
+        #[serde(default, deserialize_with = "null_as_default")]
+        content: Vec<ContentItem>,
+    },
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
     },
+    // The model's chain-of-thought. omlx returns it as a `reasoning` item
+    // with `content: null` (the text lives under a `summary` array); we don't
+    // consume it either way, so accept the tag and ignore every other field.
+    // A unit variant tolerates whatever shape the server sends.
     #[serde(rename = "reasoning")]
-    Reasoning { content: Vec<ReasoningContentItem> },
+    Reasoning,
     #[serde(other)]
     Unknown,
 }
@@ -121,11 +151,17 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(DEFAULT_REQUEST_TIMEOUT_SECS),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             bearer_token: None,
         }
+    }
+
+    /// Override the request timeout (seconds). Rebuilds the HTTP client.
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.http = build_http_client(secs);
+        self
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
@@ -166,5 +202,65 @@ impl LlmTransport for LlmClient {
         }
 
         serde_json::from_str(&text).with_context(|| format!("failed to parse LLM response: {text}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_omlx_response_with_null_valued_fields() {
+        // Shape omlx (Qwen3.6 on this server) actually returns: every item
+        // carries every field, `null` where it doesn't apply. The reasoning
+        // item has `content: null` (text lives under `summary`), and items
+        // carry null `call_id`/`name`/`summary`. Before the null-tolerant
+        // fix this failed with "invalid type: null, expected a sequence" and
+        // the whole (valid) response was discarded.
+        let body = r#"{
+          "id": "resp_abc",
+          "status": "completed",
+          "output": [
+            {"type":"reasoning","id":"rs_1","status":"completed","role":null,
+             "content":null,"call_id":null,"name":null,"arguments":null,
+             "summary":[{"type":"summary_text","text":"thinking..."}]},
+            {"type":"message","id":"msg_1","status":"completed","role":"assistant",
+             "content":[{"type":"output_text","text":"No actions found."}],
+             "call_id":null,"name":null,"arguments":null,"summary":null}
+          ]
+        }"#;
+        let resp: ResponsesResponse =
+            serde_json::from_str(body).expect("null-valued fields must parse");
+        assert_eq!(resp.status, "completed");
+        assert_eq!(resp.output.len(), 2);
+        assert!(matches!(resp.output[0], OutputItem::Reasoning));
+        match &resp.output[1] {
+            OutputItem::Message { content } => match &content[0] {
+                ContentItem::OutputText { text } => assert_eq!(text, "No actions found."),
+                other => panic!("expected output_text, got {other:?}"),
+            },
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_function_call_and_null_message_content() {
+        // A tool-call turn: a function_call item plus a message item whose
+        // content the server set to null. Both must survive.
+        let body = r#"{
+          "id": "resp_def",
+          "status": "completed",
+          "output": [
+            {"type":"function_call","call_id":"call_1","name":"record_action","arguments":"{}"},
+            {"type":"message","id":"m","status":"completed","role":"assistant","content":null}
+          ]
+        }"#;
+        let resp: ResponsesResponse = serde_json::from_str(body).expect("must parse");
+        assert!(matches!(resp.output[0], OutputItem::FunctionCall { .. }));
+        // null message content degrades to an empty Vec, not a parse failure.
+        match &resp.output[1] {
+            OutputItem::Message { content } => assert!(content.is_empty()),
+            other => panic!("expected message, got {other:?}"),
+        }
     }
 }

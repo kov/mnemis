@@ -27,12 +27,17 @@ use crate::source::{Cursor, Source, SourceId};
 /// Run one polling + extraction cycle across every non-disabled source.
 ///
 /// `model_name` is recorded in `extraction_runs.model` so the eventual
-/// re-extraction tooling can spot prompt/model changes.
+/// re-extraction tooling can spot prompt/model changes. `window_char_budget`
+/// caps how much message text a single extraction call carries; larger
+/// windows are split into sequential batches (see
+/// [`crate::extract::extract_for_channel`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_now(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
     embedder: Arc<dyn Embedder>,
     model_name: &str,
+    window_char_budget: usize,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
@@ -56,6 +61,7 @@ pub async fn sync_now(
             llm,
             &embedder,
             model_name,
+            window_char_budget,
             traces_dir,
         )
         .await
@@ -140,6 +146,7 @@ struct SourceCounts {
     errors: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_one_source(
     pool: &SqlitePool,
     source_id: i64,
@@ -147,6 +154,7 @@ async fn sync_one_source(
     llm: &dyn LlmTransport,
     embedder: &Arc<dyn Embedder>,
     model_name: &str,
+    window_char_budget: usize,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     let source = build_imap_source(pool, SourceId(source_id)).await?;
@@ -158,6 +166,7 @@ async fn sync_one_source(
         llm,
         embedder,
         model_name,
+        window_char_budget,
         traces_dir,
     )
     .await
@@ -174,6 +183,7 @@ async fn sync_one_source_with(
     llm: &dyn LlmTransport,
     embedder: &Arc<dyn Embedder>,
     model_name: &str,
+    window_char_budget: usize,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
@@ -253,7 +263,16 @@ async fn sync_one_source_with(
         trace!(channel_id, "channel: extracting");
         let mut ch_actions = 0usize;
         let mut ch_extract_err: Option<String> = None;
-        match extract_for_channel(pool, llm, channel_id, model_name, traces_dir).await {
+        match extract_for_channel(
+            pool,
+            llm,
+            channel_id,
+            model_name,
+            window_char_budget,
+            traces_dir,
+        )
+        .await
+        {
             Ok(o) => {
                 ch_actions = o.actions_created;
                 counts.actions_created += o.actions_created as i64;
@@ -389,7 +408,15 @@ mod tests {
             "http://0.0.0.0".to_string(),
             "noop".to_string(),
         ));
-        let out = sync_now(&pool, &llm, embedder, "test-model", None).await?;
+        let out = sync_now(
+            &pool,
+            &llm,
+            embedder,
+            "test-model",
+            crate::extract::DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await?;
         assert_eq!(out.sources_synced, 0);
         assert_eq!(out.sources_failed, 0);
         assert_eq!(out.messages_ingested, 0);
@@ -496,6 +523,7 @@ mod tests {
             &ContextWindowLlm,
             &embedder,
             "test-model",
+            crate::extract::DEFAULT_WINDOW_CHAR_BUDGET,
             None,
         )
         .await?;

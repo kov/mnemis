@@ -15,7 +15,7 @@
 use anyhow::Result;
 use mnemis_engine::{
     db,
-    extract::extract_for_channel,
+    extract::{DEFAULT_WINDOW_CHAR_BUDGET, extract_for_channel},
     test_util::{
         SeedMessage, assert_evidence_contains, fetch_actions, make_test_llm, mock, seed_messages,
         seed_minimal,
@@ -56,7 +56,15 @@ async fn extracts_explicit_ask_into_high_confidence_action() -> Result<()> {
         mock::no_tools("Recorded one action."),
     ]);
 
-    let outcome = extract_for_channel(&pool, &*llm, ctx.channel_id, &ctx.model, None).await?;
+    let outcome = extract_for_channel(
+        &pool,
+        &*llm,
+        ctx.channel_id,
+        &ctx.model,
+        DEFAULT_WINDOW_CHAR_BUDGET,
+        None,
+    )
+    .await?;
     assert_eq!(outcome.result, "ok", "expected ok, got {:?}", outcome);
 
     let actions = fetch_actions(&pool).await?;
@@ -112,7 +120,15 @@ async fn skips_purely_informational_message() -> Result<()> {
         "Nothing to extract — informational only.",
     )]);
 
-    let outcome = extract_for_channel(&pool, &*llm, ctx.channel_id, &ctx.model, None).await?;
+    let outcome = extract_for_channel(
+        &pool,
+        &*llm,
+        ctx.channel_id,
+        &ctx.model,
+        DEFAULT_WINDOW_CHAR_BUDGET,
+        None,
+    )
+    .await?;
     assert_eq!(outcome.result, "ok");
 
     let actions = fetch_actions(&pool).await?;

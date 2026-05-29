@@ -1,9 +1,17 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
 use tracing::warn;
+
+/// Request timeout for an embedding call. Embeddings are cheap (one short
+/// forward pass), so a stuck request past this is the server wedging — bound
+/// it so a degraded server can't hang the whole drain. Shorter than the chat
+/// timeout since embeddings should never take minutes.
+const EMBED_TIMEOUT_SECS: u64 = 120;
 
 /// Embeds text into vectors. Trait-shaped so the worker can be tested
 /// without an omlx server.
@@ -38,8 +46,12 @@ pub struct OmlxEmbedder {
 
 impl OmlxEmbedder {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(EMBED_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             bearer_token: None,
