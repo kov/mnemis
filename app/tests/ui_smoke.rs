@@ -1570,6 +1570,126 @@ async fn chat_view_lists_and_renders_a_seeded_transcript() -> Result<()> {
     Ok(())
 }
 
+/// Phase 4: the model answers in markdown, so the assistant bubble renders it
+/// as formatted HTML — and because that markdown can carry prompt-injected
+/// markup from ingested mail, the render is sanitized: raw `<script>` is
+/// dropped and `javascript:` links degrade to plain text, while a real https
+/// link survives. No LLM needed — runs under MNEMIS_DISABLE_LLM.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_view_renders_assistant_markdown_safely() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-markdown.db");
+    let md = concat!(
+        "Here is **bold emphasis** and `inline code`.\n\n",
+        "```\nlet x = 1;\n```\n\n",
+        "See [the docs](https://example.com/docs) and [danger](javascript:alert(1)).\n\n",
+        "<script>alert('xss')</script>\n",
+    );
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Smoke Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        let chat_id = store::create_chat(&pool, None, None).await?;
+        let q = "show me some formatting";
+        store::append_turn(&pool, chat_id, "user", Some(q), None, None, None).await?;
+        store::ensure_title(&pool, chat_id, q).await?;
+        store::append_turn(&pool, chat_id, "assistant", Some(md), None, None, None).await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await
+        .context("waiting for nav.nav")?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/chats"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("a.chat-list-item"))
+        .await
+        .context("waiting for a.chat-list-item")?;
+    client
+        .execute(
+            r#"document.querySelector('a.chat-list-item').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.chat-assistant"))
+        .await
+        .context("waiting for div.chat-assistant")?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let rendered = client
+        .find(Locator::Css("div.chat-assistant"))
+        .await?
+        .html(true)
+        .await
+        .unwrap_or_default();
+
+    // Formatting survived as real HTML elements.
+    assert!(
+        rendered.contains("<strong>bold emphasis</strong>"),
+        "bold markdown should render as <strong>. got: {rendered}"
+    );
+    assert!(
+        rendered.contains("<pre>") && rendered.contains("<code>"),
+        "a fenced block should render as <pre><code>. got: {rendered}"
+    );
+    // The safe link is a real anchor pointing at the original https URL.
+    assert!(
+        rendered.contains("https://example.com/docs"),
+        "an https link should survive. got: {rendered}"
+    );
+
+    // Sanitization: nothing dangerous made it through.
+    assert!(
+        !rendered.contains("<script"),
+        "raw <script> must be dropped. got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("alert('xss')"),
+        "raw HTML script body must be dropped. got: {rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("javascript:"),
+        "a javascript: link must degrade to plain text. got: {rendered}"
+    );
+    // …but the disallowed link's visible text is preserved.
+    assert!(
+        rendered.contains("danger"),
+        "the unsafe link's text should remain. got: {rendered}"
+    );
+
+    Ok(())
+}
+
 /// Phase 4: a tall transcript auto-scrolls to the newest message on open, so
 /// the user sees the latest content rather than the top. Guards the sticky-
 /// scroll behavior (the bug: scroll reset to the top on every new message).

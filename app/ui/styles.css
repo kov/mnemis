@@ -479,6 +479,95 @@ h1 {
   align-self: flex-start;
   background: var(--border);
   color: var(--fg);
+  /* Rendered markdown brings its own block structure, so drop the pre-wrap
+     the user bubble relies on (it would turn inter-block newlines into gaps). */
+  white-space: normal;
+}
+
+/* Markdown rendered inside an assistant bubble. Tight margins keep a one-line
+   reply compact while still giving lists/code/quotes real structure. */
+.chat-assistant > :first-child {
+  margin-top: 0;
+}
+.chat-assistant > :last-child {
+  margin-bottom: 0;
+}
+.chat-assistant p {
+  margin: 0.5em 0;
+}
+.chat-assistant ul,
+.chat-assistant ol {
+  margin: 0.5em 0;
+  padding-left: 1.4em;
+}
+.chat-assistant li {
+  margin: 0.15em 0;
+}
+.chat-assistant h1,
+.chat-assistant h2,
+.chat-assistant h3,
+.chat-assistant h4,
+.chat-assistant h5,
+.chat-assistant h6 {
+  margin: 0.6em 0 0.3em;
+  line-height: 1.25;
+}
+.chat-assistant h1 {
+  font-size: 1.3rem;
+}
+.chat-assistant h2 {
+  font-size: 1.18rem;
+}
+.chat-assistant h3 {
+  font-size: 1.05rem;
+}
+.chat-assistant h4,
+.chat-assistant h5,
+.chat-assistant h6 {
+  font-size: 1rem;
+}
+.chat-assistant a {
+  text-decoration: underline;
+}
+.chat-assistant code {
+  font-family: ui-monospace, monospace;
+  font-size: 0.88em;
+  background: rgba(127, 127, 127, 0.18);
+  padding: 0.1em 0.3em;
+  border-radius: 4px;
+}
+.chat-assistant pre {
+  background: rgba(127, 127, 127, 0.18);
+  padding: 0.6rem 0.8rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.chat-assistant pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.85em;
+}
+.chat-assistant blockquote {
+  margin: 0.5em 0;
+  padding-left: 0.8em;
+  border-left: 3px solid var(--medium);
+  color: var(--muted);
+}
+.chat-assistant table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+.chat-assistant th,
+.chat-assistant td {
+  border: 1px solid var(--border);
+  padding: 0.3em 0.5em;
+  text-align: left;
+}
+.chat-assistant hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0.8em 0;
 }
 
 .chat-reasoning {

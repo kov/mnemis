@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, KeyboardEvent};
+use leptos::web_sys::{
+    Element, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent,
+};
 use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use mnemis_types::{
@@ -12,14 +14,15 @@ use mnemis_types::{
 };
 use wasm_bindgen::JsCast;
 
+use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
     ChatStream, ChatUiState, FirstRunTick, SyncTick, add_imap_source, confidence_class,
     confirm_resolution, create_chat, delete_source, fetch_actions, fetch_chat_seed,
     fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
     fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
-    reject_resolution, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
-    set_channel_muted, set_channels_muted_bulk, set_chat_show_reasoning, set_source_muted,
-    status_label, submit_dismissal_feedback, update_action,
+    open_external, reject_resolution, run_sync_now, save_llm_config, save_user_profile,
+    send_chat_message, set_channel_muted, set_channels_muted_bulk, set_chat_show_reasoning,
+    set_source_muted, status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -1663,12 +1666,43 @@ fn ChatTurnView(turn: ChatTurnDto, show_reasoning: RwSignal<bool>) -> impl IntoV
         ("tool", Some(name)) => tool_disclosure(format!("\u{2190} {name}"), content),
         ("assistant", Some(name)) => tool_disclosure(format!("\u{2192} {name}"), content),
         ("assistant", None) if !content.is_empty() => {
-            view! { <div class="chat-msg chat-assistant">{content}</div> }.into_any()
+            // The model answers in markdown; render it as sanitized HTML so
+            // formatting (lists, code, links) shows the way the user expects.
+            let html = markdown_to_html(&content);
+            view! {
+                <div
+                    class="chat-msg chat-assistant"
+                    inner_html=html
+                    on:click=open_link_externally
+                ></div>
+            }
+            .into_any()
         }
         _ => ().into_any(),
     };
 
     view! { <>{reasoning_view}{body}</> }
+}
+
+/// Click handler for the assistant bubble: when a rendered markdown link is
+/// clicked, send it to the OS browser instead of navigating the webview.
+fn open_link_externally(ev: MouseEvent) {
+    let Some(anchor) = ev
+        .target()
+        .and_then(|t| t.dyn_into::<Element>().ok())
+        .and_then(|el| el.closest("a").ok().flatten())
+    else {
+        return;
+    };
+    let Some(href) = anchor.get_attribute("href") else {
+        return;
+    };
+    if is_safe_href(&href) {
+        ev.prevent_default();
+        spawn_local(async move {
+            let _ = open_external(href).await;
+        });
+    }
 }
 
 /// A collapsed `<details>` block for a tool call or result (Claude-Code style).

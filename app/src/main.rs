@@ -410,6 +410,9 @@ fn main() {
             }
         }));
     }
+    // Lets the chat view hand external links (rendered from the assistant's
+    // markdown) to the OS default browser instead of navigating the webview.
+    builder = builder.plugin(tauri_plugin_opener::init());
     builder
         .setup(|app| {
             let app_data = resolve_db_path(app)?;

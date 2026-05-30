@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 mod components;
+mod markdown;
 
 #[wasm_bindgen]
 extern "C" {
@@ -378,6 +379,23 @@ pub async fn set_chat_show_reasoning(value: bool) -> Result<(), String> {
     let args =
         serde_wasm_bindgen::to_value(&SetShowReasoningArgs { value }).map_err(|e| e.to_string())?;
     invoke("set_chat_show_reasoning", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct OpenUrlArgs {
+    url: String,
+    with: Option<String>,
+}
+
+/// Hand a URL to the OS default handler via `tauri-plugin-opener`, rather than
+/// letting the click navigate the webview away from the app.
+pub async fn open_external(url: String) -> Result<(), String> {
+    let args =
+        serde_wasm_bindgen::to_value(&OpenUrlArgs { url, with: None }).map_err(|e| e.to_string())?;
+    invoke("plugin:opener|open_url", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     Ok(())
