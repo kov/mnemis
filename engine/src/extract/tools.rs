@@ -90,6 +90,30 @@ fn fetch_messages_params() -> serde_json::Value {
     })
 }
 
+fn list_messages_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "ISO 8601 date (2026-05-28) or datetime; only messages at or after this. Omit for no lower bound."
+            },
+            "until": {
+                "type": "string",
+                "description": "ISO 8601 date or datetime; only messages strictly before this. Omit for no upper bound."
+            },
+            "before": {
+                "type": "string",
+                "description": "Paging cursor: pass the `next_before` from the previous call to get the next, older page. Omit on the first call."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max messages to return (default 25, max 100)."
+            }
+        }
+    })
+}
+
 fn record_action_params() -> serde_json::Value {
     json!({
         "type": "object",
@@ -228,10 +252,22 @@ pub fn chat_definitions() -> Vec<ToolDef> {
         ToolDef::function(
             "fetch_messages".to_string(),
             "Fetch the full bodies of one or more messages by external_id — ids you got from \
-             search_messages, from an action's evidence, or that the user named. Batch them. \
-             Returns {\"messages\": [...], \"not_found\": [...]}."
+             search_messages, list_messages, an action's evidence, or that the user named. Batch \
+             them. Returns {\"messages\": [...], \"not_found\": [...]}."
                 .to_string(),
             fetch_messages_params(),
+        ),
+        ToolDef::function(
+            "list_messages".to_string(),
+            "List the user's messages newest-first, optionally within a time window. Use this for \
+             \"what came in recently / in the last N days\" questions — search_messages is for \
+             keyword lookups, NOT time ranges. `since`/`until` are ISO 8601 dates or datetimes \
+             (resolve relative dates against the current time you were given). Returns up to \
+             `limit` summaries (external_id, posted_at, author, subject, snippet, channel) and \
+             `has_more`; when more remain it includes `next_before` — call again with that as \
+             `before` for the next, older page. Then fetch_messages by external_id for full bodies."
+                .to_string(),
+            list_messages_params(),
         ),
         ToolDef::function(
             "list_actions".to_string(),
@@ -296,6 +332,7 @@ pub async fn dispatch(
     let result = match name {
         "search_messages" => search_messages(pool, scope, arguments).await,
         "fetch_messages" => fetch_messages(pool, scope, fetch_budget, arguments).await,
+        "list_messages" => list_messages(pool, scope, arguments).await,
         "list_actions" => list_actions(pool, arguments).await,
         "get_action" => get_action(pool, arguments).await,
         "record_action" => match record_action(pool, scope, arguments).await {
@@ -314,7 +351,10 @@ pub async fn dispatch(
 
     let output = match result {
         Ok(json) => json,
-        Err(e) => json!({ "error": e.to_string() }).to_string(),
+        // `{e:#}` flattens the anyhow context chain (e.g. "FTS search failed
+        // for …: no such column: from") so the model gets an actionable error
+        // instead of just the opaque top-level message.
+        Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
     };
     DispatchOutput {
         output,
@@ -335,9 +375,31 @@ struct SearchHit {
     channel: String,
 }
 
+/// Turn an arbitrary user/model query into a safe FTS5 MATCH expression. FTS5
+/// treats `:`, `-`, `"`, `*`, `(`, and bareword `AND/OR/NOT/NEAR` as operators,
+/// so a natural-language query — or a `from:date` guess like the model reaches
+/// for on "last 2 days" questions — raises a hard syntax error (e.g. `no such
+/// column: from`). We extract bareword tokens and quote each as an FTS5 phrase,
+/// ANDed together: a forgiving keyword search that never errors. Empty when the
+/// query has no word characters at all.
+fn sanitize_fts_query(raw: &str) -> String {
+    raw.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn search_messages(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
     let args: SearchArgs =
         serde_json::from_str(arguments).context("parsing search_messages args")?;
+    let match_query = sanitize_fts_query(&args.query);
+    if match_query.is_empty() {
+        // No searchable terms (e.g. a date-only or punctuation query) — return
+        // empty rather than erroring; the model should use list_messages for
+        // time windows.
+        return Ok(serde_json::to_string(&Vec::<SearchHit>::new())?);
+    }
     let filter = scope.source_filter();
     let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT m.external_id, m.posted_at, m.body, c.name \
@@ -347,12 +409,12 @@ async fn search_messages(pool: &SqlitePool, scope: ToolScope, arguments: &str) -
          WHERE messages_fts MATCH ? AND (? IS NULL OR c.source_id = ?) \
          ORDER BY rank LIMIT 10",
     )
-    .bind(&args.query)
+    .bind(&match_query)
     .bind(filter)
     .bind(filter)
     .fetch_all(pool)
     .await
-    .context("FTS search failed")?;
+    .with_context(|| format!("FTS search failed for {match_query:?}"))?;
 
     let hits: Vec<SearchHit> = rows
         .into_iter()
@@ -441,6 +503,152 @@ async fn fetch_messages(
             "Per-run fetch budget exhausted — decide on the remaining messages from their \
              metadata, or record from what you've already read."
         );
+    }
+    Ok(serde_json::to_string(&result)?)
+}
+
+/// Parse an ISO 8601 date or datetime into a Unix timestamp (UTC). Accepts a
+/// full RFC 3339 datetime (`2026-05-28T08:00:00Z`), a zone-less datetime
+/// (assumed UTC), or a bare date (`2026-05-28`, treated as UTC midnight).
+fn parse_iso_to_ts(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp());
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(ndt.and_utc().timestamp());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(d
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc()
+            .timestamp());
+    }
+    anyhow::bail!("expected an ISO 8601 date or datetime, got {s:?}")
+}
+
+const LIST_MESSAGES_DEFAULT_LIMIT: i64 = 25;
+const LIST_MESSAGES_MAX_LIMIT: i64 = 100;
+
+#[derive(Deserialize, Default)]
+struct ListMessagesArgs {
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ListedMessage {
+    external_id: String,
+    posted_at: String,
+    author: Option<String>,
+    subject: Option<String>,
+    snippet: String,
+    channel: String,
+}
+
+/// List messages newest-first, optionally within a `[since, until)` window, with
+/// time-cursor paging (`before`). Returns up to `limit` summaries plus
+/// `has_more`; when more remain, `next_before` is the `posted_at` to pass as
+/// `before` on the next call. `until` and `before` are both exclusive upper
+/// bounds and compose (the tighter one wins).
+async fn list_messages(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
+    let args: ListMessagesArgs = if arguments.trim().is_empty() {
+        ListMessagesArgs::default()
+    } else {
+        serde_json::from_str(arguments).context("parsing list_messages args")?
+    };
+    let filter = scope.source_filter();
+    let limit = args
+        .limit
+        .unwrap_or(LIST_MESSAGES_DEFAULT_LIMIT)
+        .clamp(1, LIST_MESSAGES_MAX_LIMIT);
+
+    let since_ts = args
+        .since
+        .as_deref()
+        .map(parse_iso_to_ts)
+        .transpose()
+        .context("invalid `since`")?;
+    let until_ts = args
+        .until
+        .as_deref()
+        .map(parse_iso_to_ts)
+        .transpose()
+        .context("invalid `until`")?;
+    let before_ts = args
+        .before
+        .as_deref()
+        .map(parse_iso_to_ts)
+        .transpose()
+        .context("invalid `before`")?;
+
+    // Fetch one extra row to detect whether a further (older) page exists.
+    #[allow(clippy::type_complexity)]
+    let mut rows: Vec<(String, i64, Option<String>, Option<String>, String, String)> =
+        sqlx::query_as(
+            "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body, c.name \
+             FROM messages m \
+             LEFT JOIN people p ON p.id = m.author_id \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE (? IS NULL OR m.posted_at >= ?) \
+               AND (? IS NULL OR m.posted_at <  ?) \
+               AND (? IS NULL OR m.posted_at <  ?) \
+               AND (? IS NULL OR c.source_id  =  ?) \
+             ORDER BY m.posted_at DESC, m.id DESC \
+             LIMIT ?",
+        )
+        .bind(since_ts)
+        .bind(since_ts)
+        .bind(until_ts)
+        .bind(until_ts)
+        .bind(before_ts)
+        .bind(before_ts)
+        .bind(filter)
+        .bind(filter)
+        .bind(limit + 1)
+        .fetch_all(pool)
+        .await
+        .context("listing messages")?;
+
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+
+    // Cursor for the next page: the posted_at of the last (oldest) row here.
+    let next_before = if has_more {
+        rows.last().map(|r| iso(r.1))
+    } else {
+        None
+    };
+
+    let messages: Vec<ListedMessage> = rows
+        .into_iter()
+        .map(
+            |(external_id, posted_at, author, subject, body, channel)| ListedMessage {
+                external_id,
+                posted_at: iso(posted_at),
+                author,
+                subject,
+                snippet: snippet(&body, 200),
+                channel,
+            },
+        )
+        .collect();
+
+    let returned = messages.len();
+    let mut result = json!({
+        "messages": messages,
+        "returned": returned,
+        "has_more": has_more,
+    });
+    if let Some(nb) = next_before {
+        result["next_before"] = json!(nb);
     }
     Ok(serde_json::to_string(&result)?)
 }
@@ -1250,6 +1458,171 @@ mod tests {
         assert_eq!(
             hits2[0]["external_id"], "m2",
             "global search should span sources: {out2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_messages_tolerates_operator_syntax() {
+        let (_tmp, pool, scope) = db_with_messages(&[("m1", "an email about the meeting")]).await;
+
+        // The exact query the model sent on "last 2 days" that used to raise a
+        // hard `no such column: from` FTS5 error — must now degrade gracefully.
+        let messy =
+            json!({ "query": "email from:2026-05-28..2026-05-30 OR subject OR FROM" }).to_string();
+        let out = search_messages(&pool, scope, &messy).await;
+        assert!(out.is_ok(), "operator-laden query must not error: {out:?}");
+
+        // A plain keyword still finds the message.
+        let plain = json!({ "query": "email" }).to_string();
+        let hits: serde_json::Value =
+            serde_json::from_str(&search_messages(&pool, scope, &plain).await.unwrap()).unwrap();
+        assert_eq!(
+            hits[0]["external_id"], "m1",
+            "keyword search still works: {hits}"
+        );
+
+        // A query with no word characters degrades to empty, not an error.
+        let punct = json!({ "query": ":-)" }).to_string();
+        let empty: serde_json::Value =
+            serde_json::from_str(&search_messages(&pool, scope, &punct).await.unwrap()).unwrap();
+        assert_eq!(
+            empty.as_array().unwrap().len(),
+            0,
+            "punctuation-only query → empty: {empty}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_messages_pages_newest_first_with_a_cursor() {
+        let (_tmp, pool, scope) = db_with_messages(&[
+            ("m0", "b0"),
+            ("m1", "b1"),
+            ("m2", "b2"),
+            ("m3", "b3"),
+            ("m4", "b4"),
+        ])
+        .await;
+
+        // Page through two at a time via the `before` cursor; the union must be
+        // every message exactly once, newest-first, with no gaps or overlaps.
+        let mut seen: Vec<String> = Vec::new();
+        let mut before: Option<String> = None;
+        for page in 0..10 {
+            let mut args = serde_json::Map::new();
+            args.insert("limit".to_string(), json!(2));
+            if let Some(b) = &before {
+                args.insert("before".to_string(), json!(b));
+            }
+            let out = list_messages(&pool, scope, &serde_json::Value::Object(args).to_string())
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            for m in v["messages"].as_array().unwrap() {
+                seen.push(m["external_id"].as_str().unwrap().to_string());
+            }
+            if v["has_more"].as_bool().unwrap() {
+                before = Some(v["next_before"].as_str().unwrap().to_string());
+            } else {
+                assert!(
+                    v.get("next_before").is_none(),
+                    "the last page must not carry a cursor: {out}"
+                );
+                break;
+            }
+            assert!(page < 9, "paging failed to terminate");
+        }
+        assert_eq!(
+            seen,
+            vec!["m4", "m3", "m2", "m1", "m0"],
+            "cursor paging should walk newest→oldest with no gaps or dups"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_messages_filters_by_date_range_and_spans_sources() {
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let ctx = seed_minimal(&pool).await.unwrap();
+
+        // A second source/channel, to prove Global spans sources.
+        let (s2,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'two', 'two/ref', 0) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (c2,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'INBOX2', 'INBOX2', 'mailbox') RETURNING id",
+        )
+        .bind(s2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        const T0: i64 = 1_700_000_000;
+        const DAY: i64 = 86_400;
+        for (ch, ext, posted, body) in [
+            (ctx.channel_id, "old", T0, "before the window"),
+            (ctx.channel_id, "mid1", T0 + DAY, "in window, source one"),
+            (c2, "mid2", T0 + DAY + 100, "in window, source two"),
+            (ctx.channel_id, "new", T0 + 2 * DAY, "at/after the window"),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages \
+                 (channel_id, external_id, posted_at, subject, body, body_format, ingested_at) \
+                 VALUES (?, ?, ?, 'S', ?, 'text', 0)",
+            )
+            .bind(ch)
+            .bind(ext)
+            .bind(posted)
+            .bind(body)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let args = json!({ "since": iso(T0 + DAY), "until": iso(T0 + 2 * DAY) }).to_string();
+
+        // Global: both in-window messages, newest-first, across both sources;
+        // "old" (before since) and "new" (>= until, exclusive) are excluded.
+        let out = list_messages(&pool, ToolScope::Global, &args)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let ids: Vec<&str> = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["external_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["mid2", "mid1"],
+            "date window + newest-first across sources: {out}"
+        );
+        assert_eq!(
+            v["has_more"], false,
+            "only two messages in the window: {out}"
+        );
+
+        // Source-scoped to source 1: only its in-window message.
+        let out1 = list_messages(&pool, ToolScope::Source(ctx.source_id), &args)
+            .await
+            .unwrap();
+        let v1: serde_json::Value = serde_json::from_str(&out1).unwrap();
+        let ids1: Vec<&str> = v1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["external_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids1,
+            vec!["mid1"],
+            "scope must restrict to its source: {out1}"
         );
     }
 }
