@@ -599,7 +599,7 @@ h1 {
 .chat-tool-arrow {
   font-style: normal;
   font-size: 0.8em;
-  margin-right: 0.1rem;
+  margin-left: 0.1rem;
 }
 .chat-tool-call {
   color: var(--accent);

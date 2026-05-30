@@ -1712,10 +1712,12 @@ fn tool_disclosure(is_call: bool, name: String, body: String) -> AnyView {
     };
     view! {
         <details class="chat-tool">
+            // Marker trails the name so it doesn't sit next to the <details>
+            // revealer triangle (which would read as a second direction arrow).
             <summary>
-                <span class=marker_class>{marker}</span>
-                " "
                 {name}
+                " "
+                <span class=marker_class>{marker}</span>
             </summary>
             <pre class="chat-tool-body">{body}</pre>
         </details>
