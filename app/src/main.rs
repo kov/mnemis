@@ -12,9 +12,9 @@ use mnemis_engine::embed::{Embedder, OmlxEmbedder};
 use mnemis_engine::llm::LlmClient;
 use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, FeedbackKind,
-    LlmConfigDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome,
-    UserProfileDto,
+    ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
+    ChatDto, ChatEvent, ChatTurnDto, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto,
+    SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tauri::ipc::Channel;
@@ -174,6 +174,101 @@ async fn add_imap_source(
 #[tauri::command(rename_all = "snake_case")]
 async fn delete_source(state: State<'_, AppState>, source_id: i64) -> Result<(), String> {
     settings::delete_source(&state.pool, source_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_caldav_account(state: State<'_, AppState>) -> Result<CaldavAccountDto, String> {
+    settings::get_caldav_account(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn add_caldav_account(
+    state: State<'_, AppState>,
+    base_url: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    settings::add_caldav_account(&state.pool, &base_url, &username, &password)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn delete_caldav_account(state: State<'_, AppState>) -> Result<(), String> {
+    settings::delete_caldav_account(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Discover VTODO-capable collections for the stored account (a network probe).
+#[tauri::command(rename_all = "snake_case")]
+async fn list_caldav_collections(
+    state: State<'_, AppState>,
+) -> Result<Vec<CaldavCollectionDto>, String> {
+    let account = settings::load_caldav_account(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| "No CalDAV account configured.".to_string())?;
+    let password = mnemis_engine::secrets::fetch(&account.keychain_ref)
+        .await
+        .map_err(|e| format!("fetching CalDAV password: {e:#}"))?;
+    let found = mnemis_engine::sync::caldav::discover_task_collections(
+        &account.base_url,
+        &account.username,
+        &password,
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(found
+        .into_iter()
+        .map(|c| CaldavCollectionDto {
+            url: c.url,
+            display_name: c.display_name,
+        })
+        .collect())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_caldav_collection(
+    state: State<'_, AppState>,
+    url: String,
+    display_name: Option<String>,
+) -> Result<(), String> {
+    settings::set_caldav_collection(&state.pool, &url, display_name.as_deref())
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Manually run a CalDAV reminder sync now.
+#[tauri::command(rename_all = "snake_case")]
+async fn sync_caldav(state: State<'_, AppState>) -> Result<CaldavSyncDto, String> {
+    match orchestrator::sync_calendar_if_configured(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))?
+    {
+        Some(s) => Ok(CaldavSyncDto {
+            created: s.created,
+            pushed: s.pushed,
+            pulled: s.pulled,
+            removed: s.removed,
+            conflicts: s.conflicts,
+            errors: s.errors,
+        }),
+        None => Err("CalDAV isn't fully configured (add an account and pick a list).".to_string()),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn promote_to_reminder(
+    state: State<'_, AppState>,
+    action_id: i64,
+    due_at: i64,
+) -> Result<(), String> {
+    mutations::promote_to_reminder(&state.pool, action_id, due_at)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -515,6 +610,13 @@ fn main() {
             set_source_muted,
             delete_source,
             add_imap_source,
+            get_caldav_account,
+            add_caldav_account,
+            delete_caldav_account,
+            list_caldav_collections,
+            set_caldav_collection,
+            sync_caldav,
+            promote_to_reminder,
             list_source_channels,
             set_channel_muted,
             set_channels_muted_bulk,

@@ -691,3 +691,68 @@ h1 {
   justify-content: space-between;
   gap: 0.5rem;
 }
+
+/* ---- CalDAV reminders ---- */
+
+.reminder-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.reminder-warn {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.reminder-set {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.reminder-date {
+  font: inherit;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.settings-toast {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--fg);
+}
+
+.caldav-form,
+.caldav-connected {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-width: 32rem;
+}
+
+.caldav-row {
+  color: var(--fg);
+}
+
+.caldav-collections {
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+.caldav-collection-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.3rem 0;
+}

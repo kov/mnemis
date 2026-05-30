@@ -8,21 +8,24 @@ use leptos::web_sys::{
 use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
-    FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, ProfileIdentifier, SourceHealth,
-    SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto, summarize_sync_error,
+    ActionDto, ActionStatus, CaldavCollectionDto, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto,
+    Confidence, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, ProfileIdentifier,
+    SourceHealth, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto, summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
 use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
-    ChatStream, ChatUiState, FirstRunTick, SyncTick, add_imap_source, confidence_class,
-    confirm_resolution, create_chat, delete_chat, delete_source, fetch_actions, fetch_chat_seed,
-    fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
-    fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile, open_external,
-    reject_resolution, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
-    set_channel_muted, set_channels_muted_bulk, set_chat_archived, set_chat_show_reasoning,
-    set_source_muted, status_label, submit_dismissal_feedback, update_action,
+    ChatStream, ChatUiState, FirstRunTick, SyncTick, add_caldav_account, add_imap_source,
+    confidence_class, confirm_resolution, create_chat, delete_caldav_account, delete_chat,
+    delete_source, fetch_actions, fetch_caldav_account, fetch_chat_seed, fetch_chat_turns,
+    fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
+    fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
+    list_caldav_collections, open_external, promote_to_reminder, reject_resolution,
+    run_sync_caldav, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
+    set_caldav_collection, set_channel_muted, set_channels_muted_bulk, set_chat_archived,
+    set_chat_show_reasoning, set_source_muted, status_label, submit_dismissal_feedback,
+    update_action,
 };
 
 #[component]
@@ -264,12 +267,59 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
     let trigger_unclaim = trigger_status.clone();
     let trigger_reopen = trigger_status.clone();
 
+    // Reminder state: a synced/dirty/needs_review badge (or "pending" when a
+    // due date is set but not yet synced), plus a date control to (re)promote.
+    let due_at = action.due_at;
+    let badge: Option<(&'static str, bool)> = action
+        .sync_status
+        .as_deref()
+        .map(|s| match s {
+            "needs_review" => ("⏰ needs review", true),
+            "dirty" => ("⏰ reminder ⟳", false),
+            _ => ("⏰ reminder", false),
+        })
+        .or_else(|| due_at.map(|_| ("⏰ reminder (pending)", false)));
+    let can_remind = !matches!(
+        current_status,
+        ActionStatus::Done | ActionStatus::Cancelled | ActionStatus::Dismissed
+    );
+    let remind_label = if due_at.is_some() {
+        "Change date"
+    } else {
+        "Remind"
+    };
+    let date_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let refetch_for_remind = refetch.clone();
+    let on_remind = move |_| {
+        let val = date_ref
+            .get()
+            .map(|el| el.unchecked_ref::<HtmlInputElement>().value())
+            .unwrap_or_default();
+        if val.is_empty() {
+            return;
+        }
+        // Parse the YYYY-MM-DD picker value as UTC midnight via JS Date.
+        let ms = js_sys::Date::parse(&format!("{val}T00:00:00Z"));
+        if ms.is_nan() {
+            return;
+        }
+        let due = (ms / 1000.0) as i64;
+        let refetch = refetch_for_remind.clone();
+        spawn_local(async move {
+            let _ = promote_to_reminder(id, due).await;
+            refetch();
+        });
+    };
+
     view! {
         <div class="action">
             <div class="action-head">
                 <span class="action-title">{action.title.clone()}</span>
                 <span class=conf_class>{conf_label}</span>
                 <span class="badge">{status}</span>
+                {badge.map(|(label, warn)| view! {
+                    <span class="reminder-badge" class:reminder-warn=warn>{label}</span>
+                })}
             </div>
             {action.details.clone().map(|d| view! {
                 <div class="action-details">{d}</div>
@@ -296,6 +346,12 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                 })}
                 {show_button(current_status, ActionStatus::Pending).then(|| view! {
                     <button class="btn btn-ghost" on:click=move |_| trigger_reopen(ActionStatus::Pending, None)>"Reopen"</button>
+                })}
+                {can_remind.then(|| view! {
+                    <span class="reminder-set">
+                        <input class="reminder-date" node_ref=date_ref type="date" />
+                        <button class="btn btn-sm btn-ghost" on:click=on_remind>{remind_label}</button>
+                    </span>
                 })}
                 <TalkAboutButton kind="action" id=id />
             </div>
@@ -650,6 +706,8 @@ pub fn SettingsHome() -> impl IntoView {
                 <span class="settings-desc">" — omlx endpoint + models"</span></li>
             <li><A href="/settings/sources">"Sources"</A>
                 <span class="settings-desc">" — IMAP + chat connectors"</span></li>
+            <li><A href="/settings/reminders">"Reminders"</A>
+                <span class="settings-desc">" — CalDAV sync to Apple Reminders / Nextcloud"</span></li>
         </ul>
     }
 }
@@ -1334,6 +1392,211 @@ fn TalkAboutButton(kind: &'static str, id: i64) -> impl IntoView {
         });
     };
     view! { <button class="btn btn-ghost" on:click=on_click>"Talk about this"</button> }
+}
+
+/// CalDAV reminders settings: connect an account, discover + pick a VTODO task
+/// list, then sync. The app-specific password goes straight to the keychain via
+/// the command — this component never retains it after submit.
+#[component]
+pub fn SettingsReminders() -> impl IntoView {
+    let account = LocalResource::new(|| async move { fetch_caldav_account().await });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || account.refetch());
+    let toast: RwSignal<Option<String>> = RwSignal::new(None);
+    let collections: RwSignal<Option<Vec<CaldavCollectionDto>>> = RwSignal::new(None);
+
+    let url_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let user_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let pass_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+
+    view! {
+        <h1>"Reminders"</h1>
+        <p class="settings-desc">
+            "Sync action items that have a due date to a CalDAV task list \
+             (Apple Reminders, Nextcloud Tasks). Give an action a due date to make it a reminder."
+        </p>
+        {move || toast.get().map(|m| view! { <div class="settings-toast">{m}</div> })}
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || {
+                let refetch = refetch.clone();
+                account.get().map(move |res| match res {
+                    Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                    Ok(acc) if !acc.configured => {
+                        let refetch = refetch.clone();
+                        let on_connect = move |_| {
+                            let pull = |r: NodeRef<leptos::html::Input>| -> String {
+                                r.get()
+                                    .map(|el| {
+                                        el.unchecked_ref::<HtmlInputElement>()
+                                            .value()
+                                            .trim()
+                                            .to_string()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let base_url = pull(url_ref);
+                            let username = pull(user_ref);
+                            let password = pass_ref
+                                .get()
+                                .map(|el| el.unchecked_ref::<HtmlInputElement>().value())
+                                .unwrap_or_default();
+                            if base_url.is_empty() || username.is_empty() || password.is_empty() {
+                                toast.set(Some(
+                                    "Server URL, username, and app-specific password are required."
+                                        .to_string(),
+                                ));
+                                return;
+                            }
+                            let refetch = refetch.clone();
+                            spawn_local(async move {
+                                match add_caldav_account(base_url, username, password).await {
+                                    Ok(()) => {
+                                        toast.set(Some(
+                                            "Connected. Now discover and pick a task list."
+                                                .to_string(),
+                                        ));
+                                        refetch();
+                                    }
+                                    Err(e) => toast.set(Some(format!("Connect failed: {e}"))),
+                                }
+                            });
+                        };
+                        view! {
+                            <div class="caldav-form" data-caldav="connect">
+                                <label>"CalDAV server URL"</label>
+                                <input class="settings-input" node_ref=url_ref
+                                    placeholder="https://caldav.icloud.com" />
+                                <label>"Username (Apple ID / account email)"</label>
+                                <input class="settings-input" node_ref=user_ref
+                                    placeholder="you@icloud.com" />
+                                <label>"App-specific password"</label>
+                                <input class="settings-input" node_ref=pass_ref type="password"
+                                    placeholder="xxxx-xxxx-xxxx-xxxx" />
+                                <div class="settings-actions">
+                                    <button class="btn btn-primary" on:click=on_connect>"Connect"</button>
+                                </div>
+                                <p class="settings-desc">
+                                    "iCloud needs an app-specific password \
+                                     (appleid.apple.com → Sign-In and Security → App-Specific Passwords)."
+                                </p>
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    Ok(acc) => {
+                        let refetch = refetch.clone();
+                        let collection_label = acc
+                            .collection_name
+                            .clone()
+                            .or_else(|| acc.collection_url.clone())
+                            .unwrap_or_else(|| "— none selected —".to_string());
+                        let has_collection = acc.collection_url.is_some();
+
+                        let on_discover = move |_| {
+                            spawn_local(async move {
+                                match list_caldav_collections().await {
+                                    Ok(found) if found.is_empty() => toast.set(Some(
+                                        "No VTODO-capable task lists found on this server."
+                                            .to_string(),
+                                    )),
+                                    Ok(found) => collections.set(Some(found)),
+                                    Err(e) => toast.set(Some(format!("Discovery failed: {e}"))),
+                                }
+                            });
+                        };
+                        let on_sync = move |_| {
+                            spawn_local(async move {
+                                match run_sync_caldav().await {
+                                    Ok(s) => toast.set(Some(format!(
+                                        "Synced — {} created, {} pushed, {} pulled, {} removed, \
+                                         {} need review.",
+                                        s.created, s.pushed, s.pulled, s.removed, s.conflicts
+                                    ))),
+                                    Err(e) => toast.set(Some(format!("Sync failed: {e}"))),
+                                }
+                            });
+                        };
+                        let refetch_disc = refetch.clone();
+                        let on_disconnect = move |_| {
+                            let refetch = refetch_disc.clone();
+                            spawn_local(async move {
+                                match delete_caldav_account().await {
+                                    Ok(()) => {
+                                        collections.set(None);
+                                        toast.set(Some("Disconnected.".to_string()));
+                                        refetch();
+                                    }
+                                    Err(e) => toast.set(Some(format!("Disconnect failed: {e}"))),
+                                }
+                            });
+                        };
+                        let refetch_pick = refetch.clone();
+                        view! {
+                            <div class="caldav-connected" data-caldav="connected">
+                                <div class="caldav-row"><strong>"Server: "</strong>{acc.base_url.clone()}</div>
+                                <div class="caldav-row"><strong>"Account: "</strong>{acc.username.clone()}</div>
+                                <div class="caldav-row"><strong>"Task list: "</strong>{collection_label}</div>
+                                <div class="settings-actions">
+                                    <button class="btn btn-secondary" on:click=on_discover>"Discover lists"</button>
+                                    {has_collection.then(|| view! {
+                                        <button class="btn btn-primary" on:click=on_sync>"Sync now"</button>
+                                    })}
+                                    <button class="btn btn-ghost btn-danger" on:click=on_disconnect>"Disconnect"</button>
+                                </div>
+                                {move || collections.get().map(|cols| {
+                                    let refetch = refetch_pick.clone();
+                                    view! {
+                                        <div class="caldav-collections">
+                                            <div class="settings-desc">"Choose the task list to sync into:"</div>
+                                            <For
+                                                each=move || cols.clone()
+                                                key=|c| c.url.clone()
+                                                children=move |c: CaldavCollectionDto| {
+                                                    let name = c
+                                                        .display_name
+                                                        .clone()
+                                                        .unwrap_or_else(|| c.url.clone());
+                                                    let url = c.url.clone();
+                                                    let dn = c.display_name.clone();
+                                                    let refetch = refetch.clone();
+                                                    let on_pick = move |_| {
+                                                        let url = url.clone();
+                                                        let dn = dn.clone();
+                                                        let refetch = refetch.clone();
+                                                        spawn_local(async move {
+                                                            match set_caldav_collection(url, dn).await {
+                                                                Ok(()) => {
+                                                                    toast.set(Some(
+                                                                        "Task list selected.".to_string(),
+                                                                    ));
+                                                                    collections.set(None);
+                                                                    refetch();
+                                                                }
+                                                                Err(e) => toast.set(Some(format!(
+                                                                    "Select failed: {e}"
+                                                                ))),
+                                                            }
+                                                        });
+                                                    };
+                                                    view! {
+                                                        <div class="caldav-collection-row">
+                                                            <span>{name}</span>
+                                                            <button class="btn btn-sm btn-secondary"
+                                                                on:click=on_pick>"Use this list"</button>
+                                                        </div>
+                                                    }
+                                                }
+                                            />
+                                        </div>
+                                    }
+                                })}
+                            </div>
+                        }
+                        .into_any()
+                    }
+                })
+            }}
+        </Suspense>
+    }
 }
 
 /// Chats list + "New chat".

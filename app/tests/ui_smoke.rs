@@ -2327,3 +2327,75 @@ async fn toast_classifies_per_source_error() -> Result<()> {
     client.close().await.ok();
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn settings_reminders_shows_connect_form_when_unconfigured() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-reminders.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(Utc::now().timestamp())
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    // Actions → Settings → Reminders.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/settings"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(
+            "ul.settings-home a[href=\"/settings/reminders\"]",
+        ))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('ul.settings-home a[href="/settings/reminders"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+
+    // A fresh DB has no CalDAV account → the connect form must render.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.caldav-form[data-caldav=\"connect\"]"))
+        .await?;
+
+    let body_text = client.find(Locator::Css("body")).await?.text().await?;
+    assert!(
+        body_text.contains("CalDAV server URL"),
+        "expected the CalDAV connect form, got text: {body_text}"
+    );
+    assert!(
+        body_text.contains("app-specific password") || body_text.contains("App-specific password"),
+        "expected the app-specific-password guidance, got text: {body_text}"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}

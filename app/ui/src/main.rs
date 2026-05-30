@@ -3,9 +3,9 @@ use leptos::task::spawn_local;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
-    FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot,
-    SyncOutcome, UserProfileDto,
+    ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
+    ChatDto, ChatEvent, ChatTurnDto, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
+    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -233,6 +233,93 @@ pub async fn fetch_llm_config() -> Result<LlmConfigDto, String> {
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     serde_wasm_bindgen::from_value::<LlmConfigDto>(raw).map_err(|e| e.to_string())
+}
+
+// ---- CalDAV reminders ----------------------------------------------------
+
+pub async fn fetch_caldav_account() -> Result<CaldavAccountDto, String> {
+    let raw = invoke("get_caldav_account", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<CaldavAccountDto>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct AddCaldavArgs {
+    base_url: String,
+    username: String,
+    password: String,
+}
+
+pub async fn add_caldav_account(
+    base_url: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&AddCaldavArgs {
+        base_url,
+        username,
+        password,
+    })
+    .map_err(|e| e.to_string())?;
+    invoke("add_caldav_account", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn delete_caldav_account() -> Result<(), String> {
+    invoke("delete_caldav_account", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn list_caldav_collections() -> Result<Vec<CaldavCollectionDto>, String> {
+    let raw = invoke("list_caldav_collections", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<CaldavCollectionDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SetCollectionArgs {
+    url: String,
+    display_name: Option<String>,
+}
+
+pub async fn set_caldav_collection(
+    url: String,
+    display_name: Option<String>,
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetCollectionArgs { url, display_name })
+        .map_err(|e| e.to_string())?;
+    invoke("set_caldav_collection", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn run_sync_caldav() -> Result<CaldavSyncDto, String> {
+    let raw = invoke("sync_caldav", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<CaldavSyncDto>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct PromoteReminderArgs {
+    action_id: i64,
+    due_at: i64,
+}
+
+pub async fn promote_to_reminder(action_id: i64, due_at: i64) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&PromoteReminderArgs { action_id, due_at })
+        .map_err(|e| e.to_string())?;
+    invoke("promote_to_reminder", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -589,6 +676,7 @@ fn App() -> impl IntoView {
                     <Route path=path!("/settings/profile") view=SettingsProfilePage />
                     <Route path=path!("/settings/llm") view=SettingsLlmPage />
                     <Route path=path!("/settings/sources") view=SettingsSourcesPage />
+                    <Route path=path!("/settings/reminders") view=SettingsRemindersPage />
                 </Routes>
             </div>
         </Router>
@@ -613,6 +701,11 @@ fn SettingsLlmPage() -> impl IntoView {
 #[component]
 fn SettingsSourcesPage() -> impl IntoView {
     view! { <components::SettingsSources /> }
+}
+
+#[component]
+fn SettingsRemindersPage() -> impl IntoView {
+    view! { <components::SettingsReminders /> }
 }
 
 #[component]
