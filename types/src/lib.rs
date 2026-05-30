@@ -319,6 +319,10 @@ pub fn summarize_sync_error(raw: &str) -> String {
     if let Some(s) = parse_context_window(raw) {
         return s;
     }
+    // A configured model that doesn't exist on the server (typo / rollout).
+    if let Some(s) = parse_model_not_found(raw) {
+        return s;
+    }
     // IMAP source had no credentials wired up.
     if raw.contains("missing IMAP connection settings") {
         return "Missing IMAP connection settings — check this source's config.".to_string();
@@ -376,6 +380,52 @@ fn parse_context_window(raw: &str) -> Option<String> {
     Some(format!(
         "Window too large ({used} > {max} tokens) — message body or backlog too big."
     ))
+}
+
+/// True when an error chain is the omlx "configured model doesn't exist"
+/// failure: an HTTP 404 whose body carries `not_found_error` and a message like
+/// `Model 'X' not found. Available models: …`. A missing model fails every
+/// channel of a source identically, so the orchestrator uses this to report it
+/// once at the source level instead of once per channel.
+pub fn is_model_not_found(raw: &str) -> bool {
+    raw.contains("not_found_error") || raw.contains("not found. Available models")
+}
+
+/// Turn an omlx model-not-found 404 into an actionable line naming the missing
+/// model and (when the server listed them) the models that *are* available.
+fn parse_model_not_found(raw: &str) -> Option<String> {
+    if !is_model_not_found(raw) {
+        return None;
+    }
+    let model = slice_between(raw, "Model '", "'");
+    let available = raw.find("Available models: ").map(|i| {
+        let rest = &raw[i + "Available models: ".len()..];
+        // The list runs to the end of the JSON string ("/}) — stop there.
+        let end = rest.find(['"', '}']).unwrap_or(rest.len());
+        rest[..end].trim().trim_end_matches(['.', ' ']).to_string()
+    });
+    let available = available.filter(|s| !s.is_empty());
+    Some(match (model, available) {
+        (Some(m), Some(a)) => format!(
+            "Model \"{m}\" isn't on the LLM server. Available: {a}. \
+             Fix chat_model / embedding_model in config."
+        ),
+        (Some(m), None) => format!(
+            "Model \"{m}\" isn't on the LLM server — fix chat_model / embedding_model in config."
+        ),
+        _ => "The configured model isn't on the LLM server — fix chat_model / embedding_model \
+              in config."
+            .to_string(),
+    })
+}
+
+/// The text between the first `start` and the next `end` after it, if both
+/// are present.
+fn slice_between(s: &str, start: &str, end: &str) -> Option<String> {
+    let i = s.find(start)? + start.len();
+    let rest = &s[i..];
+    let j = rest.find(end)?;
+    Some(rest[..j].to_string())
 }
 
 #[cfg(test)]
@@ -448,5 +498,32 @@ mod summarize_tests {
     fn passes_short_unknown_errors_through_unchanged() {
         let raw = "boom";
         assert_eq!(summarize_sync_error(raw), "boom");
+    }
+
+    #[test]
+    fn classifies_model_not_found_and_names_available_models() {
+        let raw = "source 'alface' channel 'INBOX': extract failed: channel 6: \
+            LLM API error (HTTP 404 Not Found): \
+            {\"error\":{\"type\":\"not_found_error\",\"message\":\"Model 'qwen3.5-typo' not found. \
+            Available models: qwen3.5-35b-a3b-4bit, nomic-embed-text\"}}";
+        let s = summarize_sync_error(raw);
+        assert!(s.contains("qwen3.5-typo"), "names the missing model: {s}");
+        assert!(
+            s.contains("qwen3.5-35b-a3b-4bit"),
+            "lists what's available: {s}"
+        );
+        assert!(s.to_lowercase().contains("config"), "points at config: {s}");
+    }
+
+    #[test]
+    fn is_model_not_found_is_specific() {
+        assert!(is_model_not_found(
+            "...{\"type\":\"not_found_error\",\"message\":\"...\"}"
+        ));
+        assert!(is_model_not_found(
+            "Model 'x' not found. Available models: y"
+        ));
+        assert!(!is_model_not_found("connection refused"));
+        assert!(!is_model_not_found("Prompt too long: 9 exceeds"));
     }
 }

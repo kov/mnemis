@@ -301,15 +301,26 @@ async fn sync_one_source_with(
                 );
             }
             Err(e) => {
+                let chain = format!("{e:#}");
+                // A missing/misconfigured chat model 404s identically on every
+                // channel. Report it once at the source level and stop hammering
+                // the rest — there's nothing per-channel to retry.
+                if mnemis_types::is_model_not_found(&chain) {
+                    warn!(source = %source_name, error = %chain, "source: configured model not found; skipping remaining channels");
+                    counts
+                        .errors
+                        .push(format!("source '{source_name}': {chain}"));
+                    break;
+                }
                 warn!(
-                    error = format!("{e:#}"),
+                    error = %chain,
                     channel_id,
                     channel = %external_id,
                     secs = ex_started.elapsed().as_secs(),
                     "channel: extract failed"
                 );
                 counts.errors.push(format!(
-                    "source '{source_name}' channel '{external_id}': extract failed: {e:#}"
+                    "source '{source_name}' channel '{external_id}': extract failed: {chain}"
                 ));
             }
         }
@@ -488,6 +499,27 @@ mod tests {
         }
     }
 
+    /// Always 404s with the omlx "model not found" body, like a typo'd
+    /// chat_model would on every channel.
+    struct ModelNotFoundLlm;
+
+    #[async_trait]
+    impl LlmTransport for ModelNotFoundLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            _input: Vec<InputItem>,
+            _tools: &[ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<ResponsesResponse> {
+            bail!(
+                "LLM API error (HTTP 404 Not Found): \
+                 {{\"error\":{{\"type\":\"not_found_error\",\"message\":\"Model 'test-model' not \
+                 found. Available models: real-a, real-b\"}}}}"
+            )
+        }
+    }
+
     /// End-to-end: a per-channel extract failure must land in the
     /// SourceCounts.errors so sync_now relays it into SyncOutcome.errors →
     /// toast. Previously the failure was swallowed inside
@@ -553,6 +585,69 @@ mod tests {
         assert!(
             err.contains("context window"),
             "error should preserve the transport message for the classifier: {err}"
+        );
+        Ok(())
+    }
+
+    /// A missing model 404s on every channel; the orchestrator must collapse
+    /// that to a single source-level error rather than one per channel.
+    #[tokio::test]
+    async fn model_not_found_is_reported_once_per_source() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+
+        let (source_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'fastmail', 'fake/ref', ?) RETURNING id",
+        )
+        .bind(Utc::now().timestamp())
+        .fetch_one(&pool)
+        .await?;
+        // Two channels: without the collapse this would log two identical errors.
+        for ch in ["INBOX", "INBOX/Lembrar"] {
+            sqlx::query(
+                "INSERT INTO channels (source_id, external_id, name, kind) \
+                 VALUES (?, ?, ?, 'mailbox')",
+            )
+            .bind(source_id)
+            .bind(ch)
+            .bind(ch)
+            .execute(&pool)
+            .await?;
+        }
+
+        let source = OneMessageSource(SourceId(source_id));
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::embed::OmlxEmbedder::new(
+            "http://0.0.0.0".to_string(),
+            "noop".to_string(),
+        ));
+
+        let counts = sync_one_source_with(
+            &pool,
+            source_id,
+            "fastmail",
+            &source,
+            &ModelNotFoundLlm,
+            &embedder,
+            "test-model",
+            crate::extract::DEFAULT_WINDOW_CHAR_BUDGET,
+            None,
+        )
+        .await?;
+
+        assert_eq!(counts.channels_polled, 2);
+        assert_eq!(
+            counts.errors.len(),
+            1,
+            "a missing model should collapse to one source-level error: {:?}",
+            counts.errors
+        );
+        let err = &counts.errors[0];
+        assert!(err.contains("fastmail"), "names the source: {err}");
+        assert!(
+            mnemis_types::is_model_not_found(err),
+            "preserves the body so the toast classifier names the model: {err}"
         );
         Ok(())
     }
