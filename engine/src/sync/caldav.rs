@@ -274,7 +274,7 @@ pub async fn discover_task_collections(
 
     let mut out = Vec::new();
     for raw in parse_collections(&collections_body) {
-        if raw.components.iter().any(|c| c == "VTODO") {
+        if is_task_list(&raw) {
             let url = after_collections.join(&raw.href)?.to_string();
             out.push(DiscoveredCollection {
                 url,
@@ -404,10 +404,22 @@ struct RawCollection {
     href: String,
     display_name: Option<String>,
     components: Vec<String>,
+    /// Whether `resourcetype` contains a `<C:calendar/>` element. Real calendar
+    /// / reminders collections do; the scheduling inbox/outbox (which can still
+    /// advertise a `VTODO` component-set) do not — so this is what keeps the
+    /// `…/outbox/` collection out of the task-list picker.
+    is_calendar: bool,
+}
+
+/// A genuine task list: a calendar collection that advertises `VTODO`. The
+/// `is_calendar` half excludes iCloud's scheduling inbox/outbox, which would
+/// otherwise slip through on the component-set alone.
+fn is_task_list(raw: &RawCollection) -> bool {
+    raw.is_calendar && raw.components.iter().any(|c| c == "VTODO")
 }
 
 /// Parse a Depth:1 PROPFIND multistatus into the child collections, reading
-/// each one's displayname and advertised calendar components.
+/// each one's displayname, resourcetype, and advertised calendar components.
 fn parse_collections(xml: &str) -> Vec<RawCollection> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return Vec::new();
@@ -432,10 +444,16 @@ fn parse_collections(xml: &str) -> Vec<RawCollection> {
                 .filter(|n| n.tag_name().name() == "comp")
                 .filter_map(|n| n.attribute("name").map(str::to_owned))
                 .collect();
+            let is_calendar = resp
+                .descendants()
+                .find(|n| n.tag_name().name() == "resourcetype")
+                .map(|rt| rt.descendants().any(|n| n.tag_name().name() == "calendar"))
+                .unwrap_or(false);
             Some(RawCollection {
                 href,
                 display_name,
                 components,
+                is_calendar,
             })
         })
         .collect()
@@ -494,14 +512,17 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_vtodo_collections_with_names() {
-        // iCloud-shaped Depth:1 home listing: a VEVENT calendar and a VTODO list.
+    fn keeps_only_vtodo_calendars_and_excludes_the_scheduling_outbox() {
+        // iCloud-shaped Depth:1 home listing: a VEVENT calendar, a VTODO
+        // reminders list, and the scheduling outbox — which advertises a VTODO
+        // component-set but is NOT a calendar, so it must be filtered out.
         let xml = r#"<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
   <d:response>
     <d:href>/123/calendars/work/</d:href>
     <d:propstat><d:prop>
       <d:displayname>Work</d:displayname>
+      <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
       <cal:supported-calendar-component-set><cal:comp name="VEVENT"/></cal:supported-calendar-component-set>
     </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
@@ -509,19 +530,38 @@ mod tests {
     <d:href>/123/calendars/reminders/</d:href>
     <d:propstat><d:prop>
       <d:displayname>Reminders</d:displayname>
+      <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
       <cal:supported-calendar-component-set><cal:comp name="VTODO"/></cal:supported-calendar-component-set>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/123/calendar/outbox/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/><cal:schedule-outbox/></d:resourcetype>
+      <cal:supported-calendar-component-set><cal:comp name="VEVENT"/><cal:comp name="VTODO"/></cal:supported-calendar-component-set>
     </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
 </d:multistatus>"#;
 
         let cols = parse_collections(xml);
-        let todo: Vec<_> = cols
+        let task_lists: Vec<_> = cols.iter().filter(|c| is_task_list(c)).collect();
+        assert_eq!(
+            task_lists.len(),
+            1,
+            "only the reminders list is a task list"
+        );
+        assert_eq!(task_lists[0].href, "/123/calendars/reminders/");
+        assert_eq!(task_lists[0].display_name.as_deref(), Some("Reminders"));
+
+        // The outbox parsed (it has a VTODO comp) but is rejected for not being
+        // a calendar — the precise reason it used to leak into the picker.
+        let outbox = cols
             .iter()
-            .filter(|c| c.components.iter().any(|x| x == "VTODO"))
-            .collect();
-        assert_eq!(todo.len(), 1);
-        assert_eq!(todo[0].href, "/123/calendars/reminders/");
-        assert_eq!(todo[0].display_name.as_deref(), Some("Reminders"));
+            .find(|c| c.href == "/123/calendar/outbox/")
+            .expect("outbox response should still parse");
+        assert!(outbox.components.iter().any(|c| c == "VTODO"));
+        assert!(!outbox.is_calendar);
+        assert!(!is_task_list(outbox));
     }
 
     #[test]
