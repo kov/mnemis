@@ -51,6 +51,22 @@ enum Command {
         /// Channel id.
         channel_id: i64,
     },
+    /// Send one message to the chat agent against the configured LLM, printing
+    /// streamed events. For exercising the chat loop end-to-end. With no
+    /// --chat-id, starts a new chat (optionally seeded from an action/message).
+    Chat {
+        /// The message to send.
+        text: String,
+        /// Continue an existing chat instead of starting a new one.
+        #[arg(long)]
+        chat_id: Option<i64>,
+        /// Seed a NEW chat from an action (A-N or bare N).
+        #[arg(long)]
+        seed_action: Option<String>,
+        /// Seed a NEW chat from an internal message id.
+        #[arg(long)]
+        seed_message: Option<i64>,
+    },
     /// Drain the embed queue once against the configured embedding model. For debugging.
     EmbedOnce,
     /// Zero out user data (messages, actions, embeddings, etc.) while keeping
@@ -107,6 +123,12 @@ async fn main() -> Result<()> {
         }
         Command::DumpPrompt { channel_id } => commands::dump_prompt(&cfg, channel_id).await,
         Command::Extract { channel_id } => commands::extract(&cfg, channel_id).await,
+        Command::Chat {
+            text,
+            chat_id,
+            seed_action,
+            seed_message,
+        } => commands::chat(&cfg, &text, chat_id, seed_action.as_deref(), seed_message).await,
         Command::EmbedOnce => commands::embed_once(&cfg).await,
         Command::ResetData { yes } => commands::reset_data(&cfg, yes).await,
     }

@@ -315,6 +315,12 @@ h1 {
   filter: brightness(1.05);
 }
 
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: none;
+}
+
 .action-details {
   font-size: 13px;
   color: var(--fg);
@@ -375,3 +381,166 @@ h1 {
 .channels-tree .channel-kind { color: var(--muted); font-size: 12px; }
 .channels-tree .channel-count { color: var(--muted); font-size: 12px; }
 .channels-tree .channel-folder { color: var(--muted); font-style: italic; }
+
+/* ===================== Chat view (Phase 4) ===================== */
+
+.hidden { display: none; }
+
+.chats-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.chat-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--fg);
+}
+.chat-list-item:hover { border-color: var(--accent); }
+.chat-list-title { font-weight: 500; }
+
+/* Detail: a natural-height column. The transcript (not the page) scrolls, so
+   the view never grows past the viewport — the height is bounded by the
+   transcript's max-height below, leaving room for the chrome + composer. */
+.chat-detail {
+  display: flex;
+  flex-direction: column;
+}
+.chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+.chat-reasoning-toggle {
+  font-size: 0.85rem;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.chat-transcript {
+  /* Bounded to the viewport minus the chrome (banner/status/nav) and the
+     composer + margins, so the page itself never scrolls; the transcript
+     scrolls internally instead. min-height keeps it usable on short windows. */
+  max-height: calc(100vh - 22rem);
+  min-height: 8rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+/* "Talk about this" context banner — shows what a seeded chat is grounded in. */
+.chat-seed-banner {
+  font-size: 0.85rem;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.025);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.5rem;
+}
+.chat-seed-banner b { color: var(--fg); font-weight: 600; }
+
+.chat-msg {
+  max-width: 80%;
+  padding: 0.55rem 0.8rem;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  line-height: 1.4;
+}
+.chat-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+}
+.chat-assistant {
+  align-self: flex-start;
+  background: var(--border);
+  color: var(--fg);
+}
+
+.chat-reasoning {
+  align-self: flex-start;
+  max-width: 80%;
+  font-size: 0.82rem;
+  color: var(--muted);
+  border-left: 2px solid var(--medium);
+  padding-left: 0.6rem;
+}
+.chat-reasoning pre {
+  white-space: pre-wrap;
+  margin: 0;
+  font-family: inherit;
+}
+
+.chat-tool {
+  align-self: flex-start;
+  max-width: 80%;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.chat-tool summary {
+  cursor: pointer;
+  font-family: ui-monospace, monospace;
+}
+.chat-tool-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  margin: 0.3rem 0 0 0;
+  max-height: 16rem;
+  overflow: auto;
+}
+
+.chat-thinking { color: var(--muted); align-self: flex-start; }
+
+.chat-error { align-self: flex-start; margin-top: 0.25rem; }
+
+.chat-input {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+.chat-input textarea {
+  flex: 1;
+  resize: vertical;
+  min-height: 2.6rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}

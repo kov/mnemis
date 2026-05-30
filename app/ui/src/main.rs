@@ -1,11 +1,13 @@
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
-    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
+    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
+    FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot,
+    SyncOutcome, UserProfileDto,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 mod components;
@@ -17,6 +19,13 @@ extern "C" {
     // enabled in `tauri.conf.json` — we don't bother with that flag.
     #[wasm_bindgen(js_namespace = ["window", "__TAURI_INTERNALS__"], catch)]
     async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+
+    // Registers a JS callback and returns its numeric id. The Tauri `Channel`
+    // wire protocol: pass `"__CHANNEL__:<id>"` as a command arg, and each
+    // `channel.send(x)` (and an `{end:true}` on drop) is delivered to this
+    // callback. Lets us stream without pulling in `@tauri-apps/api`.
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI_INTERNALS__"])]
+    fn transformCallback(callback: &Closure<dyn FnMut(JsValue)>, once: bool) -> f64;
 }
 
 #[derive(Serialize)]
@@ -304,6 +313,145 @@ pub async fn submit_dismissal_feedback(
     Ok(())
 }
 
+pub async fn fetch_chats() -> Result<Vec<ChatDto>, String> {
+    let raw = invoke("list_chats", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<ChatDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct CreateChatArgs {
+    seeded_from_kind: Option<String>,
+    seeded_from_id: Option<i64>,
+}
+
+pub async fn create_chat(
+    seeded_from_kind: Option<String>,
+    seeded_from_id: Option<i64>,
+) -> Result<i64, String> {
+    let args = serde_wasm_bindgen::to_value(&CreateChatArgs {
+        seeded_from_kind,
+        seeded_from_id,
+    })
+    .map_err(|e| e.to_string())?;
+    let raw = invoke("create_chat", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<i64>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct ChatIdArgs {
+    chat_id: i64,
+}
+
+pub async fn fetch_chat_turns(chat_id: i64) -> Result<Vec<ChatTurnDto>, String> {
+    let args = serde_wasm_bindgen::to_value(&ChatIdArgs { chat_id }).map_err(|e| e.to_string())?;
+    let raw = invoke("get_chat_turns", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<ChatTurnDto>>(raw).map_err(|e| e.to_string())
+}
+
+pub async fn fetch_chat_seed(chat_id: i64) -> Result<Option<String>, String> {
+    let args = serde_wasm_bindgen::to_value(&ChatIdArgs { chat_id }).map_err(|e| e.to_string())?;
+    let raw = invoke("get_chat_seed", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Option<String>>(raw).map_err(|e| e.to_string())
+}
+
+pub async fn fetch_chat_show_reasoning() -> Result<bool, String> {
+    let raw = invoke("get_chat_show_reasoning", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<bool>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SetShowReasoningArgs {
+    value: bool,
+}
+
+pub async fn set_chat_show_reasoning(value: bool) -> Result<(), String> {
+    let args =
+        serde_wasm_bindgen::to_value(&SetShowReasoningArgs { value }).map_err(|e| e.to_string())?;
+    invoke("set_chat_show_reasoning", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+/// One delivery from a streamed chat turn: an engine event, or the channel
+/// closing (after the command returns and the Tauri `Channel` is dropped).
+pub enum ChatStream {
+    Event(ChatEvent),
+    End,
+}
+
+/// The envelope the Tauri `Channel` callback receives: either `{message, index}`
+/// for a sent value or `{end: true, index}` when the channel drops.
+#[derive(Deserialize)]
+struct ChannelEnvelope {
+    #[serde(default)]
+    end: bool,
+    message: Option<ChatEvent>,
+}
+
+#[derive(Serialize)]
+struct SendChatArgs {
+    chat_id: i64,
+    text: String,
+    on_event: String,
+}
+
+/// Start a chat turn, delivering each streamed `ChatEvent` (then `End`) to
+/// `on_msg`. We register a JS callback via `transformCallback` and hand its id
+/// to the `send_chat_message` command as `"__CHANNEL__:<id>"`; the engine
+/// persists every turn before emitting, so the `End` handler can safely refetch
+/// the authoritative transcript. Payloads are parsed with `serde_json` (robust
+/// for internally-tagged enums) rather than `serde_wasm_bindgen`.
+pub fn send_chat_message<F>(chat_id: i64, text: String, mut on_msg: F)
+where
+    F: FnMut(ChatStream) + 'static,
+{
+    let closure = Closure::wrap(Box::new(move |payload: JsValue| {
+        let Some(s) = js_sys::JSON::stringify(&payload)
+            .ok()
+            .and_then(|v| v.as_string())
+        else {
+            return;
+        };
+        match serde_json::from_str::<ChannelEnvelope>(&s) {
+            Ok(env) if env.end => on_msg(ChatStream::End),
+            Ok(env) => {
+                if let Some(ev) = env.message {
+                    on_msg(ChatStream::Event(ev));
+                }
+            }
+            Err(_) => {}
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let id = transformCallback(&closure, false);
+    // The callback fires for every streamed event until the channel closes, so
+    // it must outlive this function. Leak it — one per user message (user-paced,
+    // so the bound is trivial).
+    closure.forget();
+
+    let on_event = format!("__CHANNEL__:{}", id as u64);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(args) = serde_wasm_bindgen::to_value(&SendChatArgs {
+            chat_id,
+            text,
+            on_event,
+        }) {
+            let _ = invoke("send_chat_message", args).await;
+        }
+    });
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     mount_to_body(App);
@@ -320,10 +468,61 @@ pub struct SyncTick(pub RwSignal<u32>);
 #[derive(Clone, Copy)]
 pub struct FirstRunTick(pub RwSignal<u32>);
 
+/// Chat state that has to outlive `ChatDetail` remounts. The component is torn
+/// down and rebuilt on every navigation, so anything kept in component-local
+/// signals (the in-flight stream, the reasoning toggle) is lost when the user
+/// flips to the chats list and back. Hoisting it to app scope means a send
+/// started in one visit keeps streaming into the same buffers, and returning to
+/// the chat shows it continuing rather than a frozen, half-finished transcript.
+///
+/// `active_id` records which chat the in-flight send belongs to, so a different
+/// chat's `ChatDetail` doesn't render someone else's stream.
+#[derive(Clone, Copy)]
+pub struct ChatUiState {
+    /// "Show reasoning" — persisted so toggling it survives navigation.
+    pub show_reasoning: RwSignal<bool>,
+    /// The chat id of the in-flight send (None when idle).
+    pub active_id: RwSignal<Option<i64>>,
+    /// The user message being answered (shown optimistically until its
+    /// persisted copy appears in the transcript).
+    pub pending_user: RwSignal<Option<String>>,
+    /// True while a send is in flight (one at a time).
+    pub sending: RwSignal<bool>,
+    /// Bumped on every streamed event (and on completion) so any mounted
+    /// `ChatDetail` refetches the authoritative, persisted transcript. The
+    /// engine persists each turn *before* emitting its event, so a refetch
+    /// always reflects what was just streamed — no parallel live buffer to
+    /// double up against the DB after a navigate-away-and-back.
+    pub refresh: RwSignal<u32>,
+    /// A turn-level failure `(chat_id, message)`. Errors aren't persisted as
+    /// turns (they'd pollute the transcript + history), so they ride this
+    /// signal instead; scoped by chat id so one chat's failure doesn't surface
+    /// while viewing another.
+    pub error: RwSignal<Option<(i64, String)>>,
+}
+
 #[component]
 fn App() -> impl IntoView {
     provide_context(SyncTick(RwSignal::new(0u32)));
     provide_context(FirstRunTick(RwSignal::new(0u32)));
+    // Default the reasoning toggle ON; the persisted preference (below)
+    // overrides it once loaded.
+    let chat_ui = ChatUiState {
+        show_reasoning: RwSignal::new(true),
+        active_id: RwSignal::new(None),
+        pending_user: RwSignal::new(None),
+        sending: RwSignal::new(false),
+        refresh: RwSignal::new(0u32),
+        error: RwSignal::new(None),
+    };
+    provide_context(chat_ui);
+    // Remember "show reasoning" across runs (stored in the DB settings table).
+    let show_reasoning = chat_ui.show_reasoning;
+    spawn_local(async move {
+        if let Ok(v) = fetch_chat_show_reasoning().await {
+            show_reasoning.set(v);
+        }
+    });
 
     view! {
         <Router>
@@ -333,11 +532,14 @@ fn App() -> impl IntoView {
                 <nav class="nav">
                     <A href="/">"Actions"</A>
                     <A href="/inbox">"Inbox"</A>
+                    <A href="/chats">"Chats"</A>
                     <A href="/settings">"Settings"</A>
                 </nav>
                 <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
                     <Route path=path!("/") view=ActionsPage />
                     <Route path=path!("/inbox") view=InboxPage />
+                    <Route path=path!("/chats") view=ChatsListPage />
+                    <Route path=path!("/chats/:id") view=ChatDetailPage />
                     <Route path=path!("/settings") view=SettingsPage />
                     <Route path=path!("/settings/profile") view=SettingsProfilePage />
                     <Route path=path!("/settings/llm") view=SettingsLlmPage />
@@ -371,6 +573,16 @@ fn SettingsSourcesPage() -> impl IntoView {
 #[component]
 fn ActionsPage() -> impl IntoView {
     view! { <components::ActionsPage /> }
+}
+
+#[component]
+fn ChatsListPage() -> impl IntoView {
+    view! { <components::ChatsPage /> }
+}
+
+#[component]
+fn ChatDetailPage() -> impl IntoView {
+    view! { <components::ChatDetail /> }
 }
 
 #[component]

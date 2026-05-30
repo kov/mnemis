@@ -252,6 +252,66 @@ pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
     Ok(())
 }
 
+pub async fn chat(
+    cfg: &Config,
+    text: &str,
+    chat_id: Option<i64>,
+    seed_action: Option<&str>,
+    seed_message: Option<i64>,
+) -> Result<()> {
+    use mnemis_engine::chat;
+    use mnemis_engine::types::ChatEvent;
+
+    let pool = db::open(&cfg.db_path()).await?;
+    let llm = build_llm(cfg);
+
+    // Resolve (or create) the chat.
+    let chat_id = match chat_id {
+        Some(id) => id,
+        None => {
+            let (kind, sid) = if let Some(a) = seed_action {
+                let n: i64 = a
+                    .trim()
+                    .strip_prefix("A-")
+                    .unwrap_or(a.trim())
+                    .parse()
+                    .with_context(|| format!("invalid --seed-action {a:?} (expected A-N or N)"))?;
+                (Some("action"), Some(n))
+            } else if let Some(m) = seed_message {
+                (Some("message"), Some(m))
+            } else {
+                (None, None)
+            };
+            chat::create_chat(&pool, kind, sid).await?
+        }
+    };
+
+    let system_prompt = chat::prompt::build_system_prompt(&pool, chat_id).await?;
+    let budget =
+        mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens());
+
+    println!("you: {text}\n");
+    let sink = |e: ChatEvent| match e {
+        ChatEvent::Reasoning { text } => println!("  💭 {}", text.replace('\n', "\n     ")),
+        ChatEvent::ToolCall { name, arguments } => println!("  → {name}({arguments})"),
+        ChatEvent::ToolResult { name, output } => {
+            let trimmed: String = output.chars().take(200).collect();
+            println!("  ← {name}: {trimmed}");
+        }
+        ChatEvent::AssistantMessage { text } => println!("\n{text}"),
+        ChatEvent::Done => {}
+        ChatEvent::Error { message } => eprintln!("\nerror: {message}"),
+    };
+
+    chat::run_chat_turn(&pool, &llm, &system_prompt, chat_id, text, budget, &sink).await?;
+    // Best-effort title upgrade for an unseeded chat (matches the app).
+    if let Err(e) = chat::maybe_generate_title(&pool, &llm, chat_id, text).await {
+        eprintln!("(title generation skipped: {e:#})");
+    }
+    println!("\n(chat #{chat_id} — continue with: mnemis chat --chat-id {chat_id} \"…\")");
+    Ok(())
+}
+
 pub async fn embed_once(cfg: &Config) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
     let embedder = build_embedder(cfg);

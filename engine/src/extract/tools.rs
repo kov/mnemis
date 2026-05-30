@@ -6,12 +6,25 @@ use sqlx::SqlitePool;
 
 use crate::llm::ToolDef;
 
-/// Snapshot of which channel + source an extraction run is scoped to.
-/// Used by tool dispatch to scope DB lookups appropriately.
+/// How wide the message-touching tools may look. Extraction runs are bound to
+/// the one source they're processing (`Source`); the chat agent ranges over
+/// everything the user has ingested (`Global`). Each handler turns this into an
+/// optional `source_id` SQL filter (`None` = no restriction).
 #[derive(Debug, Clone, Copy)]
-pub struct ExtractionScope {
-    pub source_id: i64,
-    pub channel_id: i64,
+pub enum ToolScope {
+    Source(i64),
+    Global,
+}
+
+impl ToolScope {
+    /// The `source_id` to filter message lookups by, or `None` for no
+    /// restriction. Bound into `(? IS NULL OR c.source_id = ?)` clauses.
+    fn source_filter(self) -> Option<i64> {
+        match self {
+            ToolScope::Source(id) => Some(id),
+            ToolScope::Global => None,
+        }
+    }
 }
 
 /// Per-run cap on how many characters of message bodies the agent may pull via
@@ -55,6 +68,101 @@ impl FetchBudget {
     }
 }
 
+// Tool parameter schemas, shared by the extraction and chat tool sets so the
+// two can't drift. The JSON Schemas are identical across surfaces; only the
+// human-readable descriptions differ (see `definitions` vs `chat_definitions`).
+
+fn search_messages_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"]
+    })
+}
+
+fn fetch_messages_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "external_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        },
+        "required": ["external_ids"]
+    })
+}
+
+fn record_action_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title":      { "type": "string", "description": "imperative, ≤80 chars" },
+            "details":    { "type": "string", "description": "1-3 sentences of context" },
+            "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+            "rationale":  { "type": "string", "description": "≤200 chars, why this is an action" },
+            "due_at":     { "type": ["string", "null"], "description": "ISO 8601 timestamp or null" },
+            "evidence_external_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        },
+        "required": ["title", "details", "confidence", "rationale", "evidence_external_ids"]
+    })
+}
+
+fn resolve_action_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action_id":  { "type": "string", "description": "A-N id" },
+            "status":     { "type": "string", "enum": ["done", "cancelled"] },
+            "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+            "rationale":  { "type": "string", "description": "≤200 chars, what proves it's done" },
+            "evidence_external_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        },
+        "required": ["action_id", "status", "confidence", "rationale", "evidence_external_ids"]
+    })
+}
+
+fn update_action_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action_id":  { "type": "string", "description": "the A-N id returned by record_action or shown in Existing actions" },
+            "title":      { "type": "string" },
+            "details":    { "type": "string" },
+            "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+            "rationale":  { "type": "string" },
+            "due_at":     { "type": ["string", "null"], "description": "ISO 8601 timestamp or null" },
+            "evidence_external_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "additional evidence to append; not replaced"
+            }
+        },
+        "required": ["action_id"]
+    })
+}
+
+fn get_action_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action_id": { "type": "string", "description": "A-N id (or bare N)" }
+        },
+        "required": ["action_id"]
+    })
+}
+
+fn list_actions_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "include_resolved": {
+                "type": "boolean",
+                "description": "also include done/cancelled/dismissed (default false)"
+            }
+        }
+    })
+}
+
+/// The extraction agent's tool set. It has no `get_action` — the existing
+/// actions for the channel are injected into its prompt directly.
 pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef::function(
@@ -62,13 +170,7 @@ pub fn definitions() -> Vec<ToolDef> {
             "Keyword search across messages in this source. Returns up to 10 matches \
              with external_id, channel, posted_at, and a short snippet."
                 .to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"]
-            }),
+            search_messages_params(),
         ),
         ToolDef::function(
             "fetch_messages".to_string(),
@@ -78,17 +180,7 @@ pub fn definitions() -> Vec<ToolDef> {
              the ask. Returns {\"messages\": [...], \"not_found\": [...]} plus \"over_budget\" \
              ids and a notice if the per-run fetch budget is hit."
                 .to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "external_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1
-                    }
-                },
-                "required": ["external_ids"]
-            }),
+            fetch_messages_params(),
         ),
         ToolDef::function(
             "record_action".to_string(),
@@ -97,22 +189,7 @@ pub fn definitions() -> Vec<ToolDef> {
              {\"action_id\": \"A-N\", \"status\": ...} — keep the action_id if you may \
              want to amend the same action later in this response (use update_action)."
                 .to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "title":      { "type": "string", "description": "imperative, ≤80 chars" },
-                    "details":    { "type": "string", "description": "1-3 sentences of context" },
-                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-                    "rationale":  { "type": "string", "description": "≤200 chars, why this is an action" },
-                    "due_at":     { "type": ["string", "null"], "description": "ISO 8601 timestamp or null" },
-                    "evidence_external_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1
-                    }
-                },
-                "required": ["title", "details", "confidence", "rationale", "evidence_external_ids"]
-            }),
+            record_action_params(),
         ),
         ToolDef::function(
             "resolve_action".to_string(),
@@ -121,21 +198,7 @@ pub fn definitions() -> Vec<ToolDef> {
              show the resolution (≥1). high-confidence applies immediately; medium/low \
              queue the suggestion for the user to confirm — same gating as record_action."
                 .to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "action_id":  { "type": "string", "description": "A-N id from Existing actions" },
-                    "status":     { "type": "string", "enum": ["done", "cancelled"] },
-                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-                    "rationale":  { "type": "string", "description": "≤200 chars, what proves it's done" },
-                    "evidence_external_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1
-                    }
-                },
-                "required": ["action_id", "status", "confidence", "rationale", "evidence_external_ids"]
-            }),
+            resolve_action_params(),
         ),
         ToolDef::function(
             "update_action".to_string(),
@@ -144,23 +207,73 @@ pub fn definitions() -> Vec<ToolDef> {
              is appended, not replaced. Use this instead of calling record_action a second \
              time for the same underlying item."
                 .to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "action_id":  { "type": "string", "description": "the A-N id returned by record_action or shown in Existing actions" },
-                    "title":      { "type": "string" },
-                    "details":    { "type": "string" },
-                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-                    "rationale":  { "type": "string" },
-                    "due_at":     { "type": ["string", "null"], "description": "ISO 8601 timestamp or null" },
-                    "evidence_external_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "additional evidence to append; not replaced"
-                    }
-                },
-                "required": ["action_id"]
-            }),
+            update_action_params(),
+        ),
+    ]
+}
+
+/// The chat agent's tool set: read-and-act across *all* sources, plus
+/// `get_action` to inspect a specific action the user references. The mutating
+/// tools share the extraction handlers (and their confidence gating + audit
+/// events) — only the descriptions are tuned for an interactive conversation.
+pub fn chat_definitions() -> Vec<ToolDef> {
+    vec![
+        ToolDef::function(
+            "search_messages".to_string(),
+            "Keyword search across ALL the user's ingested messages (every source). Returns \
+             up to 10 matches with external_id, channel, posted_at, and a short snippet."
+                .to_string(),
+            search_messages_params(),
+        ),
+        ToolDef::function(
+            "fetch_messages".to_string(),
+            "Fetch the full bodies of one or more messages by external_id — ids you got from \
+             search_messages, from an action's evidence, or that the user named. Batch them. \
+             Returns {\"messages\": [...], \"not_found\": [...]}."
+                .to_string(),
+            fetch_messages_params(),
+        ),
+        ToolDef::function(
+            "list_actions".to_string(),
+            "List the user's action items — open ones by default (pending, auto-claimed, claimed), \
+             most-urgent first. Returns each action's A-N id, title, status, confidence, and due \
+             date. Start here when the user asks what they have outstanding, then use get_action \
+             for detail on specific ones. Pass include_resolved=true to also see done/cancelled."
+                .to_string(),
+            list_actions_params(),
+        ),
+        ToolDef::function(
+            "get_action".to_string(),
+            "Look up one action by its A-N id: title, details, status, confidence, due date, \
+             the messages it cites as evidence, and its recent history. Call this whenever the \
+             user refers to an action so your answer is grounded in what it's actually based on."
+                .to_string(),
+            get_action_params(),
+        ),
+        ToolDef::function(
+            "record_action".to_string(),
+            "Create a new action for the user. evidence_external_ids must cite at least one real \
+             message (find it with search_messages/fetch_messages). Use high confidence when the \
+             user explicitly asks you to track something — it is auto-claimed; use medium/low for \
+             your own suggestions, which the user confirms. Only for a concrete thing the user must \
+             do — never to note that there is nothing to do."
+                .to_string(),
+            record_action_params(),
+        ),
+        ToolDef::function(
+            "resolve_action".to_string(),
+            "Mark an action done or cancelled by its A-N id, citing evidence_external_ids that show \
+             it. Use high confidence when the user explicitly tells you it's done (applies \
+             immediately); medium/low queues it for the user to confirm."
+                .to_string(),
+            resolve_action_params(),
+        ),
+        ToolDef::function(
+            "update_action".to_string(),
+            "Amend an existing action by its A-N id. Only the fields you pass change; new evidence \
+             is appended, not replaced. Prefer this over recording a duplicate."
+                .to_string(),
+            update_action_params(),
         ),
     ]
 }
@@ -175,7 +288,7 @@ pub struct DispatchOutput {
 
 pub async fn dispatch(
     pool: &SqlitePool,
-    scope: ExtractionScope,
+    scope: ToolScope,
     fetch_budget: &mut FetchBudget,
     name: &str,
     arguments: &str,
@@ -183,6 +296,8 @@ pub async fn dispatch(
     let result = match name {
         "search_messages" => search_messages(pool, scope, arguments).await,
         "fetch_messages" => fetch_messages(pool, scope, fetch_budget, arguments).await,
+        "list_actions" => list_actions(pool, arguments).await,
+        "get_action" => get_action(pool, arguments).await,
         "record_action" => match record_action(pool, scope, arguments).await {
             Ok(json) => {
                 return DispatchOutput {
@@ -220,23 +335,21 @@ struct SearchHit {
     channel: String,
 }
 
-async fn search_messages(
-    pool: &SqlitePool,
-    scope: ExtractionScope,
-    arguments: &str,
-) -> Result<String> {
+async fn search_messages(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
     let args: SearchArgs =
         serde_json::from_str(arguments).context("parsing search_messages args")?;
+    let filter = scope.source_filter();
     let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
         "SELECT m.external_id, m.posted_at, m.body, c.name \
          FROM messages_fts \
          JOIN messages m ON m.id = messages_fts.rowid \
          JOIN channels c ON c.id = m.channel_id \
-         WHERE messages_fts MATCH ? AND c.source_id = ? \
+         WHERE messages_fts MATCH ? AND (? IS NULL OR c.source_id = ?) \
          ORDER BY rank LIMIT 10",
     )
     .bind(&args.query)
-    .bind(scope.source_id)
+    .bind(filter)
+    .bind(filter)
     .fetch_all(pool)
     .await
     .context("FTS search failed")?;
@@ -272,11 +385,12 @@ struct FetchedMessage {
 #[allow(clippy::type_complexity)]
 async fn fetch_messages(
     pool: &SqlitePool,
-    scope: ExtractionScope,
+    scope: ToolScope,
     budget: &mut FetchBudget,
     arguments: &str,
 ) -> Result<String> {
     let args: FetchArgs = serde_json::from_str(arguments).context("parsing fetch_messages args")?;
+    let filter = scope.source_filter();
 
     let mut messages = Vec::new();
     let mut not_found = Vec::new();
@@ -288,10 +402,11 @@ async fn fetch_messages(
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              JOIN channels c ON c.id = m.channel_id \
-             WHERE m.external_id = ? AND c.source_id = ?",
+             WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?)",
         )
         .bind(ext_id)
-        .bind(scope.source_id)
+        .bind(filter)
+        .bind(filter)
         .fetch_optional(pool)
         .await
         .context("fetch_messages lookup failed")?;
@@ -341,11 +456,7 @@ struct RecordArgs {
     evidence_external_ids: Vec<String>,
 }
 
-async fn record_action(
-    pool: &SqlitePool,
-    scope: ExtractionScope,
-    arguments: &str,
-) -> Result<String> {
+async fn record_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
     let args: RecordArgs = serde_json::from_str(arguments).context("parsing record_action args")?;
 
     if !["high", "medium", "low"].contains(&args.confidence.as_str()) {
@@ -391,17 +502,20 @@ async fn record_action(
     .await
     .context("inserting action")?;
 
-    // Resolve evidence message ids (scoped to source — extractor can fetch across channels).
+    // Resolve evidence message ids. Extraction is scoped to its source; chat
+    // ranges over all of them (Global → no source filter).
+    let filter = scope.source_filter();
     let mut evidence_ids = Vec::new();
     for (i, ext_id) in args.evidence_external_ids.iter().enumerate() {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT m.id FROM messages m \
              JOIN channels c ON c.id = m.channel_id \
-             WHERE m.external_id = ? AND c.source_id = ? \
+             WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?) \
              LIMIT 1",
         )
         .bind(ext_id)
-        .bind(scope.source_id)
+        .bind(filter)
+        .bind(filter)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((mid,)) = row {
@@ -501,11 +615,7 @@ fn parse_action_ref(s: &str) -> Result<i64> {
         .with_context(|| format!("invalid action_id: {s:?} (expected A-N or N)"))
 }
 
-async fn update_action(
-    pool: &SqlitePool,
-    scope: ExtractionScope,
-    arguments: &str,
-) -> Result<String> {
+async fn update_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
     let args: UpdateArgs = serde_json::from_str(arguments).context("parsing update_action args")?;
     let action_id = parse_action_ref(&args.action_id)?;
 
@@ -589,16 +699,18 @@ async fn update_action(
     }
 
     // Append (not replace) any extra evidence.
+    let filter = scope.source_filter();
     let mut appended_evidence = Vec::new();
     if let Some(extras) = &args.evidence_external_ids {
         for ext_id in extras {
             let row: Option<(i64,)> = sqlx::query_as(
                 "SELECT m.id FROM messages m \
                  JOIN channels c ON c.id = m.channel_id \
-                 WHERE m.external_id = ? AND c.source_id = ? LIMIT 1",
+                 WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?) LIMIT 1",
             )
             .bind(ext_id)
-            .bind(scope.source_id)
+            .bind(filter)
+            .bind(filter)
             .fetch_optional(&mut *tx)
             .await?;
             let Some((mid,)) = row else { continue };
@@ -667,11 +779,7 @@ struct ResolveArgs {
     evidence_external_ids: Vec<String>,
 }
 
-async fn resolve_action(
-    pool: &SqlitePool,
-    scope: ExtractionScope,
-    arguments: &str,
-) -> Result<String> {
+async fn resolve_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
     let args: ResolveArgs =
         serde_json::from_str(arguments).context("parsing resolve_action args")?;
     let action_id = parse_action_ref(&args.action_id)?;
@@ -702,15 +810,17 @@ async fn resolve_action(
     // Resolution evidence (kind='resolution') is attached either way — even
     // for the queued case, it's useful for the user to see what the agent
     // would have used to justify the resolution.
+    let filter = scope.source_filter();
     let mut attached = Vec::new();
     for ext_id in &args.evidence_external_ids {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT m.id FROM messages m \
              JOIN channels c ON c.id = m.channel_id \
-             WHERE m.external_id = ? AND c.source_id = ? LIMIT 1",
+             WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?) LIMIT 1",
         )
         .bind(ext_id)
-        .bind(scope.source_id)
+        .bind(filter)
+        .bind(filter)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((mid,)) = row else { continue };
@@ -793,6 +903,139 @@ async fn resolve_action(
     .to_string())
 }
 
+#[derive(Deserialize, Default)]
+struct ListActionsArgs {
+    #[serde(default)]
+    include_resolved: bool,
+}
+
+/// List the user's actions (open ones by default), most-urgent first — the
+/// entry point for "what do I have outstanding?". Chat-only.
+async fn list_actions(pool: &SqlitePool, arguments: &str) -> Result<String> {
+    let args: ListActionsArgs = if arguments.trim().is_empty() {
+        ListActionsArgs::default()
+    } else {
+        serde_json::from_str(arguments).context("parsing list_actions args")?
+    };
+
+    let rows: Vec<(i64, String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, title, status, confidence, due_at FROM actions \
+         WHERE (? OR status IN ('pending', 'auto_claimed', 'claimed')) \
+         ORDER BY (due_at IS NULL), due_at ASC, extracted_at DESC LIMIT 50",
+    )
+    .bind(args.include_resolved)
+    .fetch_all(pool)
+    .await
+    .context("list_actions query failed")?;
+
+    let actions: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, title, status, confidence, due_at)| {
+            json!({
+                "action_id": format!("A-{id}"),
+                "title": title,
+                "status": status,
+                "confidence": confidence,
+                "due_at": due_at.map(iso),
+            })
+        })
+        .collect();
+    Ok(json!({ "actions": actions }).to_string())
+}
+
+#[derive(Deserialize)]
+struct GetActionArgs {
+    action_id: String,
+}
+
+/// Convert a unix timestamp to an RFC 3339 string (empty on overflow).
+fn iso(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// Look up one action with its evidence messages and recent event history, so
+/// the chat agent can ground answers about a specific action the user names.
+/// Chat-only (the extractor gets existing actions injected into its prompt), so
+/// there's no source scope — actions aren't source-bound.
+async fn get_action(pool: &SqlitePool, arguments: &str) -> Result<String> {
+    let args: GetActionArgs = serde_json::from_str(arguments).context("parsing get_action args")?;
+    let action_id = parse_action_ref(&args.action_id)?;
+
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT title, details, confidence, status, rationale, due_at, resolved_at \
+         FROM actions WHERE id = ?",
+    )
+    .bind(action_id)
+    .fetch_optional(pool)
+    .await
+    .context("get_action lookup failed")?;
+
+    let Some((title, details, confidence, status, rationale, due_at, resolved_at)) = row else {
+        anyhow::bail!("action A-{action_id} not found");
+    };
+
+    let ev_rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT m.external_id, ae.kind, m.posted_at, m.body \
+         FROM action_evidence ae \
+         JOIN messages m ON m.id = ae.message_id \
+         WHERE ae.action_id = ? \
+         ORDER BY ae.is_primary DESC, m.posted_at",
+    )
+    .bind(action_id)
+    .fetch_all(pool)
+    .await
+    .context("get_action evidence lookup failed")?;
+    let evidence: Vec<serde_json::Value> = ev_rows
+        .into_iter()
+        .map(|(external_id, kind, posted_at, body)| {
+            json!({
+                "external_id": external_id,
+                "kind": kind,
+                "posted_at": iso(posted_at),
+                "snippet": snippet(&body, 200),
+            })
+        })
+        .collect();
+
+    let event_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT event_kind, actor, occurred_at FROM action_events \
+         WHERE action_id = ? ORDER BY occurred_at DESC LIMIT 10",
+    )
+    .bind(action_id)
+    .fetch_all(pool)
+    .await
+    .context("get_action events lookup failed")?;
+    let events: Vec<serde_json::Value> = event_rows
+        .into_iter()
+        .map(|(kind, actor, at)| json!({ "kind": kind, "actor": actor, "at": iso(at) }))
+        .collect();
+
+    Ok(json!({
+        "action_id": format!("A-{action_id}"),
+        "title": title,
+        "details": details,
+        "confidence": confidence,
+        "status": status,
+        "rationale": rationale,
+        "due_at": due_at.map(iso),
+        "resolved_at": resolved_at.map(iso),
+        "evidence": evidence,
+        "events": events,
+    })
+    .to_string())
+}
+
 /// Truncate `text` to `max` chars (collapsing newlines) with an ellipsis when
 /// cut. Public so the CLI `dump_prompt` command and the window projection share
 /// one snippet definition rather than drifting.
@@ -811,7 +1054,7 @@ mod tests {
     use crate::test_util::{SeedMessage, seed_messages, seed_minimal};
     use tempfile::TempDir;
 
-    async fn db_with_messages(bodies: &[(&str, &str)]) -> (TempDir, SqlitePool, ExtractionScope) {
+    async fn db_with_messages(bodies: &[(&str, &str)]) -> (TempDir, SqlitePool, ToolScope) {
         let tmp = TempDir::new().unwrap();
         let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
         db::migrate(&pool).await.unwrap();
@@ -830,11 +1073,7 @@ mod tests {
         seed_messages(&pool, ctx.source_id, ctx.channel_id, &msgs)
             .await
             .unwrap();
-        let scope = ExtractionScope {
-            source_id: ctx.source_id,
-            channel_id: ctx.channel_id,
-        };
-        (tmp, pool, scope)
+        (tmp, pool, ToolScope::Source(ctx.source_id))
     }
 
     #[tokio::test]
@@ -878,6 +1117,139 @@ mod tests {
         assert!(
             v["notice"].is_string(),
             "a budget-exhausted notice should be present: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_action_returns_the_action_with_evidence_and_events() {
+        let (_tmp, pool, scope) =
+            db_with_messages(&[("msg-a", "Ana asked you to ship the report")]).await;
+        // Record an action citing msg-a, then look it up.
+        let rec = json!({
+            "title": "Ship the report",
+            "details": "Ana asked.",
+            "confidence": "high",
+            "rationale": "direct ask",
+            "evidence_external_ids": ["msg-a"],
+        })
+        .to_string();
+        let recorded = record_action(&pool, scope, &rec).await.unwrap();
+        let action_ref = serde_json::from_str::<serde_json::Value>(&recorded).unwrap()["action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let out = get_action(&pool, &json!({ "action_id": action_ref }).to_string())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["action_id"], action_ref);
+        assert_eq!(v["title"], "Ship the report");
+        assert_eq!(v["status"], "auto_claimed");
+        assert_eq!(v["evidence"][0]["external_id"], "msg-a");
+        assert!(
+            v["evidence"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("ship the report"),
+            "evidence snippet should carry the body: {out}"
+        );
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"created"), "events: {kinds:?}");
+    }
+
+    #[tokio::test]
+    async fn get_action_reports_missing() {
+        let (_tmp, pool, _scope) = db_with_messages(&[("msg-a", "x")]).await;
+        assert!(
+            get_action(&pool, &json!({ "action_id": "A-999" }).to_string())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_actions_returns_open_actions_with_refs() {
+        let (_tmp, pool, scope) =
+            db_with_messages(&[("msg-a", "Ana asked you to ship the report")]).await;
+        let rec = json!({
+            "title": "Ship the report",
+            "details": "Ana asked.",
+            "confidence": "high",
+            "rationale": "direct ask",
+            "evidence_external_ids": ["msg-a"],
+        })
+        .to_string();
+        record_action(&pool, scope, &rec).await.unwrap();
+
+        // Empty args must not panic (the model often sends "" for no-arg tools).
+        for args in ["", "{}"] {
+            let out = list_actions(&pool, args).await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["actions"][0]["action_id"], "A-1", "args={args:?}: {out}");
+            assert_eq!(v["actions"][0]["title"], "Ship the report");
+            assert_eq!(v["actions"][0]["status"], "auto_claimed");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_messages_global_scope_spans_sources() {
+        // Source 1 (from seed_minimal) has "alpha"; add a second source with "beta".
+        let (_tmp, pool, source1_scope) =
+            db_with_messages(&[("m1", "alpha from source one")]).await;
+        let (s2,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'two', 'two/ref', 0) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (c2,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'INBOX2', 'INBOX2', 'mailbox') RETURNING id",
+        )
+        .bind(s2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        seed_messages(
+            &pool,
+            s2,
+            c2,
+            &[SeedMessage {
+                external_id: "m2",
+                author_email: "bob@example.com",
+                author_name: "Bob",
+                subject: "S",
+                body: "beta from source two",
+                recipients: &[],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let q = json!({ "query": "beta" }).to_string();
+
+        // Source-scoped to source 1: must not see source 2's message.
+        let out1 = search_messages(&pool, source1_scope, &q).await.unwrap();
+        let hits1: serde_json::Value = serde_json::from_str(&out1).unwrap();
+        assert_eq!(
+            hits1.as_array().unwrap().len(),
+            0,
+            "source-scoped search must not leak across sources: {out1}"
+        );
+
+        // Global: finds the source-2 message.
+        let out2 = search_messages(&pool, ToolScope::Global, &q).await.unwrap();
+        let hits2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(
+            hits2[0]["external_id"], "m2",
+            "global search should span sources: {out2}"
         );
     }
 }

@@ -127,6 +127,15 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
+/// One entry of a `reasoning` item's `summary` array. omlx emits
+/// `{type:"summary_text", text:"…"}`; we only need the text. Unknown fields
+/// (like `type`) are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningSummary {
+    #[serde(default)]
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputItem {
@@ -141,14 +150,36 @@ pub enum OutputItem {
         name: String,
         arguments: String,
     },
-    // The model's chain-of-thought. omlx returns it as a `reasoning` item
-    // with `content: null` (the text lives under a `summary` array); we don't
-    // consume it either way, so accept the tag and ignore every other field.
-    // A unit variant tolerates whatever shape the server sends.
+    // The model's chain-of-thought. omlx returns it as a `reasoning` item with
+    // `content: null` — the human-readable text lives under a `summary` array
+    // of `{type:"summary_text", text}` items, which we capture for the chat UI
+    // to display. The agent loops NEVER replay this into model input (the
+    // reasoning-replay rule: Qwen/Gemma mishandle a replayed `<think>`). A
+    // null/absent summary degrades to an empty Vec.
     #[serde(rename = "reasoning")]
-    Reasoning,
+    Reasoning {
+        #[serde(default, deserialize_with = "null_as_default")]
+        summary: Vec<ReasoningSummary>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+impl OutputItem {
+    /// Join a reasoning item's summary entries into a single display string.
+    /// Returns `None` for non-reasoning items or empty summaries.
+    pub fn reasoning_text(&self) -> Option<String> {
+        match self {
+            OutputItem::Reasoning { summary } if !summary.is_empty() => Some(
+                summary
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +189,7 @@ pub struct ResponsesResponse {
     pub output: Vec<OutputItem>,
 }
 
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
@@ -286,7 +318,18 @@ mod tests {
             serde_json::from_str(body).expect("null-valued fields must parse");
         assert_eq!(resp.status, "completed");
         assert_eq!(resp.output.len(), 2);
-        assert!(matches!(resp.output[0], OutputItem::Reasoning));
+        // Reasoning is captured (for the chat UI), not discarded: the
+        // `summary` text survives parsing even though `content` is null.
+        match &resp.output[0] {
+            OutputItem::Reasoning { summary } => {
+                assert_eq!(summary[0].text, "thinking...");
+                assert_eq!(
+                    resp.output[0].reasoning_text().as_deref(),
+                    Some("thinking...")
+                );
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
         match &resp.output[1] {
             OutputItem::Message { content } => match &content[0] {
                 ContentItem::OutputText { text } => assert_eq!(text, "No actions found."),

@@ -1413,6 +1413,281 @@ async fn settings_sources_lists_and_modal_opens() -> Result<()> {
 /// up front) and one low-confidence (hidden behind the revealer). Matches
 /// the `record_action` insert shape so the same `queries::list_actions` SQL
 /// returns them.
+/// Phase 4: the Chats tab lists a seeded conversation and renders its
+/// transcript. The live send path needs an LLM (covered by engine tests); this
+/// asserts the read/render path the user sees, under MNEMIS_DISABLE_LLM.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_view_lists_and_renders_a_seeded_transcript() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-chat.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Smoke Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        // An action to seed a "Talk about this" chat from (drives the banner).
+        let (action_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, details, confidence, rationale, status, extracted_at) \
+             VALUES ('Renew the TLS cert', 'x', 'high', 'r', 'auto_claimed', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+
+        // Seed a small transcript on a chat that's about that action.
+        let chat_id = store::create_chat(&pool, Some("action"), Some(action_id)).await?;
+        let q = "why is the renewal flagged?";
+        store::append_turn(&pool, chat_id, "user", Some(q), None, None, None).await?;
+        store::ensure_title(&pool, chat_id, q).await?;
+        let a = store::append_turn(
+            &pool,
+            chat_id,
+            "assistant",
+            Some("Because Ana asked you to renew the cert by Friday."),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        store::append_reasoning(&pool, a, "Checked the evidence message.").await?;
+
+        // Pre-flight: the app's queries see the chat + its turns.
+        assert_eq!(
+            store::list_chats(&pool).await?.len(),
+            1,
+            "pre-flight: one chat"
+        );
+        assert_eq!(
+            store::load_turns(&pool, chat_id).await?.len(),
+            2,
+            "pre-flight: two turns"
+        );
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await
+        .context("waiting for nav.nav")?;
+
+    // Navigate to the Chats tab.
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/chats"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+
+    // The chat is listed under its derived title.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("a.chat-list-item"))
+        .await
+        .context("waiting for a.chat-list-item")?;
+    let list_text = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        list_text.contains("why is the renewal flagged"),
+        "chat list should show the derived title. got: {list_text}"
+    );
+
+    // Open it; the transcript shows both turns.
+    client
+        .execute(
+            r#"document.querySelector('a.chat-list-item').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.chat-transcript"))
+        .await
+        .context("waiting for div.chat-transcript")?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let chat_text = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        chat_text.contains("why is the renewal flagged"),
+        "transcript should show the user message. got: {chat_text}"
+    );
+    assert!(
+        chat_text.contains("ana asked you to renew"),
+        "transcript should show the assistant message. got: {chat_text}"
+    );
+    // The "Talk about this" seed banner shows what the chat is grounded in.
+    assert!(
+        chat_text.contains("renew the tls cert"),
+        "seeded chat should show its 'About …' context banner. got: {chat_text}"
+    );
+
+    let html = client
+        .find(Locator::Css("body"))
+        .await?
+        .html(true)
+        .await
+        .unwrap_or_default();
+    assert!(
+        html.contains("chat-input"),
+        "the chat composer should be present. html: {html}"
+    );
+    assert!(
+        html.contains("chat-seed-banner"),
+        "the seed banner element should be present. html: {html}"
+    );
+
+    Ok(())
+}
+
+/// Phase 4: a tall transcript auto-scrolls to the newest message on open, so
+/// the user sees the latest content rather than the top. Guards the sticky-
+/// scroll behavior (the bug: scroll reset to the top on every new message).
+/// No LLM needed — runs under MNEMIS_DISABLE_LLM.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_view_auto_scrolls_to_the_latest_message() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-scroll.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Smoke Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        // Many turns so the transcript overflows the 1280x720 viewport.
+        let chat_id = store::create_chat(&pool, None, None).await?;
+        for i in 0..40 {
+            let (role, text) = if i % 2 == 0 {
+                (
+                    "user",
+                    format!("Question number {i} — tell me about action item {i}."),
+                )
+            } else {
+                (
+                    "assistant",
+                    format!(
+                        "Answer number {i}. Here is a longer paragraph so the transcript grows tall enough to need scrolling and we can tell whether the view pinned to the bottom."
+                    ),
+                )
+            };
+            store::append_turn(&pool, chat_id, role, Some(&text), None, None, None).await?;
+        }
+        // A unique marker on the very last turn.
+        store::append_turn(
+            &pool,
+            chat_id,
+            "assistant",
+            Some("FINAL-MARKER-LINE: this should be visible at the bottom on open."),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/chats"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("a.chat-list-item"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('a.chat-list-item').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.chat-transcript"))
+        .await?;
+    // Give the resource + the post-render rAF a moment to settle.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let metrics = client
+        .execute(
+            r#"const el = document.querySelector('.chat-transcript');
+               return JSON.stringify({top: el.scrollTop, sh: el.scrollHeight, ch: el.clientHeight});"#,
+            vec![],
+        )
+        .await?;
+    let m: Value = serde_json::from_str(metrics.as_str().unwrap_or("{}"))?;
+    let top = m["top"].as_f64().unwrap_or(0.0);
+    let sh = m["sh"].as_f64().unwrap_or(0.0);
+    let ch = m["ch"].as_f64().unwrap_or(0.0);
+
+    // The transcript must actually be scrollable (else the test proves nothing).
+    assert!(
+        sh > ch + 100.0,
+        "transcript should overflow (scrollHeight {sh} vs clientHeight {ch})"
+    );
+    // And it must have auto-scrolled to (near) the bottom on open.
+    assert!(
+        top >= sh - ch - 80.0,
+        "transcript should be pinned to the bottom on open: scrollTop {top}, max {}",
+        sh - ch
+    );
+
+    Ok(())
+}
+
 async fn seed(pool: &SqlitePool) -> Result<()> {
     let now = Utc::now().timestamp();
 

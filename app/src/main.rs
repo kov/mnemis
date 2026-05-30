@@ -10,12 +10,14 @@ use anyhow::Context;
 use mnemis_engine::config::Config;
 use mnemis_engine::embed::{Embedder, OmlxEmbedder};
 use mnemis_engine::llm::LlmClient;
-use mnemis_engine::{config, db, mutations, orchestrator, queries, settings};
+use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, FeedbackKind, LlmConfigDto, MessageDto,
-    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
+    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, FeedbackKind,
+    LlmConfigDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome,
+    UserProfileDto,
 };
 use sqlx::SqlitePool;
+use tauri::ipc::Channel;
 use tauri::{Manager, State};
 use tracing::{info, warn};
 
@@ -271,6 +273,108 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
     .map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+async fn list_chats(state: State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
+    chat::store::list_chats(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn create_chat(
+    state: State<'_, AppState>,
+    seeded_from_kind: Option<String>,
+    seeded_from_id: Option<i64>,
+) -> Result<i64, String> {
+    chat::create_chat(&state.pool, seeded_from_kind.as_deref(), seeded_from_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_chat_turns(
+    state: State<'_, AppState>,
+    chat_id: i64,
+) -> Result<Vec<ChatTurnDto>, String> {
+    chat::store::load_turns(&state.pool, chat_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// A short label of what a seeded chat is about (or null for a blank chat), so
+/// the UI can show the "Talk about this" context.
+#[tauri::command(rename_all = "snake_case")]
+async fn get_chat_seed(state: State<'_, AppState>, chat_id: i64) -> Result<Option<String>, String> {
+    chat::prompt::seed_label(&state.pool, chat_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Run one chat turn, streaming each loop event to the frontend over `on_event`
+/// (a Tauri typed Channel). Every event is persisted to SQLite *before* it's
+/// sent, so the transcript survives even if the window closes mid-answer.
+#[tauri::command(rename_all = "snake_case")]
+async fn send_chat_message(
+    state: State<'_, AppState>,
+    chat_id: i64,
+    text: String,
+    on_event: Channel<ChatEvent>,
+) -> Result<(), String> {
+    let stack = state
+        .llm_stack
+        .as_ref()
+        .ok_or_else(|| "No LLM configured. Edit ~/.config/mnemis/config.toml.".to_string())?;
+    let system_prompt = chat::prompt::build_system_prompt(&state.pool, chat_id)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    // Forward each engine event to the frontend channel. run_chat_turn already
+    // emits a terminal Error event before returning Err, so the UI sees the
+    // failure either way; we still surface it as a command error for logging.
+    let sink = move |e: ChatEvent| {
+        let _ = on_event.send(e);
+    };
+    chat::run_chat_turn(
+        &state.pool,
+        &stack.llm,
+        &system_prompt,
+        chat_id,
+        &text,
+        stack.window_char_budget,
+        &sink,
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+
+    // Best-effort: give an unseeded chat a real title from its first message.
+    // Detached so it doesn't hold the channel open — the composer re-enables as
+    // soon as this command returns and the `Channel` drops; the title lands in
+    // the list on its next view.
+    let pool = state.pool.clone();
+    let llm = stack.llm.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = chat::maybe_generate_title(&pool, &llm, chat_id, &text).await {
+            tracing::debug!(error = %format!("{e:#}"), "chat title generation failed");
+        }
+    });
+    Ok(())
+}
+
+/// Chat UI preference: show the model's reasoning. Defaults on; persisted in
+/// the `settings` table so it's remembered across runs.
+#[tauri::command]
+async fn get_chat_show_reasoning(state: State<'_, AppState>) -> Result<bool, String> {
+    settings::get_chat_show_reasoning(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_chat_show_reasoning(state: State<'_, AppState>, value: bool) -> Result<(), String> {
+    settings::set_chat_show_reasoning(&state.pool, value)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -389,7 +493,14 @@ fn main() {
             set_channel_muted,
             set_channels_muted_bulk,
             get_llm_config,
-            save_llm_config
+            save_llm_config,
+            list_chats,
+            create_chat,
+            get_chat_turns,
+            get_chat_seed,
+            send_chat_message,
+            get_chat_show_reasoning,
+            set_chat_show_reasoning
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

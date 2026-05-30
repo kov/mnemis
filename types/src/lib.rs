@@ -251,6 +251,61 @@ pub struct PendingResolutionDto {
     pub suggested_at: i64,
 }
 
+/// One persistent conversation in the chat view. `seeded_from_*` records the
+/// entity a "Talk about this" chat was started from (null for a blank chat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatDto {
+    pub id: i64,
+    /// Null until the first user message gives it a title.
+    pub title: Option<String>,
+    /// `'message' | 'action' | 'memory' | 'report'`, or null for a blank chat.
+    pub seeded_from_kind: Option<String>,
+    pub seeded_from_id: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One turn in a chat transcript. A single model response may produce several
+/// turns: an assistant message, plus one row per tool call (role `'assistant'`,
+/// `tool_name`/`tool_call_id` set, `content` = arguments) and one per tool
+/// result (role `'tool'`, `content` = output). The model's reasoning, when
+/// present, rides on the assistant turn it preceded — shown in the UI but never
+/// replayed into the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurnDto {
+    pub id: i64,
+    /// `'user' | 'assistant' | 'tool'`.
+    pub role: String,
+    /// Message text, tool-call arguments, or tool output depending on `role`.
+    pub content: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    /// Captured chain-of-thought for this turn, if any. Display-only.
+    pub reasoning: Option<String>,
+    pub created_at: i64,
+}
+
+/// A live event streamed from a `send_chat_message` turn as the agent loop
+/// runs. Each is persisted to SQLite *before* it's emitted, so the channel is
+/// purely a display accelerator — dropping it never loses data. Tagged by
+/// `kind` so the WASM side can match without a discriminant field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatEvent {
+    /// The model's reasoning for the turn (display-only, never replayed).
+    Reasoning { text: String },
+    /// Assistant-visible text.
+    AssistantMessage { text: String },
+    /// The agent invoked a tool with these JSON arguments.
+    ToolCall { name: String, arguments: String },
+    /// The tool returned (the raw JSON string the model will see next).
+    ToolResult { name: String, output: String },
+    /// The turn finished cleanly — no more events are coming.
+    Done,
+    /// The turn failed; `message` is a human-readable reason.
+    Error { message: String },
+}
+
 /// Map a long, raw error string from the engine (typically an anyhow chain
 /// from `SyncOutcome.errors`) into a short, human-friendly one-liner suitable
 /// for the toast. Falls back to a truncated copy of the raw text for

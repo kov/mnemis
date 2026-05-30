@@ -147,6 +147,46 @@ pub async fn is_first_run(pool: &SqlitePool) -> Result<bool> {
     Ok(count == 0)
 }
 
+/// Read a raw setting value (JSON-encoded) by key from the `settings` k/v
+/// table, `None` when unset.
+pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .context("reading setting")?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// Upsert a setting value (JSON-encoded) by key.
+pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await
+    .context("writing setting")?;
+    Ok(())
+}
+
+const CHAT_SHOW_REASONING_KEY: &str = "chat/show_reasoning";
+
+/// Whether the chat view shows the model's reasoning. Defaults to **on** when
+/// never set; persisted across runs once the user toggles it.
+pub async fn get_chat_show_reasoning(pool: &SqlitePool) -> Result<bool> {
+    Ok(get_setting(pool, CHAT_SHOW_REASONING_KEY)
+        .await?
+        .and_then(|v| serde_json::from_str::<bool>(&v).ok())
+        .unwrap_or(true))
+}
+
+pub async fn set_chat_show_reasoning(pool: &SqlitePool, value: bool) -> Result<()> {
+    set_setting(pool, CHAT_SHOW_REASONING_KEY, &value.to_string()).await
+}
+
 /// All configured sources, in display order, with mute + health columns.
 /// `muted` is true only when *every* channel on the source is muted — partial
 /// mute states show as unmuted at the source row so the source-level
@@ -412,6 +452,20 @@ mod tests {
         let pool = db::open(&tmp.path().join("t.db")).await?;
         db::migrate(&pool).await?;
         Ok((tmp, pool))
+    }
+
+    #[tokio::test]
+    async fn chat_show_reasoning_defaults_on_and_round_trips() -> Result<()> {
+        let (_tmp, pool) = open().await?;
+        // Unset → defaults to on.
+        assert!(get_chat_show_reasoning(&pool).await?);
+        // Turn it off, persists.
+        set_chat_show_reasoning(&pool, false).await?;
+        assert!(!get_chat_show_reasoning(&pool).await?);
+        // And back on (upsert, not duplicate insert).
+        set_chat_show_reasoning(&pool, true).await?;
+        assert!(get_chat_show_reasoning(&pool).await?);
+        Ok(())
     }
 
     #[tokio::test]

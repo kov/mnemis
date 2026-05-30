@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, trace, warn};
 
+use crate::agent;
 use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 use crate::source::Recipient;
 
@@ -14,22 +15,28 @@ pub mod trace;
 
 use mnemis_types::FeedbackKind;
 use prompt::{ExistingAction, FeedbackExample, PromptInputs, WindowMessage};
-use tools::ExtractionScope;
+use tools::ToolScope;
 use trace::TraceWriter;
+
+/// Identifies which channel + source an extraction run is processing. Used for
+/// the loop's logging context; the message tools see only its `source_id` (via
+/// `ToolScope::Source`).
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionScope {
+    pub source_id: i64,
+    pub channel_id: i64,
+}
+
+impl ExtractionScope {
+    /// The tool-layer scope for this run: bound to its source.
+    fn tool_scope(self) -> ToolScope {
+        ToolScope::Source(self.source_id)
+    }
+}
 
 pub const PROMPT_VERSION: i64 = 1;
 const WINDOW_LIMIT: i64 = 100;
 const MAX_AGENT_TURNS: usize = 20;
-
-/// How many times a turn's LLM send is retried when it fails with a *transient*
-/// server stall (empty body / timeout) — 2 retries = 3 attempts total. omlx
-/// stalls when it throttles under memory pressure and clears once it evicts a
-/// model, so the same request usually succeeds within a retry or two.
-const STALL_RETRIES: usize = 2;
-
-/// Base backoff between stall retries, multiplied by the attempt number so the
-/// second retry waits longer — giving omlx time to evict a model and recover.
-const STALL_BACKOFF: Duration = Duration::from_secs(3);
 
 /// Chars of body preview shown per message in the metadata-first window.
 /// The full body is never in the window — the model fetches it on demand
@@ -90,19 +97,6 @@ enum BatchResult {
 /// (omlx: `Prompt too long: N tokens exceeds max context window of M`).
 fn is_context_overflow(err_chain: &str) -> bool {
     err_chain.contains("max context window") || err_chain.contains("Prompt too long")
-}
-
-/// True when an error chain is a *transient* server stall rather than a
-/// deterministic failure: omlx accepts the request, emits an HTTP 200, then
-/// stalls/aborts generation when it throttles under memory pressure — surfacing
-/// as an empty response body or a request/body-read timeout. These clear once
-/// the server recovers (often after it evicts a model), so the turn is safe to
-/// retry. Deterministic failures (context overflow, malformed request) do not
-/// match and bubble straight to the caller. See the `v1-gotchas` memory.
-fn is_transient_stall(err_chain: &str) -> bool {
-    err_chain.contains("empty response body")
-        || err_chain.contains("stalled")
-        || err_chain.contains("timed out")
 }
 
 #[derive(Debug)]
@@ -639,43 +633,22 @@ async fn run_agent_loop(
         }
         trace!(turn, channel_id = scope.channel_id, "LLM: send");
         // A wedged omlx server accepts the request, emits an HTTP 200, then
-        // stalls — surfacing as an empty body or timeout. Often transient, so
-        // retry with backoff before giving up. Deterministic failures (context
-        // overflow, bad request) are not retried — they bubble straight to the
-        // caller's split-down path.
-        let mut attempt = 0usize;
-        let response = loop {
-            match llm
-                .send(&system_prompt, history.clone(), &tool_defs, None)
-                .await
-            {
-                Ok(r) => break r,
-                Err(e) => {
-                    let chain = format!("{e:#}");
-                    if is_transient_stall(&chain) && attempt < STALL_RETRIES {
-                        attempt += 1;
-                        warn!(
-                            turn,
-                            attempt,
-                            channel_id = scope.channel_id,
-                            "LLM stalled (empty body / timeout); retrying after backoff"
-                        );
-                        if let Some(w) = trace.as_deref_mut() {
-                            w.llm_error(
-                                turn,
-                                &format!("transient stall, retry {attempt}: {chain}"),
-                            );
+        // stalls — surfacing as an empty body or timeout. The shared helper
+        // retries transient stalls with backoff (deterministic failures, like
+        // context overflow, bubble straight to the caller's split-down path)
+        // and reports each attempt so we can record it in the trace.
+        let response =
+            agent::send_with_stall_retry(llm, &system_prompt, &history, &tool_defs, turn, |ev| {
+                if let Some(w) = trace.as_deref_mut() {
+                    match ev {
+                        agent::StallEvent::Retry { attempt, error } => {
+                            w.llm_error(turn, &format!("transient stall, retry {attempt}: {error}"))
                         }
-                        tokio::time::sleep(STALL_BACKOFF * attempt as u32).await;
-                        continue;
+                        agent::StallEvent::GaveUp { error } => w.llm_error(turn, error),
                     }
-                    if let Some(w) = trace.as_deref_mut() {
-                        w.llm_error(turn, &chain);
-                    }
-                    return Err(e).with_context(|| format!("LLM send failed on turn {turn}"));
                 }
-            }
-        };
+            })
+            .await?;
         let elapsed = t.elapsed().as_secs();
         if let Some(w) = trace.as_deref_mut() {
             w.llm_recv(turn, elapsed, &response);
@@ -722,7 +695,7 @@ async fn run_agent_loop(
                         text_parts.push(msg);
                     }
                 }
-                OutputItem::Reasoning | OutputItem::Unknown => {}
+                OutputItem::Reasoning { .. } | OutputItem::Unknown => {}
             }
         }
 
@@ -738,7 +711,14 @@ async fn run_agent_loop(
 
         for (call_id, name, arguments) in function_calls {
             debug!(name = %name, call_id = %call_id, "dispatching tool");
-            let out = tools::dispatch(pool, scope, &mut fetch_budget, &name, &arguments).await;
+            let out = tools::dispatch(
+                pool,
+                scope.tool_scope(),
+                &mut fetch_budget,
+                &name,
+                &arguments,
+            )
+            .await;
             if out.recorded_action {
                 actions_created += 1;
             }
@@ -963,7 +943,7 @@ mod tests {
         };
         let out = tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "record_action",
             &args,
@@ -1022,7 +1002,7 @@ mod tests {
         };
         let out = tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "record_action",
             &args,
@@ -1336,7 +1316,11 @@ mod tests {
         let llm = CapturingLlm::new(vec![
             // Turn 0: a reasoning item (must NOT be replayed) + a fetch call.
             crate::test_util::mock::turn(vec![
-                OutputItem::Reasoning,
+                OutputItem::Reasoning {
+                    summary: vec![crate::llm::ReasoningSummary {
+                        text: "should never be replayed".to_string(),
+                    }],
+                },
                 OutputItem::FunctionCall {
                     call_id: "c1".to_string(),
                     name: "fetch_messages".to_string(),
@@ -1489,7 +1473,7 @@ mod tests {
         .to_string();
         let created = tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "record_action",
             &create_args,
@@ -1513,7 +1497,7 @@ mod tests {
         .to_string();
         let updated = tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "update_action",
             &update_args,
@@ -1609,7 +1593,7 @@ mod tests {
         .to_string();
         let out = tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "resolve_action",
             &args,
@@ -1676,7 +1660,7 @@ mod tests {
         .to_string();
         let out = tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "resolve_action",
             &args,
@@ -1858,7 +1842,7 @@ mod tests {
         };
         tools::dispatch(
             &pool,
-            scope,
+            scope.tool_scope(),
             &mut tools::FetchBudget::unlimited(),
             "record_action",
             &args,

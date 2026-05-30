@@ -2,22 +2,24 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
+use leptos::web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, KeyboardEvent};
 use leptos_router::components::A;
+use leptos_router::hooks::{use_navigate, use_params_map};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
-    PendingResolutionDto, ProfileIdentifier, SourceHealth, SourceRowDto, StatusSnapshot,
-    SyncOutcome, UserProfileDto, summarize_sync_error,
+    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
+    FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, ProfileIdentifier, SourceHealth,
+    SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto, summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
 use crate::{
-    FirstRunTick, SyncTick, add_imap_source, confidence_class, confirm_resolution, delete_source,
-    fetch_actions, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
+    ChatStream, ChatUiState, FirstRunTick, SyncTick, add_imap_source, confidence_class,
+    confirm_resolution, create_chat, delete_source, fetch_actions, fetch_chat_seed,
+    fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
     fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
-    reject_resolution, run_sync_now, save_llm_config, save_user_profile, set_channel_muted,
-    set_channels_muted_bulk, set_source_muted, status_label, submit_dismissal_feedback,
-    update_action,
+    reject_resolution, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
+    set_channel_muted, set_channels_muted_bulk, set_chat_show_reasoning, set_source_muted,
+    status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -292,6 +294,7 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                 {show_button(current_status, ActionStatus::Pending).then(|| view! {
                     <button class="btn btn-ghost" on:click=move |_| trigger_reopen(ActionStatus::Pending, None)>"Reopen"</button>
                 })}
+                <TalkAboutButton kind="action" id=id />
             </div>
             <Show when=move || feedback_open.get().is_some() fallback=|| view! { <></> }>
                 {
@@ -593,7 +596,10 @@ fn MessageRow(msg: MessageDto) -> impl IntoView {
                 <span class="message-when">{when}</span>
             </div>
             <div class="message-snippet">{msg.snippet.clone()}</div>
-            <div class="message-meta">{format!("{source} · {channel}")}</div>
+            <div class="message-meta">
+                <span>{format!("{source} · {channel}")}</span>
+                <TalkAboutButton kind="message" id=msg.id />
+            </div>
         </div>
     }
 }
@@ -1311,4 +1317,367 @@ fn render_node(node: ChannelNode, refetch: Arc<dyn Fn() + Send + Sync>) -> AnyVi
     };
 
     view! { <>{row_view}{children_view}</> }.into_any()
+}
+
+// ===================== Chat view (Phase 4) =====================
+
+/// "Talk about this" button: opens a new chat seeded from an entity and
+/// navigates to it. `kind` is `"action"` or `"message"`, `id` the entity's id.
+#[component]
+fn TalkAboutButton(kind: &'static str, id: i64) -> impl IntoView {
+    let navigate = use_navigate();
+    let on_click = move |_| {
+        let navigate = navigate.clone();
+        spawn_local(async move {
+            if let Ok(chat_id) = create_chat(Some(kind.to_string()), Some(id)).await {
+                navigate(&format!("/chats/{chat_id}"), Default::default());
+            }
+        });
+    };
+    view! { <button class="btn btn-ghost" on:click=on_click>"Talk about this"</button> }
+}
+
+/// Chats list + "New chat".
+#[component]
+pub fn ChatsPage() -> impl IntoView {
+    let refresh = RwSignal::new(0u32);
+    let chats = LocalResource::new(move || {
+        let _ = refresh.get();
+        async move { fetch_chats().await }
+    });
+    let navigate = use_navigate();
+    let on_new = move |_| {
+        let navigate = navigate.clone();
+        spawn_local(async move {
+            if let Ok(id) = create_chat(None, None).await {
+                navigate(&format!("/chats/{id}"), Default::default());
+            }
+        });
+    };
+
+    view! {
+        <div class="chats-head">
+            <h1>"Chats"</h1>
+            <button class="btn btn-primary" on:click=on_new>"New chat"</button>
+        </div>
+        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+            {move || chats.get().map(|res| match res {
+                Ok(rows) => view! { <ChatsList rows=rows /> }.into_any(),
+                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+            })}
+        </Suspense>
+    }
+}
+
+#[component]
+fn ChatsList(rows: Vec<ChatDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty">
+                "No chats yet. Start one, or use \u{201c}Talk about this\u{201d} on an action or message."
+            </div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="chat-list">
+            <For
+                each=move || rows.clone()
+                key=|c| c.id
+                children=move |c: ChatDto| {
+                    let title = c.title.clone().unwrap_or_else(|| "(new chat)".to_string());
+                    let href = format!("/chats/{}", c.id);
+                    let seed = c.seeded_from_kind.clone();
+                    view! {
+                        <A href=href attr:class="chat-list-item">
+                            <span class="chat-list-title">{title}</span>
+                            {seed.map(|k| view! { <span class="badge">{k}</span> })}
+                        </A>
+                    }
+                }
+            />
+        </div>
+    }
+    .into_any()
+}
+
+/// A single chat: transcript + streaming input.
+#[component]
+pub fn ChatDetail() -> impl IntoView {
+    let params = use_params_map();
+    let chat_id =
+        Memo::new(move |_| params.read().get("id").and_then(|s| s.parse::<i64>().ok()));
+
+    // Streaming + toggle state lives at app scope so it survives this
+    // component's remount when the user flips to the chats list and back.
+    let ui = use_context::<ChatUiState>().expect("chat ui state context");
+    let ChatUiState {
+        show_reasoning,
+        active_id,
+        pending_user,
+        sending,
+        refresh,
+        error,
+    } = ui;
+
+    let turns = LocalResource::new(move || {
+        // Subscribing to `refresh` makes the transcript refetch when an
+        // in-flight send finishes — even one that finished while this view was
+        // unmounted — so returning to the chat shows the completed answer
+        // instead of a frozen, half-streamed state.
+        let _ = refresh.get();
+        let id = chat_id.get();
+        async move {
+            match id {
+                Some(id) => fetch_chat_turns(id).await,
+                None => Ok(Vec::new()),
+            }
+        }
+    });
+
+    // What a "Talk about this" chat is grounded in (None for a blank chat).
+    let seed = LocalResource::new(move || {
+        let id = chat_id.get();
+        async move {
+            match id {
+                Some(id) => fetch_chat_seed(id).await.ok().flatten(),
+                None => None,
+            }
+        }
+    });
+
+    // Is the in-flight send (if any) for *this* chat? Gates the optimistic
+    // bubble + spinner so another chat's send never shows up here.
+    let is_active = Memo::new(move |_| active_id.get().is_some() && active_id.get() == chat_id.get());
+
+    // Only offer the reasoning toggle when there's actually reasoning to show —
+    // the local model usually inlines its working into the answer and emits no
+    // separate reasoning, so a permanently-inert checkbox would just read as
+    // broken. It lights up for a thinking-capable model.
+    let has_reasoning = Memo::new(move |_| {
+        turns
+            .get()
+            .and_then(|res| res.ok())
+            .map(|rows| {
+                rows.iter()
+                    .any(|t| t.reasoning.as_deref().is_some_and(|r| !r.trim().is_empty()))
+            })
+            .unwrap_or(false)
+    });
+
+    let input_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+
+    let do_send = move || {
+        let Some(id) = chat_id.get() else { return };
+        if sending.get() {
+            return;
+        }
+        let Some(input) = input_ref.get() else { return };
+        let text = input.value();
+        if text.trim().is_empty() {
+            return;
+        }
+        input.set_value("");
+        active_id.set(Some(id));
+        sending.set(true);
+        error.set(None);
+        pending_user.set(Some(text.clone()));
+        send_chat_message(id, text, move |msg| match msg {
+            // A turn-level failure isn't persisted, so surface it off to the
+            // side instead of refetching for it.
+            ChatStream::Event(ChatEvent::Error { message }) => error.set(Some((id, message))),
+            // Each turn was persisted before its event fired, so a refetch shows
+            // exactly what was just streamed. Driving the transcript straight
+            // from the DB (instead of a separate live buffer) means returning to
+            // the chat mid-send can't double the in-flight turns against their
+            // persisted copies.
+            ChatStream::Event(_) => refresh.update(|n| *n += 1),
+            ChatStream::End => {
+                sending.set(false);
+                pending_user.set(None);
+                active_id.set(None);
+                refresh.update(|n| *n += 1);
+            }
+        });
+    };
+
+    // `do_send` only captures Copy handles (signals, NodeRef, Memo), so it's
+    // Copy — both the keydown and click handlers can take their own copy.
+    let on_keydown = move |ev: KeyboardEvent| {
+        if ev.key() == "Enter" && !ev.shift_key() {
+            ev.prevent_default();
+            do_send();
+        }
+    };
+
+    // Sticky scroll: keep the transcript pinned to the newest message while
+    // streaming, but leave it alone once the user scrolls up to read history.
+    let transcript_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    // Whether the view was at (or near) the bottom *before* the latest content
+    // arrived. Updated on every scroll; the effect below re-pins only when true.
+    let at_bottom = RwSignal::new(true);
+    let on_scroll = move |_| {
+        if let Some(el) = transcript_ref.get_untracked() {
+            let dist = el.scroll_height() - el.scroll_top() - el.client_height();
+            at_bottom.set(dist <= 64);
+        }
+    };
+    Effect::new(move |_| {
+        // Re-run after anything that changes the transcript's height. Reading
+        // the resource ties this to the *resolved* turns, so it fires after the
+        // `<For>` has appended the new rows (not before).
+        let _ = turns.get();
+        let _ = refresh.get();
+        let _ = pending_user.get();
+        let _ = sending.get();
+        if at_bottom.get_untracked() {
+            if let Some(el) = transcript_ref.get_untracked() {
+                // Defer past the DOM reconciliation so scroll_height is final.
+                request_animation_frame(move || el.set_scroll_top(el.scroll_height()));
+            }
+        }
+    });
+
+    view! {
+        <div class="chat-detail">
+            <div class="chat-toolbar">
+                <A href="/chats" attr:class="btn btn-ghost">"\u{2190} Chats"</A>
+                {move || has_reasoning.get().then(|| view! {
+                    <label class="chat-reasoning-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=move || show_reasoning.get()
+                            on:change=move |_| {
+                                let next = !show_reasoning.get();
+                                show_reasoning.set(next);
+                                // Persist so it's remembered across runs.
+                                spawn_local(async move {
+                                    let _ = set_chat_show_reasoning(next).await;
+                                });
+                            }
+                        />
+                        " Show reasoning"
+                    </label>
+                })}
+            </div>
+            {move || seed.get().flatten().map(|label| view! {
+                <div class="chat-seed-banner">"About "<b>{label}</b></div>
+            })}
+            <div class="chat-transcript" node_ref=transcript_ref on:scroll=on_scroll>
+                // Transition (not Suspense) so a refetch keeps the current
+                // transcript on screen instead of collapsing to the fallback —
+                // which is what reset the scroll on every streamed event.
+                <Transition fallback=|| view! { <div class="loading">"Loading…"</div> }>
+                    {move || turns.get().map(|res| match res {
+                        Ok(rows) => view! {
+                            <ChatTranscript turns=rows show_reasoning=show_reasoning />
+                        }.into_any(),
+                        Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                    })}
+                </Transition>
+                // Optimistic echo of the just-sent message, so it appears
+                // instantly rather than after the (slow) first model turn. It's
+                // dropped the moment its persisted copy shows up in `turns`,
+                // which is what keeps it from rendering twice.
+                {move || {
+                    if !is_active.get() {
+                        return None;
+                    }
+                    let pending = pending_user.get()?;
+                    let already_persisted = turns
+                        .get()
+                        .and_then(|res| res.ok())
+                        .map(|rows| {
+                            rows.iter().any(|t| {
+                                t.role == "user" && t.content.as_deref() == Some(pending.as_str())
+                            })
+                        })
+                        .unwrap_or(false);
+                    (!already_persisted)
+                        .then(|| view! { <div class="chat-msg chat-user">{pending}</div> })
+                }}
+                {move || (is_active.get() && sending.get()).then(|| view! { <div class="chat-thinking">"\u{2026}"</div> })}
+                // A turn-level failure for *this* chat (survives the spinner
+                // stopping so the user actually sees why it stopped).
+                {move || error.get()
+                    .filter(|(cid, _)| Some(*cid) == chat_id.get())
+                    .map(|(_, msg)| view! { <div class="error chat-error">{msg}</div> })}
+            </div>
+            <div class="chat-input">
+                // The textarea stays enabled while a send runs so the user can
+                // draft their next message; only the Send button is disabled, so
+                // the message can't actually go out until the turn finishes.
+                <textarea
+                    node_ref=input_ref
+                    placeholder="Ask about your actions or messages\u{2026}"
+                    on:keydown=on_keydown
+                />
+                <button
+                    class="btn btn-primary"
+                    on:click=move |_| do_send()
+                    prop:disabled=move || sending.get()
+                >
+                    "Send"
+                </button>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ChatTranscript(turns: Vec<ChatTurnDto>, show_reasoning: RwSignal<bool>) -> impl IntoView {
+    if turns.is_empty() {
+        return view! {
+            <div class="empty">"No messages yet — ask a question to get started."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <For
+            each=move || turns.clone()
+            key=|t| t.id
+            children=move |t: ChatTurnDto| view! {
+                <ChatTurnView turn=t show_reasoning=show_reasoning />
+            }
+        />
+    }
+    .into_any()
+}
+
+#[component]
+fn ChatTurnView(turn: ChatTurnDto, show_reasoning: RwSignal<bool>) -> impl IntoView {
+    let role = turn.role.clone();
+    let content = turn.content.clone().unwrap_or_default();
+    let reasoning = turn.reasoning.clone().filter(|r| !r.trim().is_empty());
+
+    let reasoning_view = reasoning.map(|r| {
+        view! {
+            <div class="chat-reasoning" class:hidden=move || !show_reasoning.get()>
+                <pre>{r}</pre>
+            </div>
+        }
+    });
+
+    let body = match (role.as_str(), turn.tool_name.clone()) {
+        ("user", _) => view! { <div class="chat-msg chat-user">{content}</div> }.into_any(),
+        ("tool", Some(name)) => tool_disclosure(format!("\u{2190} {name}"), content),
+        ("assistant", Some(name)) => tool_disclosure(format!("\u{2192} {name}"), content),
+        ("assistant", None) if !content.is_empty() => {
+            view! { <div class="chat-msg chat-assistant">{content}</div> }.into_any()
+        }
+        _ => ().into_any(),
+    };
+
+    view! { <>{reasoning_view}{body}</> }
+}
+
+/// A collapsed `<details>` block for a tool call or result (Claude-Code style).
+fn tool_disclosure(summary: String, body: String) -> AnyView {
+    view! {
+        <details class="chat-tool">
+            <summary>{summary}</summary>
+            <pre class="chat-tool-body">{body}</pre>
+        </details>
+    }
+    .into_any()
 }
