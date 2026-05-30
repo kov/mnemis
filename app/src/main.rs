@@ -354,6 +354,7 @@ async fn send_chat_message(
     let sink = move |e: ChatEvent| {
         let _ = on_event.send(e);
     };
+    let traces = config::traces_dir_for(&state.db_path);
     chat::run_chat_turn(
         &state.pool,
         &stack.llm,
@@ -362,6 +363,7 @@ async fn send_chat_message(
         &text,
         stack.window_char_budget,
         &sink,
+        Some(&traces),
     )
     .await
     .map_err(|e| format!("{e:#}"))?;

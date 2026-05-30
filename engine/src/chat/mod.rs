@@ -11,7 +11,10 @@
 pub mod prompt;
 pub mod store;
 
+use std::path::Path;
+
 use anyhow::Result;
+use chrono::Utc;
 use sqlx::SqlitePool;
 use tracing::{debug, trace};
 
@@ -19,6 +22,7 @@ use mnemis_types::ChatEvent;
 
 use crate::agent;
 use crate::extract::tools::{self, FetchBudget, ToolScope};
+use crate::extract::trace::TraceWriter;
 use crate::llm::{ContentItem, InputItem, LlmTransport, OutputItem, Role};
 
 /// Max model turns for a single user message before we bail (tool-call loop
@@ -54,6 +58,7 @@ pub async fn create_chat(
 /// the matching event to `sink`. Emits `Done` on a clean finish, or `Error`
 /// (and returns the error) on failure — so a caller that only watches the sink
 /// still learns the outcome.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chat_turn(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
@@ -62,7 +67,12 @@ pub async fn run_chat_turn(
     user_text: &str,
     fetch_budget_chars: usize,
     sink: ChatSink<'_>,
+    traces_dir: Option<&Path>,
 ) -> Result<()> {
+    // One JSONL trace per user message, alongside the extraction traces, so a
+    // "the model had trouble" report can be read back line-by-line.
+    let mut trace =
+        traces_dir.map(|dir| TraceWriter::open_chat(dir, Utc::now().timestamp(), chat_id));
     match run_inner(
         pool,
         llm,
@@ -71,6 +81,7 @@ pub async fn run_chat_turn(
         user_text,
         fetch_budget_chars,
         sink,
+        trace.as_mut(),
     )
     .await
     {
@@ -79,6 +90,9 @@ pub async fn run_chat_turn(
             Ok(())
         }
         Err(e) => {
+            if let Some(w) = trace.as_mut() {
+                w.agent_error(&format!("{e:#}"));
+            }
             sink(ChatEvent::Error {
                 message: format!("{e:#}"),
             });
@@ -87,6 +101,7 @@ pub async fn run_chat_turn(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
@@ -95,6 +110,7 @@ async fn run_inner(
     user_text: &str,
     fetch_budget_chars: usize,
     sink: ChatSink<'_>,
+    mut trace: Option<&mut TraceWriter>,
 ) -> Result<()> {
     // Persist the user's message first; everything else reconstructs from the DB.
     store::append_turn(pool, chat_id, "user", Some(user_text), None, None, None).await?;
@@ -102,14 +118,25 @@ async fn run_inner(
 
     let tool_defs = tools::chat_definitions();
     let mut fetch_budget = FetchBudget::new(fetch_budget_chars);
+    if let Some(w) = trace.as_deref_mut() {
+        w.system_prompt(system_prompt);
+        w.tools(&tool_defs);
+    }
 
     for turn in 0..MAX_CHAT_TURNS {
         // Rebuild the model input from what's persisted (excludes reasoning).
         let history = store::build_history(pool, chat_id).await?;
         trace!(turn, chat_id, "chat LLM: send");
+        if let Some(w) = trace.as_deref_mut() {
+            w.llm_send(turn, &history, None);
+        }
+        let started = std::time::Instant::now();
         let response =
             agent::send_with_stall_retry(llm, system_prompt, &history, &tool_defs, turn, |_| {})
                 .await?;
+        if let Some(w) = trace.as_deref_mut() {
+            w.llm_recv(turn, started.elapsed().as_secs(), &response);
+        }
         let response_id = (!response.id.is_empty()).then(|| response.id.clone());
 
         // Walk the output in order, persisting then emitting. Reasoning rides on
@@ -229,6 +256,9 @@ async fn run_inner(
                 &arguments,
             )
             .await;
+            if let Some(w) = trace.as_deref_mut() {
+                w.tool_dispatch(turn, &call_id, &name, &arguments, &out.output);
+            }
             store::append_turn(
                 pool,
                 chat_id,
@@ -414,6 +444,7 @@ mod tests {
             "what does Ana need?",
             100_000,
             &sink,
+            None,
         )
         .await
         .unwrap();
@@ -463,6 +494,91 @@ mod tests {
         assert!(history.iter().any(
             |i| matches!(i, crate::llm::InputItem::Message { role: Role::User, content } if content.contains("Ana"))
         ));
+    }
+
+    #[tokio::test]
+    async fn run_writes_a_jsonl_trace_when_a_traces_dir_is_given() {
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let ctx = seed_minimal(&pool).await.unwrap();
+        seed_messages(
+            &pool,
+            ctx.source_id,
+            ctx.channel_id,
+            &[SeedMessage {
+                external_id: "m1",
+                author_email: "ana@example.com",
+                author_name: "Ana",
+                subject: "Renewal",
+                body: "Please renew the cert before Friday.",
+                recipients: &[],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let llm = crate::test_util::MockLlm::new(vec![
+            mock::turn(vec![OutputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "fetch_messages".to_string(),
+                arguments: serde_json::json!({ "external_ids": ["m1"] }).to_string(),
+            }]),
+            mock::no_tools("Ana asked you to renew the cert before Friday."),
+        ]);
+
+        let traces = TempDir::new().unwrap();
+        let chat = store::create_chat(&pool, None, None).await.unwrap();
+        let (_events, sink) = collector();
+        run_chat_turn(
+            &pool,
+            &llm,
+            "system",
+            chat,
+            "what does Ana need?",
+            100_000,
+            &sink,
+            Some(traces.path()),
+        )
+        .await
+        .unwrap();
+
+        // One trace file, named for this chat, holding the full transcript.
+        let file = std::fs::read_dir(traces.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(&format!("-chat{chat}.jsonl")))
+            })
+            .expect("a -chat<id>.jsonl trace file should exist");
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
+        for want in [
+            "system_prompt",
+            "tools",
+            "llm_send",
+            "llm_recv",
+            "tool_dispatch",
+        ] {
+            assert!(events.contains(&want), "trace missing {want}: {events:?}");
+        }
+        // The tool dispatch line carries the call's args + output verbatim.
+        let dispatch = lines
+            .iter()
+            .find(|l| l["event"] == "tool_dispatch")
+            .unwrap();
+        assert_eq!(dispatch["name"], "fetch_messages");
+        assert_eq!(dispatch["arguments"]["external_ids"][0], "m1");
+        assert!(
+            dispatch["output"]["messages"].is_array(),
+            "fetch_messages output should be captured: {dispatch}"
+        );
     }
 
     #[tokio::test]
@@ -573,6 +689,7 @@ mod tests {
             "track that I need to renew the cert",
             100_000,
             &sink,
+            None,
         )
         .await
         .unwrap();

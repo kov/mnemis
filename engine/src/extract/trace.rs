@@ -36,7 +36,18 @@ impl TraceWriter {
     /// (no permission, disk full, etc.) returns a no-op writer so callers
     /// don't have to guard every call site.
     pub fn open(traces_dir: &Path, ran_at: i64, channel_id: i64) -> Self {
-        let path = traces_dir.join(format!("{ran_at}-ch{channel_id}.jsonl"));
+        Self::open_named(traces_dir, &format!("{ran_at}-ch{channel_id}.jsonl"))
+    }
+
+    /// Open a chat-run trace at `<traces_dir>/<ran_at>-chat<chat_id>.jsonl`.
+    /// One file per user message; the `chat` prefix distinguishes it from the
+    /// `ch<channel_id>` extraction traces in the same directory.
+    pub fn open_chat(traces_dir: &Path, ran_at: i64, chat_id: i64) -> Self {
+        Self::open_named(traces_dir, &format!("{ran_at}-chat{chat_id}.jsonl"))
+    }
+
+    fn open_named(traces_dir: &Path, filename: &str) -> Self {
+        let path = traces_dir.join(filename);
         let file = (|| -> std::io::Result<File> {
             std::fs::create_dir_all(traces_dir)?;
             OpenOptions::new().create(true).append(true).open(&path)

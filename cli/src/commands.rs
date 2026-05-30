@@ -303,7 +303,18 @@ pub async fn chat(
         ChatEvent::Error { message } => eprintln!("\nerror: {message}"),
     };
 
-    chat::run_chat_turn(&pool, &llm, &system_prompt, chat_id, text, budget, &sink).await?;
+    let traces = cfg.traces_dir();
+    chat::run_chat_turn(
+        &pool,
+        &llm,
+        &system_prompt,
+        chat_id,
+        text,
+        budget,
+        &sink,
+        Some(&traces),
+    )
+    .await?;
     // Best-effort title upgrade for an unseeded chat (matches the app).
     if let Err(e) = chat::maybe_generate_title(&pool, &llm, chat_id, text).await {
         eprintln!("(title generation skipped: {e:#})");
