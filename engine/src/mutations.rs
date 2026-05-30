@@ -99,6 +99,16 @@ pub async fn update_action_status(
         _ => unreachable!("guarded by VALID_TARGETS"),
     }
 
+    // If this action is mirrored as a CalDAV reminder, flag it so the next sync
+    // pushes the status change to the calendar.
+    sqlx::query(
+        "UPDATE actions SET sync_status = 'dirty' \
+         WHERE id = ? AND external_calendar_uid IS NOT NULL",
+    )
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query(
         "INSERT INTO action_events (action_id, event_kind, actor, data_json, occurred_at) \
          VALUES (?, ?, 'user', ?, ?)",
@@ -110,6 +120,40 @@ pub async fn update_action_status(
     .execute(&mut *tx)
     .await?;
 
+    tx.commit().await.context("commit tx")?;
+    Ok(())
+}
+
+/// Set (or change) an action's due date, turning it into a reminder. A new
+/// reminder gets created on the next CalDAV sync (the reconcile create path
+/// keys off `due_at`); an action that's already a reminder is marked `dirty`
+/// so the new due date pushes to the calendar.
+pub async fn promote_to_reminder(pool: &SqlitePool, action_id: i64, due_at: i64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let mut tx = pool.begin().await.context("begin tx")?;
+    let affected = sqlx::query(
+        "UPDATE actions SET due_at = ?, \
+         sync_status = CASE WHEN external_calendar_uid IS NOT NULL THEN 'dirty' ELSE sync_status END \
+         WHERE id = ?",
+    )
+    .bind(due_at)
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await
+    .context("setting due date")?
+    .rows_affected();
+    if affected == 0 {
+        bail!("action {action_id} not found");
+    }
+    sqlx::query(
+        "INSERT INTO action_events (action_id, event_kind, actor, data_json, occurred_at) \
+         VALUES (?, 'updated', 'user', ?, ?)",
+    )
+    .bind(action_id)
+    .bind(serde_json::json!({ "promoted_to_reminder": due_at }).to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await.context("commit tx")?;
     Ok(())
 }
@@ -548,6 +592,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promote_sets_due_and_only_dirties_an_existing_reminder() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+
+        // A plain action (not yet a reminder): due is set, sync_status stays
+        // NULL — the next sync will *create* it because due_at is now present.
+        let plain = seed_action(&pool, "pending").await?;
+        promote_to_reminder(&pool, plain, 1_780_000_000).await?;
+        let (due, sync): (Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT due_at, sync_status FROM actions WHERE id = ?")
+                .bind(plain)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(due, Some(1_780_000_000));
+        assert_eq!(sync, None);
+
+        // An action already mirrored as a reminder: changing its due dirties it.
+        let linked = seed_action(&pool, "pending").await?;
+        sqlx::query(
+            "UPDATE actions SET external_calendar_uid = 'mnemis-x@mnemis', sync_status = 'synced' \
+             WHERE id = ?",
+        )
+        .bind(linked)
+        .execute(&pool)
+        .await?;
+        promote_to_reminder(&pool, linked, 1_780_000_500).await?;
+        let (sync,): (Option<String>,) =
+            sqlx::query_as("SELECT sync_status FROM actions WHERE id = ?")
+                .bind(linked)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(sync.as_deref(), Some("dirty"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_change_dirties_a_linked_reminder() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let id = seed_action(&pool, "pending").await?;
+        sqlx::query(
+            "UPDATE actions SET external_calendar_uid = 'mnemis-x@mnemis', sync_status = 'synced' \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+        update_action_status(&pool, id, ActionStatus::Done, None).await?;
+        let (status, sync): (String, Option<String>) =
+            sqlx::query_as("SELECT status, sync_status FROM actions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(status, "done");
+        assert_eq!(
+            sync.as_deref(),
+            Some("dirty"),
+            "completing a reminder must queue a push"
+        );
         Ok(())
     }
 }

@@ -25,7 +25,7 @@ pub struct ActionFilter {
 pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec<ActionDto>> {
     let sql = if filter.include_resolved {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, '') \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -35,7 +35,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          ORDER BY a.extracted_at DESC"
     } else {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, '') \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -56,13 +56,26 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         Option<i64>,
         String,
         String,
+        Option<String>,
     )> = sqlx::query_as(sql)
         .fetch_all(pool)
         .await
         .context("listing actions")?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, title, details, conf, status, created_at, due_at, channel_name, source_name) in rows {
+    for (
+        id,
+        title,
+        details,
+        conf,
+        status,
+        created_at,
+        due_at,
+        channel_name,
+        source_name,
+        sync_status,
+    ) in rows
+    {
         let evidence_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM action_evidence WHERE action_id = ?")
                 .bind(id)
@@ -88,6 +101,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
             } else {
                 Some(source_name)
             },
+            sync_status,
         });
     }
     Ok(out)

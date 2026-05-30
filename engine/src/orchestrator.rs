@@ -128,6 +128,28 @@ pub async fn sync_now(
         Err(e) => warn!(error = format!("{e:#}"), "final embed drain failed"),
     }
 
+    // Push newly-due actions + pull calendar-side changes. Best-effort: a
+    // CalDAV failure (or no account configured) must not fail the whole sync.
+    match sync_calendar_if_configured(pool).await {
+        Ok(Some(s)) => {
+            info!(
+                created = s.created,
+                pushed = s.pushed,
+                pulled = s.pulled,
+                removed = s.removed,
+                conflicts = s.conflicts,
+                "caldav sync"
+            );
+            out.errors
+                .extend(s.errors.into_iter().map(|e| format!("caldav: {e}")));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = format!("{e:#}"), "caldav sync failed");
+            out.errors.push(format!("caldav sync: {e:#}"));
+        }
+    }
+
     info!(
         sources_synced = out.sources_synced,
         sources_failed = out.sources_failed,
@@ -371,6 +393,29 @@ pub async fn build_imap_source(pool: &SqlitePool, source_id: SourceId) -> Result
             password,
         },
     ))
+}
+
+/// Run a CalDAV reminder sync iff an account *and* a task collection are
+/// configured. Returns `None` when CalDAV isn't set up (account absent, or no
+/// collection picked yet) so callers can stay silent; otherwise the reconcile
+/// summary. Builds the backend from the persisted account + keychain password,
+/// mirroring [`build_imap_source`].
+pub async fn sync_calendar_if_configured(
+    pool: &SqlitePool,
+) -> Result<Option<crate::sync::reconcile::SyncSummary>> {
+    let Some(account) = crate::settings::load_caldav_account(pool).await? else {
+        return Ok(None);
+    };
+    let Some(collection_url) = account.collection_url.as_deref() else {
+        return Ok(None);
+    };
+    let password = secrets::fetch(&account.keychain_ref)
+        .await
+        .with_context(|| format!("fetching keychain entry {}", account.keychain_ref))?;
+    let backend =
+        crate::sync::caldav::CaldavBackend::new(collection_url, &account.username, &password)?;
+    let summary = crate::sync::reconcile::sync_caldav(pool, &backend).await?;
+    Ok(Some(summary))
 }
 
 pub async fn mark_source_ok(pool: &SqlitePool, source_id: i64) -> Result<()> {

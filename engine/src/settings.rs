@@ -4,7 +4,10 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use mnemis_types::{ChannelRowDto, ProfileIdentifier, SourceHealth, SourceRowDto, UserProfileDto};
+use mnemis_types::{
+    CaldavAccountDto, ChannelRowDto, ProfileIdentifier, SourceHealth, SourceRowDto, UserProfileDto,
+};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::secrets;
@@ -441,6 +444,112 @@ pub async fn add_imap_source(
     Ok(source_id)
 }
 
+const CALDAV_ACCOUNT_KEY: &str = "caldav/account";
+
+/// The persisted CalDAV account (engine-internal). The app-specific password
+/// lives in the keychain under `keychain_ref`, never here. `collection_url` is
+/// `None` until the user discovers + picks a task list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaldavAccount {
+    pub base_url: String,
+    pub username: String,
+    pub keychain_ref: String,
+    #[serde(default)]
+    pub collection_url: Option<String>,
+    #[serde(default)]
+    pub collection_name: Option<String>,
+}
+
+/// Load the singleton CalDAV account, `None` when none is configured.
+pub async fn load_caldav_account(pool: &SqlitePool) -> Result<Option<CaldavAccount>> {
+    let Some(raw) = get_setting(pool, CALDAV_ACCOUNT_KEY).await? else {
+        return Ok(None);
+    };
+    let account = serde_json::from_str(&raw).context("parsing stored CalDAV account")?;
+    Ok(Some(account))
+}
+
+/// Settings-facing view of the account (no secrets, plus a `configured` flag).
+pub async fn get_caldav_account(pool: &SqlitePool) -> Result<CaldavAccountDto> {
+    match load_caldav_account(pool).await? {
+        Some(a) => Ok(CaldavAccountDto {
+            base_url: a.base_url,
+            username: a.username,
+            collection_url: a.collection_url,
+            collection_name: a.collection_name,
+            configured: true,
+        }),
+        None => Ok(CaldavAccountDto::default()),
+    }
+}
+
+/// Store (or replace) the CalDAV account: stash the password in the keychain,
+/// persist the rest as JSON in `settings`. Discovery of the task collection is
+/// deferred to a separate step (it needs a network round-trip), mirroring how
+/// IMAP defers mailbox discovery to the first sync.
+pub async fn add_caldav_account(
+    pool: &SqlitePool,
+    base_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "caldav".to_owned());
+    let keychain_ref = format!("caldav/{username}@{host}");
+    secrets::store(&keychain_ref, password)
+        .await
+        .context("storing CalDAV password in keychain")?;
+
+    let account = CaldavAccount {
+        base_url: base_url.to_owned(),
+        username: username.to_owned(),
+        keychain_ref,
+        collection_url: None,
+        collection_name: None,
+    };
+    set_setting(
+        pool,
+        CALDAV_ACCOUNT_KEY,
+        &serde_json::to_string(&account).context("serializing CalDAV account")?,
+    )
+    .await
+}
+
+/// Record the chosen task collection after discovery.
+pub async fn set_caldav_collection(
+    pool: &SqlitePool,
+    url: &str,
+    display_name: Option<&str>,
+) -> Result<()> {
+    let mut account = load_caldav_account(pool)
+        .await?
+        .context("no CalDAV account configured")?;
+    account.collection_url = Some(url.to_owned());
+    account.collection_name = display_name.map(str::to_owned);
+    set_setting(
+        pool,
+        CALDAV_ACCOUNT_KEY,
+        &serde_json::to_string(&account).context("serializing CalDAV account")?,
+    )
+    .await
+}
+
+/// Forget the CalDAV account: drop the settings row and the keychain entry.
+pub async fn delete_caldav_account(pool: &SqlitePool) -> Result<()> {
+    if let Some(account) = load_caldav_account(pool).await? {
+        // Best-effort: a missing keychain entry shouldn't block forgetting.
+        let _ = secrets::delete(&account.keychain_ref).await;
+    }
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(CALDAV_ACCOUNT_KEY)
+        .execute(pool)
+        .await
+        .context("deleting CalDAV account setting")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +892,47 @@ mod tests {
         delete_source(&pool, sid).await?;
         let rows = list_sources(&pool).await?;
         assert!(rows.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caldav_account_view_and_collection_round_trip() -> Result<()> {
+        // Exercises the non-secret paths (no keychain needed): seed the account
+        // JSON directly, then read it back, set a collection, and delete.
+        let (_tmp, pool) = open().await?;
+        assert!(!get_caldav_account(&pool).await?.configured);
+
+        let acct = CaldavAccount {
+            base_url: "https://caldav.icloud.com".into(),
+            username: "me@icloud.com".into(),
+            keychain_ref: "caldav/me@icloud.com@caldav.icloud.com".into(),
+            collection_url: None,
+            collection_name: None,
+        };
+        set_setting(&pool, CALDAV_ACCOUNT_KEY, &serde_json::to_string(&acct)?).await?;
+
+        let dto = get_caldav_account(&pool).await?;
+        assert!(dto.configured);
+        assert_eq!(dto.username, "me@icloud.com");
+        assert_eq!(dto.collection_url, None);
+
+        set_caldav_collection(
+            &pool,
+            "https://p1.icloud.com/1/calendars/reminders/",
+            Some("Reminders"),
+        )
+        .await?;
+        let dto = get_caldav_account(&pool).await?;
+        assert_eq!(
+            dto.collection_url.as_deref(),
+            Some("https://p1.icloud.com/1/calendars/reminders/")
+        );
+        assert_eq!(dto.collection_name.as_deref(), Some("Reminders"));
+
+        // delete drops the row (the keychain delete is best-effort, so this
+        // works even without a Secret Service available).
+        delete_caldav_account(&pool).await?;
+        assert!(!get_caldav_account(&pool).await?.configured);
         Ok(())
     }
 }

@@ -53,3 +53,28 @@ pub async fn fetch(reference: &str) -> Result<String> {
     let bytes = item.get_secret().await.context("reading secret value")?;
     String::from_utf8(bytes).context("secret was not valid UTF-8")
 }
+
+/// Delete every secret stored under `reference`. A missing entry is not an
+/// error — the post-condition (no such secret) already holds.
+pub async fn delete(reference: &str) -> Result<()> {
+    let ss = SecretService::connect(EncryptionType::Dh)
+        .await
+        .context("connecting to Secret Service")?;
+    let collection = ss
+        .get_default_collection()
+        .await
+        .context("opening default keychain collection")?;
+    if collection.is_locked().await.unwrap_or(false) {
+        collection.unlock().await.ok();
+    }
+    let attrs: HashMap<&str, &str> =
+        HashMap::from([("application", APPLICATION), ("ref", reference)]);
+    let items = collection
+        .search_items(attrs)
+        .await
+        .context("searching secrets")?;
+    for item in items {
+        item.delete().await.context("deleting secret")?;
+    }
+    Ok(())
+}
