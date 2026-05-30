@@ -7,6 +7,7 @@
   --high: #2d7a4f;
   --medium: #b18a23;
   --low: #707070;
+  --danger: #c0392b;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -19,6 +20,7 @@
     --high: #6dc18d;
     --medium: #d6b76b;
     --low: #888;
+    --danger: #e06c5e;
   }
 }
 
@@ -321,6 +323,16 @@ h1 {
   filter: none;
 }
 
+.btn-sm {
+  font-size: 11px;
+  padding: 2px 7px;
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
 .action-details {
   font-size: 13px;
   color: var(--fg);
@@ -392,12 +404,45 @@ h1 {
   justify-content: space-between;
   gap: 1rem;
 }
+.chats-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.chat-show-archived {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
 
 .chat-list {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
   margin-top: 0.5rem;
+}
+.chat-list-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.chat-list-row .chat-list-item {
+  flex: 1;
+}
+.chat-list-row.chat-archived .chat-list-item {
+  opacity: 0.55;
+}
+.chat-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+.chat-confirm {
+  font-size: 11px;
+  color: var(--muted);
 }
 .chat-list-item {
   display: flex;

@@ -263,6 +263,9 @@ pub struct ChatDto {
     pub seeded_from_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Hidden from the default chat list; still listed when the user opts to
+    /// show archived chats.
+    pub archived: bool,
 }
 
 /// One turn in a chat transcript. A single model response may produce several

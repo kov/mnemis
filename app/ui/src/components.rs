@@ -17,12 +17,12 @@ use wasm_bindgen::JsCast;
 use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
     ChatStream, ChatUiState, FirstRunTick, SyncTick, add_imap_source, confidence_class,
-    confirm_resolution, create_chat, delete_source, fetch_actions, fetch_chat_seed,
+    confirm_resolution, create_chat, delete_chat, delete_source, fetch_actions, fetch_chat_seed,
     fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
     fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile, open_external,
     reject_resolution, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
-    set_channel_muted, set_channels_muted_bulk, set_chat_show_reasoning, set_source_muted,
-    status_label, submit_dismissal_feedback, update_action,
+    set_channel_muted, set_channels_muted_bulk, set_chat_archived, set_chat_show_reasoning,
+    set_source_muted, status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -1340,9 +1340,11 @@ fn TalkAboutButton(kind: &'static str, id: i64) -> impl IntoView {
 #[component]
 pub fn ChatsPage() -> impl IntoView {
     let refresh = RwSignal::new(0u32);
+    let show_archived = RwSignal::new(false);
     let chats = LocalResource::new(move || {
         let _ = refresh.get();
-        async move { fetch_chats().await }
+        let include_archived = show_archived.get();
+        async move { fetch_chats(include_archived).await }
     });
     let navigate = use_navigate();
     let on_new = move |_| {
@@ -1357,11 +1359,21 @@ pub fn ChatsPage() -> impl IntoView {
     view! {
         <div class="chats-head">
             <h1>"Chats"</h1>
-            <button class="btn btn-primary" on:click=on_new>"New chat"</button>
+            <div class="chats-head-actions">
+                <label class="chat-show-archived">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || show_archived.get()
+                        on:change=move |_| show_archived.update(|v| *v = !*v)
+                    />
+                    " Show archived"
+                </label>
+                <button class="btn btn-primary" on:click=on_new>"New chat"</button>
+            </div>
         </div>
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
             {move || chats.get().map(|res| match res {
-                Ok(rows) => view! { <ChatsList rows=rows /> }.into_any(),
+                Ok(rows) => view! { <ChatsList rows=rows refresh=refresh /> }.into_any(),
                 Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
             })}
         </Suspense>
@@ -1369,7 +1381,7 @@ pub fn ChatsPage() -> impl IntoView {
 }
 
 #[component]
-fn ChatsList(rows: Vec<ChatDto>) -> impl IntoView {
+fn ChatsList(rows: Vec<ChatDto>, refresh: RwSignal<u32>) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty">
@@ -1382,19 +1394,68 @@ fn ChatsList(rows: Vec<ChatDto>) -> impl IntoView {
         <div class="chat-list">
             <For
                 each=move || rows.clone()
-                key=|c| c.id
-                children=move |c: ChatDto| {
-                    let title = c.title.clone().unwrap_or_else(|| "(new chat)".to_string());
-                    let href = format!("/chats/{}", c.id);
-                    let seed = c.seeded_from_kind.clone();
-                    view! {
-                        <A href=href attr:class="chat-list-item">
-                            <span class="chat-list-title">{title}</span>
-                            {seed.map(|k| view! { <span class="badge">{k}</span> })}
-                        </A>
-                    }
-                }
+                key=|c| (c.id, c.archived)
+                children=move |c: ChatDto| view! { <ChatRow chat=c refresh=refresh /> }
             />
+        </div>
+    }
+    .into_any()
+}
+
+/// One row in the chat list: the title link plus archive and delete controls.
+/// Delete is two-step (a click reveals a confirm) so a misclick can't nuke a
+/// conversation. Both mutations bump `refresh` to refetch the list.
+#[component]
+fn ChatRow(chat: ChatDto, refresh: RwSignal<u32>) -> impl IntoView {
+    let id = chat.id;
+    let archived = chat.archived;
+    let title = chat
+        .title
+        .clone()
+        .unwrap_or_else(|| "(new chat)".to_string());
+    let href = format!("/chats/{id}");
+    let seed = chat.seeded_from_kind.clone();
+    let confirming = RwSignal::new(false);
+
+    let on_archive = move |_| {
+        spawn_local(async move {
+            let _ = set_chat_archived(id, !archived).await;
+            refresh.update(|n| *n += 1);
+        });
+    };
+
+    view! {
+        <div class="chat-list-row" class:chat-archived=archived attr:data-chat-id=id.to_string()>
+            <A href=href attr:class="chat-list-item">
+                <span class="chat-list-title">{title}</span>
+                {seed.map(|k| view! { <span class="badge">{k}</span> })}
+            </A>
+            <div class="chat-list-actions">
+                <button class="btn btn-ghost btn-sm" on:click=on_archive>
+                    {if archived { "Unarchive" } else { "Archive" }}
+                </button>
+                {move || if confirming.get() {
+                    let on_confirm = move |_| {
+                        spawn_local(async move {
+                            let _ = delete_chat(id).await;
+                            refresh.update(|n| *n += 1);
+                        });
+                    };
+                    let on_cancel = move |_| confirming.set(false);
+                    view! {
+                        <span class="chat-confirm">"Delete?"</span>
+                        <button class="btn btn-sm btn-danger" on:click=on_confirm>"Yes"</button>
+                        <button class="btn btn-ghost btn-sm" on:click=on_cancel>"No"</button>
+                    }
+                    .into_any()
+                } else {
+                    let on_ask = move |_| confirming.set(true);
+                    view! {
+                        <button class="btn btn-ghost btn-sm" on:click=on_ask>"Delete"</button>
+                    }
+                    .into_any()
+                }}
+            </div>
         </div>
     }
     .into_any()

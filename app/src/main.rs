@@ -273,9 +273,30 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
     .map_err(|e| format!("{e:#}"))
 }
 
-#[tauri::command]
-async fn list_chats(state: State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
-    chat::store::list_chats(&state.pool)
+#[tauri::command(rename_all = "snake_case")]
+async fn list_chats(
+    state: State<'_, AppState>,
+    include_archived: bool,
+) -> Result<Vec<ChatDto>, String> {
+    chat::store::list_chats(&state.pool, include_archived)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_chat_archived(
+    state: State<'_, AppState>,
+    chat_id: i64,
+    archived: bool,
+) -> Result<(), String> {
+    chat::store::set_archived(&state.pool, chat_id, archived)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn delete_chat(state: State<'_, AppState>, chat_id: i64) -> Result<(), String> {
+    chat::store::delete_chat(&state.pool, chat_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -499,6 +520,8 @@ fn main() {
             save_llm_config,
             list_chats,
             create_chat,
+            set_chat_archived,
+            delete_chat,
             get_chat_turns,
             get_chat_seed,
             send_chat_message,

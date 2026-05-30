@@ -39,29 +39,64 @@ pub async fn create_chat(
     Ok(id)
 }
 
-/// List non-archived chats, most-recently-active first.
-pub async fn list_chats(pool: &SqlitePool) -> Result<Vec<ChatDto>> {
+/// List chats most-recently-active first. Archived chats are excluded unless
+/// `include_archived` is set, in which case they sort after the active ones.
+pub async fn list_chats(pool: &SqlitePool, include_archived: bool) -> Result<Vec<ChatDto>> {
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, Option<String>, Option<String>, Option<i64>, i64, i64)> = sqlx::query_as(
-        "SELECT id, title, seeded_from_kind, seeded_from_id, created_at, updated_at \
-         FROM chats WHERE archived = 0 ORDER BY updated_at DESC",
+    let rows: Vec<(
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT id, title, seeded_from_kind, seeded_from_id, created_at, updated_at, archived \
+             FROM chats WHERE (? OR archived = 0) ORDER BY archived ASC, updated_at DESC",
     )
+    .bind(include_archived)
     .fetch_all(pool)
     .await
     .context("listing chats")?;
     Ok(rows
         .into_iter()
         .map(
-            |(id, title, seeded_from_kind, seeded_from_id, created_at, updated_at)| ChatDto {
-                id,
-                title,
-                seeded_from_kind,
-                seeded_from_id,
-                created_at,
-                updated_at,
+            |(id, title, seeded_from_kind, seeded_from_id, created_at, updated_at, archived)| {
+                ChatDto {
+                    id,
+                    title,
+                    seeded_from_kind,
+                    seeded_from_id,
+                    created_at,
+                    updated_at,
+                    archived: archived != 0,
+                }
             },
         )
         .collect())
+}
+
+/// Archive or unarchive a chat (toggles whether it shows in the default list).
+pub async fn set_archived(pool: &SqlitePool, chat_id: i64, archived: bool) -> Result<()> {
+    sqlx::query("UPDATE chats SET archived = ? WHERE id = ?")
+        .bind(archived as i64)
+        .bind(chat_id)
+        .execute(pool)
+        .await
+        .context("archiving chat")?;
+    Ok(())
+}
+
+/// Permanently delete a chat. Its turns and reasoning rows cascade away via the
+/// `ON DELETE CASCADE` foreign keys (foreign_keys is enabled on the pool).
+pub async fn delete_chat(pool: &SqlitePool, chat_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM chats WHERE id = ?")
+        .bind(chat_id)
+        .execute(pool)
+        .await
+        .context("deleting chat")?;
+    Ok(())
 }
 
 /// One chat's transcript in display order, each turn carrying its reasoning
@@ -348,9 +383,10 @@ mod tests {
         assert_eq!(call.reasoning.as_deref(), Some("let me look it up"));
 
         // Title was derived from the first user message.
-        let chats = list_chats(&pool).await.unwrap();
+        let chats = list_chats(&pool, false).await.unwrap();
         assert_eq!(chats[0].title.as_deref(), Some("why flagged?"));
         assert_eq!(chats[0].seeded_from_kind.as_deref(), Some("action"));
+        assert!(!chats[0].archived);
 
         // Reconstructed history maps roles and OMITS reasoning entirely.
         let history = build_history(&pool, chat).await.unwrap();
@@ -380,6 +416,69 @@ mod tests {
         assert!(
             !serialized.contains("let me look it up"),
             "reasoning must never appear in reconstructed history: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_hides_from_default_list_and_delete_cascades() {
+        let (_tmp, pool) = empty_db().await;
+
+        let keep = create_chat(&pool, None, None).await.unwrap();
+        let gone = create_chat(&pool, None, None).await.unwrap();
+        // Give `gone` a turn + reasoning so we can prove the cascade deletes them.
+        let turn = append_turn(&pool, gone, "user", Some("hi"), None, None, None)
+            .await
+            .unwrap();
+        append_reasoning(&pool, turn, "thinking").await.unwrap();
+
+        // Archive `keep`: it drops out of the default list but shows when asked.
+        set_archived(&pool, keep, true).await.unwrap();
+        let default = list_chats(&pool, false).await.unwrap();
+        assert!(
+            default.iter().all(|c| c.id != keep),
+            "archived chat must not appear in the default list"
+        );
+        let all = list_chats(&pool, true).await.unwrap();
+        let archived = all.iter().find(|c| c.id == keep).unwrap();
+        assert!(
+            archived.archived,
+            "include_archived should surface it as archived"
+        );
+
+        // Unarchive brings it back to the default list.
+        set_archived(&pool, keep, false).await.unwrap();
+        assert!(
+            list_chats(&pool, false)
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.id == keep)
+        );
+
+        // Delete `gone`: the chat and its turns + reasoning all disappear.
+        delete_chat(&pool, gone).await.unwrap();
+        assert!(
+            list_chats(&pool, true)
+                .await
+                .unwrap()
+                .iter()
+                .all(|c| c.id != gone)
+        );
+        let (turns,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chat_turns WHERE chat_id = ?")
+            .bind(gone)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(turns, 0, "turns should cascade-delete with the chat");
+        let (reasoning,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM chat_turn_reasoning WHERE turn_id = ?")
+                .bind(turn)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            reasoning, 0,
+            "reasoning should cascade-delete with its turn"
         );
     }
 }

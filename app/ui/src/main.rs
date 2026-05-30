@@ -311,11 +311,41 @@ pub async fn submit_dismissal_feedback(
     Ok(())
 }
 
-pub async fn fetch_chats() -> Result<Vec<ChatDto>, String> {
-    let raw = invoke("list_chats", JsValue::NULL)
+#[derive(Serialize)]
+struct ListChatsArgs {
+    include_archived: bool,
+}
+
+pub async fn fetch_chats(include_archived: bool) -> Result<Vec<ChatDto>, String> {
+    let args = serde_wasm_bindgen::to_value(&ListChatsArgs { include_archived })
+        .map_err(|e| e.to_string())?;
+    let raw = invoke("list_chats", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     serde_wasm_bindgen::from_value::<Vec<ChatDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SetChatArchivedArgs {
+    chat_id: i64,
+    archived: bool,
+}
+
+pub async fn set_chat_archived(chat_id: i64, archived: bool) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&SetChatArchivedArgs { chat_id, archived })
+        .map_err(|e| e.to_string())?;
+    invoke("set_chat_archived", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+pub async fn delete_chat(chat_id: i64) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&ChatIdArgs { chat_id }).map_err(|e| e.to_string())?;
+    invoke("delete_chat", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
 }
 
 #[derive(Serialize)]

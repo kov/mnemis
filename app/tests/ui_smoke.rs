@@ -1461,7 +1461,7 @@ async fn chat_view_lists_and_renders_a_seeded_transcript() -> Result<()> {
 
         // Pre-flight: the app's queries see the chat + its turns.
         assert_eq!(
-            store::list_chats(&pool).await?.len(),
+            store::list_chats(&pool, false).await?.len(),
             1,
             "pre-flight: one chat"
         );
@@ -1688,6 +1688,145 @@ async fn chat_view_marks_tool_calls_and_results_distinctly() -> Result<()> {
     assert!(
         html.contains('\u{25B6}') && html.contains('\u{25C0}'),
         "both triangle markers should render. html: {html}"
+    );
+
+    Ok(())
+}
+
+/// Polish: a chat can be archived (drops out of the default list, returns under
+/// "Show archived") and permanently deleted via a two-step confirm. No LLM.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_list_archive_and_delete() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-archive.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Smoke Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        let chat_id = store::create_chat(&pool, None, None).await?;
+        store::set_title(&pool, chat_id, "archive me please").await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await
+        .context("waiting for nav.nav")?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/chats"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.chat-list-row"))
+        .await
+        .context("waiting for the chat row")?;
+
+    let listed = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        listed.contains("archive me please"),
+        "the chat should be listed before archiving"
+    );
+
+    // Archive it → it leaves the default list.
+    client
+        .execute(
+            r#"Array.from(document.querySelectorAll('.chat-list-actions button'))
+                 .find(b => b.textContent.trim() === 'Archive').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after_archive = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        !after_archive.contains("archive me please"),
+        "archived chat should drop out of the default list"
+    );
+
+    // Flip "Show archived" → it comes back, now offering Unarchive.
+    client
+        .execute(
+            r#"document.querySelector('.chat-show-archived input').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.chat-list-row"))
+        .await
+        .context("archived chat should reappear under Show archived")?;
+    let html = client
+        .find(Locator::Css("body"))
+        .await?
+        .html(true)
+        .await
+        .unwrap_or_default();
+    assert!(
+        html.contains("Unarchive"),
+        "an archived chat should offer Unarchive. html: {html}"
+    );
+
+    // Delete it: first click reveals the confirm, then "Yes" removes it for good.
+    client
+        .execute(
+            r#"Array.from(document.querySelectorAll('.chat-list-actions button'))
+                 .find(b => b.textContent.trim() === 'Delete').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client
+        .execute(
+            r#"Array.from(document.querySelectorAll('.chat-list-actions button'))
+                 .find(b => b.textContent.trim() === 'Yes').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after_delete = client
+        .find(Locator::Css("body"))
+        .await?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        !after_delete.contains("archive me please"),
+        "deleted chat should be gone even with Show archived on"
     );
 
     Ok(())
