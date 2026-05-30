@@ -1570,6 +1570,129 @@ async fn chat_view_lists_and_renders_a_seeded_transcript() -> Result<()> {
     Ok(())
 }
 
+/// Phase 4: a tool call and its result render as two separate, color-coded
+/// disclosures — a blue ▶ for the agent's call and a green ◀ for the reply.
+/// No LLM needed — runs under MNEMIS_DISABLE_LLM.
+#[tokio::test(flavor = "current_thread")]
+async fn chat_view_marks_tool_calls_and_results_distinctly() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-tools.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Smoke Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        let chat_id = store::create_chat(&pool, None, None).await?;
+        let q = "anything from the last 2 days?";
+        store::append_turn(&pool, chat_id, "user", Some(q), None, None, None).await?;
+        store::ensure_title(&pool, chat_id, q).await?;
+        // The agent's tool call, then the tool's reply — two separate rows.
+        store::append_turn(
+            &pool,
+            chat_id,
+            "assistant",
+            Some(r#"{"since":"2026-05-28"}"#),
+            Some("list_messages"),
+            Some("call-1"),
+            None,
+        )
+        .await?;
+        store::append_turn(
+            &pool,
+            chat_id,
+            "tool",
+            Some(r#"{"messages":[],"has_more":false}"#),
+            Some("list_messages"),
+            Some("call-1"),
+            None,
+        )
+        .await?;
+        store::append_turn(
+            &pool,
+            chat_id,
+            "assistant",
+            Some("Nothing new in the last two days."),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await
+        .context("waiting for nav.nav")?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/chats"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("a.chat-list-item"))
+        .await
+        .context("waiting for a.chat-list-item")?;
+    client
+        .execute(
+            r#"document.querySelector('a.chat-list-item').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("details.chat-tool"))
+        .await
+        .context("waiting for a tool disclosure")?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let html = client
+        .find(Locator::Css("body"))
+        .await?
+        .html(true)
+        .await
+        .unwrap_or_default();
+
+    // Call and result are distinct, color-coded disclosures.
+    assert!(
+        html.contains("chat-tool-call"),
+        "the call should carry the call marker class. html: {html}"
+    );
+    assert!(
+        html.contains("chat-tool-result"),
+        "the result should carry the result marker class. html: {html}"
+    );
+    // The triangle glyphs (▶ call, ◀ result) the user picked over thin arrows.
+    assert!(
+        html.contains('\u{25B6}') && html.contains('\u{25C0}'),
+        "both triangle markers should render. html: {html}"
+    );
+
+    Ok(())
+}
+
 /// Phase 4: the model answers in markdown, so the assistant bubble renders it
 /// as formatted HTML — and because that markdown can carry prompt-injected
 /// markup from ingested mail, the render is sanitized: raw `<script>` is

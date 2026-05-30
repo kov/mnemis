@@ -594,6 +594,19 @@ h1 {
   cursor: pointer;
   font-family: ui-monospace, monospace;
 }
+/* Direction marker: ▶ for the agent's outgoing call, ◀ for the tool's reply,
+   color-coded so the two read apart at a glance. */
+.chat-tool-arrow {
+  font-style: normal;
+  font-size: 0.8em;
+  margin-right: 0.1rem;
+}
+.chat-tool-call {
+  color: var(--accent);
+}
+.chat-tool-result {
+  color: var(--high);
+}
 .chat-tool-body {
   white-space: pre-wrap;
   word-break: break-word;

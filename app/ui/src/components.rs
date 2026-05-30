@@ -1659,8 +1659,8 @@ fn ChatTurnView(turn: ChatTurnDto, show_reasoning: RwSignal<bool>) -> impl IntoV
 
     let body = match (role.as_str(), turn.tool_name.clone()) {
         ("user", _) => view! { <div class="chat-msg chat-user">{content}</div> }.into_any(),
-        ("tool", Some(name)) => tool_disclosure(format!("\u{2190} {name}"), content),
-        ("assistant", Some(name)) => tool_disclosure(format!("\u{2192} {name}"), content),
+        ("tool", Some(name)) => tool_disclosure(false, name, content),
+        ("assistant", Some(name)) => tool_disclosure(true, name, content),
         ("assistant", None) if !content.is_empty() => {
             // The model answers in markdown; render it as sanitized HTML so
             // formatting (lists, code, links) shows the way the user expects.
@@ -1702,10 +1702,21 @@ fn open_link_externally(ev: MouseEvent) {
 }
 
 /// A collapsed `<details>` block for a tool call or result (Claude-Code style).
-fn tool_disclosure(summary: String, body: String) -> AnyView {
+/// `is_call` picks the direction marker and its color: a blue ▶ for the agent's
+/// outgoing call, a green ◀ for the tool's reply.
+fn tool_disclosure(is_call: bool, name: String, body: String) -> AnyView {
+    let (marker, marker_class) = if is_call {
+        ("\u{25B6}", "chat-tool-arrow chat-tool-call")
+    } else {
+        ("\u{25C0}", "chat-tool-arrow chat-tool-result")
+    };
     view! {
         <details class="chat-tool">
-            <summary>{summary}</summary>
+            <summary>
+                <span class=marker_class>{marker}</span>
+                " "
+                {name}
+            </summary>
             <pre class="chat-tool-body">{body}</pre>
         </details>
     }
