@@ -173,6 +173,41 @@ pub struct ActionDto {
     pub channel_name: Option<String>,
     /// Source display name (e.g. `fastmail`).
     pub source_name: Option<String>,
+    /// CalDAV reminder sync state, when this action is (or was) a reminder:
+    /// `synced` | `dirty` | `needs_review`. `None` means it isn't a reminder.
+    pub sync_status: Option<String>,
+}
+
+/// CalDAV account as shown in settings. Secrets (the app-specific password)
+/// never cross this boundary — they live in the OS keychain.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaldavAccountDto {
+    pub base_url: String,
+    pub username: String,
+    /// The chosen task collection's URL, once discovered + selected.
+    pub collection_url: Option<String>,
+    /// Human-readable name of the chosen collection (e.g. `Reminders`).
+    pub collection_name: Option<String>,
+    /// True when an account is stored (so the UI can show connected vs. empty).
+    pub configured: bool,
+}
+
+/// One VTODO-capable collection found during discovery, for the picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaldavCollectionDto {
+    pub url: String,
+    pub display_name: Option<String>,
+}
+
+/// Result of a CalDAV sync run, surfaced to the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaldavSyncDto {
+    pub created: usize,
+    pub pushed: usize,
+    pub pulled: usize,
+    pub removed: usize,
+    pub conflicts: usize,
+    pub errors: Vec<String>,
 }
 
 /// Profile editor wire shape. `identifiers` is a flat list across kinds so
