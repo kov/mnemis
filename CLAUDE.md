@@ -83,9 +83,9 @@ The harness uses process groups (`setsid` at spawn, `kill(-pgid, ...)` at drop) 
 
 ## Hygiene
 
-- `.githooks/pre-commit` runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Active via `git config core.hooksPath .githooks`.
+- `.githooks/pre-commit` runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`, plus separate `--manifest-path app/ui/Cargo.toml` fmt + clippy passes for the standalone UI workspace (clippy on `wasm32-unknown-unknown`, so `rustup target add wasm32-unknown-unknown` is required). Active via `git config core.hooksPath .githooks`.
 - For clippy with the `ui-probe` feature: `cargo clippy -p mnemis-app --bin ui-probe --features ui-probe -- -D warnings` (the feature is mnemis-app-only).
-- `app/ui` is a standalone workspace — its deps don't pollute the host build graph. Don't `cd` into it casually; if you do, `cd -` afterwards or use `--manifest-path`.
+- `app/ui` is a standalone workspace — its deps don't pollute the host build graph. Don't `cd` into it casually; if you do, `cd -` afterwards or use `--manifest-path`. Format it with `cargo fmt --manifest-path app/ui/Cargo.toml`.
 
 ## Platform notes
 

@@ -19,10 +19,10 @@ use crate::{
     ChatStream, ChatUiState, FirstRunTick, SyncTick, add_imap_source, confidence_class,
     confirm_resolution, create_chat, delete_source, fetch_actions, fetch_chat_seed,
     fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
-    fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
-    open_external, reject_resolution, run_sync_now, save_llm_config, save_user_profile,
-    send_chat_message, set_channel_muted, set_channels_muted_bulk, set_chat_show_reasoning,
-    set_source_muted, status_label, submit_dismissal_feedback, update_action,
+    fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile, open_external,
+    reject_resolution, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
+    set_channel_muted, set_channels_muted_bulk, set_chat_show_reasoning, set_source_muted,
+    status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -373,13 +373,13 @@ fn FeedbackModal(
 /// items get an explicit Claim (auto_claimed is already claimed-by-agent).
 fn show_button(current: ActionStatus, target: ActionStatus) -> bool {
     use ActionStatus::*;
-    match (current, target) {
-        (Pending, Claimed) => true,
-        (Pending | AutoClaimed | Claimed, Done) => true,
-        (Pending | AutoClaimed | Claimed, Dismissed) => true,
-        (Done | Cancelled | Dismissed, Pending) => true,
-        _ => false,
-    }
+    matches!(
+        (current, target),
+        (Pending, Claimed)
+            | (Pending | AutoClaimed | Claimed, Done)
+            | (Pending | AutoClaimed | Claimed, Dismissed)
+            | (Done | Cancelled | Dismissed, Pending)
+    )
 }
 
 #[component]
@@ -1116,9 +1116,8 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
 
 #[component]
 fn SourceChannels(source_id: i64) -> impl IntoView {
-    let channels = LocalResource::new(move || async move {
-        fetch_source_channels(source_id).await
-    });
+    let channels =
+        LocalResource::new(move || async move { fetch_source_channels(source_id).await });
     let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || channels.refetch());
     view! {
         <Suspense fallback=|| view! { <div class="loading">"Loading channels…"</div> }>
@@ -1206,10 +1205,7 @@ fn collect_channel_ids(nodes: &[ChannelNode], out: &mut Vec<i64>) {
 }
 
 #[component]
-fn ChannelsList(
-    rows: Vec<ChannelRowDto>,
-    refetch: Arc<dyn Fn() + Send + Sync>,
-) -> impl IntoView {
+fn ChannelsList(rows: Vec<ChannelRowDto>, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
     let tree = build_tree(rows.clone());
     let all_ids = {
         let mut v = Vec::new();
@@ -1408,8 +1404,7 @@ fn ChatsList(rows: Vec<ChatDto>) -> impl IntoView {
 #[component]
 pub fn ChatDetail() -> impl IntoView {
     let params = use_params_map();
-    let chat_id =
-        Memo::new(move |_| params.read().get("id").and_then(|s| s.parse::<i64>().ok()));
+    let chat_id = Memo::new(move |_| params.read().get("id").and_then(|s| s.parse::<i64>().ok()));
 
     // Streaming + toggle state lives at app scope so it survives this
     // component's remount when the user flips to the chats list and back.
@@ -1451,7 +1446,8 @@ pub fn ChatDetail() -> impl IntoView {
 
     // Is the in-flight send (if any) for *this* chat? Gates the optimistic
     // bubble + spinner so another chat's send never shows up here.
-    let is_active = Memo::new(move |_| active_id.get().is_some() && active_id.get() == chat_id.get());
+    let is_active =
+        Memo::new(move |_| active_id.get().is_some() && active_id.get() == chat_id.get());
 
     // Only offer the reasoning toggle when there's actually reasoning to show —
     // the local model usually inlines its working into the answer and emits no
@@ -1533,11 +1529,11 @@ pub fn ChatDetail() -> impl IntoView {
         let _ = refresh.get();
         let _ = pending_user.get();
         let _ = sending.get();
-        if at_bottom.get_untracked() {
-            if let Some(el) = transcript_ref.get_untracked() {
-                // Defer past the DOM reconciliation so scroll_height is final.
-                request_animation_frame(move || el.set_scroll_top(el.scroll_height()));
-            }
+        if at_bottom.get_untracked()
+            && let Some(el) = transcript_ref.get_untracked()
+        {
+            // Defer past the DOM reconciliation so scroll_height is final.
+            request_animation_frame(move || el.set_scroll_top(el.scroll_height()));
         }
     });
 

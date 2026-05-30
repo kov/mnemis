@@ -11,3 +11,19 @@ cargo clippy --workspace --all-targets -- -D warnings || {
     echo "cargo clippy found issues" >&2
     exit 1
 }
+
+# app/ui is a standalone workspace (wasm32 target), so --all/--workspace above
+# don't reach it. Lint it explicitly. Needs the wasm target:
+#   rustup target add wasm32-unknown-unknown
+UI_MANIFEST=app/ui/Cargo.toml
+UI_TARGET=wasm32-unknown-unknown
+
+cargo fmt --manifest-path "$UI_MANIFEST" -- --check || {
+    echo "cargo fmt found issues in app/ui; run 'cargo fmt --manifest-path $UI_MANIFEST' to fix" >&2
+    exit 1
+}
+
+cargo clippy --manifest-path "$UI_MANIFEST" --target "$UI_TARGET" --all-targets -- -D warnings || {
+    echo "cargo clippy found issues in app/ui" >&2
+    exit 1
+}

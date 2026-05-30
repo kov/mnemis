@@ -180,10 +180,7 @@ struct SetChannelsMutedBulkArgs {
     muted: bool,
 }
 
-pub async fn set_channels_muted_bulk(
-    channel_ids: Vec<i64>,
-    muted: bool,
-) -> Result<(), String> {
+pub async fn set_channels_muted_bulk(channel_ids: Vec<i64>, muted: bool) -> Result<(), String> {
     let args = serde_wasm_bindgen::to_value(&SetChannelsMutedBulkArgs { channel_ids, muted })
         .map_err(|e| e.to_string())?;
     invoke("set_channels_muted_bulk", args)
@@ -393,8 +390,8 @@ struct OpenUrlArgs {
 /// Hand a URL to the OS default handler via `tauri-plugin-opener`, rather than
 /// letting the click navigate the webview away from the app.
 pub async fn open_external(url: String) -> Result<(), String> {
-    let args =
-        serde_wasm_bindgen::to_value(&OpenUrlArgs { url, with: None }).map_err(|e| e.to_string())?;
+    let args = serde_wasm_bindgen::to_value(&OpenUrlArgs { url, with: None })
+        .map_err(|e| e.to_string())?;
     invoke("plugin:opener|open_url", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
