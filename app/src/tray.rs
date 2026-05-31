@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use mnemis_engine::orchestrator;
+use mnemis_engine::{config, orchestrator};
 use tauri::{
     AppHandle, Manager,
     menu::{Menu, MenuItem},
@@ -80,11 +80,14 @@ fn spawn_sync(app: &AppHandle) {
             warn!("tray sync: no LLM configured");
             return;
         };
+        let traces = config::traces_dir_for(&state.db_path);
         match orchestrator::sync_now(
             &state.pool,
             &stack.llm,
             Arc::clone(&stack.embedder),
             &stack.chat_model,
+            stack.window_char_budget,
+            Some(&traces),
         )
         .await
         {
