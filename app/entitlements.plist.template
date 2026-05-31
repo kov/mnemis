@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Required on macOS for the data-protection keychain. Without this, calls
+        with `kSecUseDataProtectionKeychain = true` fail with
+        errSecMissingEntitlement (-34018). The value must be `<team-id>.<bundle-id>`
+        and matches the certificate the binary is signed with.
+
+        The team-id segment is substituted at build time by app/build.rs,
+        which reads the MNEMIS_APPLE_TEAM_ID environment variable.
+    -->
+    <key>com.apple.application-identifier</key>
+    <string>__TEAM_ID__.br.dev.kov.mnemis</string>
+
+    <!--
+        The default keychain access group when none is explicitly specified is
+        also `<team-id>.<bundle-id>`, so we don't list `keychain-access-groups`
+        at all — the OS uses the application identifier as the implicit group.
+    -->
+</dict>
+</plist>

@@ -1,0 +1,3 @@
+[alias]
+# Lets `cargo xtask <subcommand>` work from anywhere in the workspace.
+xtask = "run --quiet --package xtask --"

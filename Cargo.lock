@@ -2926,6 +2926,7 @@ dependencies = [
  "async-native-tls",
  "async-trait",
  "base64 0.22.1",
+ "block2",
  "chrono",
  "dirs",
  "futures",
@@ -2934,6 +2935,9 @@ dependencies = [
  "libsqlite3-sys",
  "mail-parser",
  "mnemis-types",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
  "reqwest",
  "roxmltree",
  "secret-service",
@@ -3301,6 +3305,17 @@ dependencies = [
  "bitflags 2.11.1",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -5771,6 +5786,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ui-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fantoccini",
+ "mnemis-app",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "unic-char-property"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6884,6 +6910,13 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

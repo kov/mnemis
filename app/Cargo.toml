@@ -2,6 +2,10 @@
 name = "mnemis-app"
 version = "0.1.0"
 edition = "2024"
+# Tauri's bundler also reads this — without it, `cargo tauri build` walks
+# every `[[bin]]` and tries to ship `ui-probe`, which is only built behind a
+# feature gate.
+default-run = "mnemis-app"
 
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
@@ -23,9 +27,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 
-# UI-driver probe binary — separate so the main app build doesn't pull in
-# fantoccini/hyper unnecessarily. Run with `cargo run -p mnemis-app --bin
-# ui-probe --features ui-probe`.
+# Exposes `pub mod test_support` for the standalone `ui-probe` crate and the
+# `ui_smoke` integration test. Gated so the default `mnemis-app` build
+# doesn't pull in fantoccini etc.
 ui-probe = ["dep:fantoccini", "dep:tokio-stream", "dep:libc"]
 
 [dependencies.fantoccini]
@@ -47,8 +51,3 @@ chrono = "0.4.44"
 [[bin]]
 name = "mnemis-app"
 path = "src/main.rs"
-
-[[bin]]
-name = "ui-probe"
-path = "src/bin/ui_probe.rs"
-required-features = ["ui-probe"]

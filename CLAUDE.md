@@ -47,6 +47,58 @@ MNEMIS_DB_PATH=/path/to/mnemis.db ./target/debug/mnemis-app
 # config file (otherwise defaults to ~/.config/mnemis/config.toml).
 ```
 
+### macOS: signed bundle (required for the keychain)
+
+The keychain backend uses the **data-protection keychain** with the
+`com.apple.application-identifier` entitlement. The app reads its own secrets
+without prompting; writes/edits are gated by a single Touch ID (or device
+password) prompt. The data-protection keychain refuses unentitled processes
+with `errSecMissingEntitlement (-34018)`, so a plain `cargo run` binary
+**cannot** read or write secrets — only the signed `.app` bundle can.
+
+One-time setup: register your team ID and signing identity in git config so
+they're picked up automatically by the xtask wrapper.
+
+```
+git config --global mnemis.appleTeamId WDNHP64H9G
+git config --global mnemis.appleSigningIdentity \
+    "Apple Development: gustavo@noronha.eti.br (P3TJZGGJP5)"
+```
+
+Then any time you want a signed bundle:
+
+```
+cargo xtask build-macos                 # trunk build + cargo tauri build
+cargo xtask run-macos                   # same, then `open` the .app
+```
+
+The xtask reads the two git-config values (falling back to
+`MNEMIS_APPLE_TEAM_ID` / `APPLE_SIGNING_IDENTITY` env vars), runs the UI
+bundle, then invokes `cargo tauri build` with the env vars exported.
+`app/build.rs` reads `MNEMIS_APPLE_TEAM_ID` and materialises
+`app/entitlements.plist` from `entitlements.plist.template`; Tauri passes that
+file to `codesign` along with the identity. The generated `entitlements.plist`
+is git-ignored. Without those values set, the build emits a warning and
+produces a bundle that runs but cannot use the data-protection keychain.
+
+The signing identity is the exact string `security find-identity -v -p
+codesigning` prints in quotes; the team ID is the OU field on the cert
+(`security find-certificate -c "Apple Development: <your-email>" -p |
+openssl x509 -noout -subject` — usually visible in Xcode → Settings →
+Accounts → Team).
+
+Verify after signing:
+
+```
+codesign -d --entitlements - ./target/release/bundle/macos/mnemis.app
+# Should print the application-identifier entry above.
+security find-generic-password -s mnemis -g     # also shows items
+```
+
+The `mnemis-cli` binary is **not** signed by this flow, so it cannot read or
+write secrets on macOS. CLI-driven credential management is unsupported on
+the Mac for now — use the app's settings UI.
+
 ## UI debugging & integration tests
 
 The Tauri webview can't be inspected the way regular Rust code can. Two complementary tools, both gated behind the `ui-probe` feature so default builds stay small:

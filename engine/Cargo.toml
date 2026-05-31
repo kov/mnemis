@@ -38,7 +38,17 @@ roxmltree = "0.21.1"
 secret-service = { version = "5.0.0", features = ["rt-tokio-crypto-rust"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7.0"
+# `OSX_10_15` unlocks `PasswordOptions::use_protected_keychain()`, which routes
+# items into the modern data-protection keychain (the one that doesn't prompt
+# the app for items it owns).
+security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+# LocalAuthentication.framework via objc2 — used to gate keychain writes/edits
+# behind a single Touch ID / device-password prompt. Reads never prompt because
+# the data-protection keychain treats the app's own items as freely accessible.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["alloc", "NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["LAContext", "LAError", "block2"] }
+block2 = { version = "0.6", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

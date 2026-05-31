@@ -1,0 +1,22 @@
+[package]
+name = "ui-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Stand-alone binary that drives the running Tauri app through the shared
+# `test_support` harness. Lives in its own crate so the user-facing
+# `mnemis-app` package declares a single `[[bin]]` — Tauri's bundler walks
+# every `[[bin]]` in a package and would otherwise try to ship the probe
+# alongside the app.
+
+[dependencies]
+mnemis-app = { path = "../app", features = ["ui-probe"] }
+anyhow = "1.0.102"
+fantoccini = "0.22.1"
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }
+
+[[bin]]
+name = "ui-probe"
+path = "src/main.rs"
