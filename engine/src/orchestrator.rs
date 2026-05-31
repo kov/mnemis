@@ -214,6 +214,17 @@ async fn sync_one_source_with(
     window_char_budget: usize,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
+    // Refresh the folder list from the server first, so a freshly added source
+    // (or a newly created server-side folder) is polled this run instead of
+    // only after some later sync. Best-effort: a discovery failure shouldn't
+    // stop us polling the folders we already know.
+    if let Err(e) = discover_channels(pool, source, source_id).await {
+        warn!(
+            error = %format!("{e:#}"),
+            source_id, "channel discovery failed; polling known channels only"
+        );
+    }
+
     let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
     )
@@ -395,6 +406,35 @@ pub async fn build_imap_source(pool: &SqlitePool, source_id: SourceId) -> Result
     ))
 }
 
+/// Discover the source's channels (IMAP folders) and upsert them into the
+/// `channels` table, returning how many the server reported. Idempotent
+/// (`ON CONFLICT DO NOTHING`), so it's safe to run on every sync and whenever
+/// the settings view asks to refresh: newly created server-side folders appear,
+/// while the per-channel mute/cursor state on folders we already know is left
+/// untouched. Best-effort callers should log-and-continue on error — a
+/// discovery failure (offline, transient) must not block polling known folders.
+pub async fn discover_channels(
+    pool: &SqlitePool,
+    source: &dyn Source,
+    source_id: i64,
+) -> Result<usize> {
+    let channels = source.list_channels().await.context("listing channels")?;
+    for ch in &channels {
+        sqlx::query(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(source_id)
+        .bind(&ch.external_id)
+        .bind(&ch.name)
+        .bind(&ch.kind)
+        .execute(pool)
+        .await
+        .with_context(|| format!("upserting channel {}", ch.external_id))?;
+    }
+    Ok(channels.len())
+}
+
 /// Run a CalDAV reminder sync iff an account *and* a task collection are
 /// configured. Returns `None` when CalDAV isn't set up (account absent, or no
 /// collection picked yet) so callers can stay silent; otherwise the reconcile
@@ -497,7 +537,10 @@ mod tests {
             SourceKind::Imap
         }
         async fn list_channels(&self) -> Result<Vec<ChannelInfo>> {
-            unimplemented!("not used in sync path")
+            // Discovery now runs on the sync path. These tests seed channels
+            // directly, so report none here (the upsert is a no-op) and let the
+            // seeded rows drive the poll loop.
+            Ok(Vec::new())
         }
         async fn poll(&self, _channel: &str, _cursor: Option<&Cursor>) -> Result<PollBatch> {
             Ok(PollBatch {
@@ -694,6 +737,85 @@ mod tests {
             mnemis_types::is_model_not_found(err),
             "preserves the body so the toast classifier names the model: {err}"
         );
+        Ok(())
+    }
+
+    /// Source that reports two folders, to exercise `discover_channels`.
+    struct TwoFolderSource(SourceId);
+
+    #[async_trait]
+    impl Source for TwoFolderSource {
+        fn id(&self) -> SourceId {
+            self.0
+        }
+        fn kind(&self) -> SourceKind {
+            SourceKind::Imap
+        }
+        async fn list_channels(&self) -> Result<Vec<ChannelInfo>> {
+            Ok(vec![
+                ChannelInfo {
+                    external_id: "INBOX".to_string(),
+                    name: "INBOX".to_string(),
+                    kind: "mailbox".to_string(),
+                },
+                ChannelInfo {
+                    external_id: "INBOX/Lembrar".to_string(),
+                    name: "INBOX/Lembrar".to_string(),
+                    kind: "mailbox".to_string(),
+                },
+            ])
+        }
+        async fn poll(&self, _channel: &str, _cursor: Option<&Cursor>) -> Result<PollBatch> {
+            unimplemented!("not used in this test")
+        }
+        async fn fetch(&self, _channel: &str, _msg: &str) -> Result<ImportedMessage> {
+            unimplemented!("not used in this test")
+        }
+    }
+
+    /// Discovery upserts the server's folders and is idempotent — a second run
+    /// adds no duplicates and preserves the mute state of folders we already
+    /// knew (the part that makes "discover on every sync / settings open" safe).
+    #[tokio::test]
+    async fn discover_channels_upserts_idempotently() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+
+        let (source_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'fastmail', 'fake/ref', ?) RETURNING id",
+        )
+        .bind(Utc::now().timestamp())
+        .fetch_one(&pool)
+        .await?;
+
+        let source = TwoFolderSource(SourceId(source_id));
+        let discovered = discover_channels(&pool, &source, source_id).await?;
+        assert_eq!(discovered, 2);
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channels WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 2, "both folders inserted");
+
+        // Mute one, then re-discover: no duplicates, mute preserved.
+        sqlx::query("UPDATE channels SET muted = 1 WHERE external_id = 'INBOX/Lembrar'")
+            .execute(&pool)
+            .await?;
+        discover_channels(&pool, &source, source_id).await?;
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channels WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 2, "re-discovery adds no duplicates");
+        let (muted,): (i64,) =
+            sqlx::query_as("SELECT muted FROM channels WHERE external_id = 'INBOX/Lembrar'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(muted, 1, "re-discovery preserves mute state");
         Ok(())
     }
 }

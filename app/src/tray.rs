@@ -76,7 +76,7 @@ fn spawn_sync(app: &AppHandle) {
                 return;
             }
         };
-        let Some(stack) = state.llm_stack.as_ref() else {
+        let Some(stack) = state.current_llm() else {
             warn!("tray sync: no LLM configured");
             return;
         };

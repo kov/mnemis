@@ -4,7 +4,7 @@
 mod tray;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use mnemis_engine::config::Config;
@@ -24,10 +24,12 @@ use tracing::{info, warn};
 /// Wraps shared mutable engine state held by the Tauri runtime.
 pub(crate) struct AppState {
     pub pool: SqlitePool,
-    /// LLM + embedder, present when the user has a usable config.toml. If
-    /// missing, sync_now is the only command that surfaces a clear error;
-    /// read-only views continue to work.
-    pub llm_stack: Option<LlmStack>,
+    /// LLM + embedder, present when the user has a usable config. Behind a
+    /// `RwLock` + `Arc` so `save_llm_config` can hot-swap it without an app
+    /// restart, and readers snapshot a cheap `Arc` clone instead of holding the
+    /// lock across the long async sync. `None` until configured; read-only
+    /// views still work, and sync_now is the only command that errors clearly.
+    pub llm_stack: RwLock<Option<Arc<LlmStack>>>,
     /// Resolved path to the SQLite file, kept so commands can derive the
     /// traces directory (`<db_parent>/traces/`) without recomputing it.
     pub db_path: PathBuf,
@@ -38,6 +40,22 @@ pub(crate) struct LlmStack {
     pub embedder: Arc<dyn Embedder>,
     pub chat_model: String,
     pub window_char_budget: usize,
+}
+
+impl AppState {
+    /// Snapshot the current LLM stack as a cheap `Arc` clone, releasing the
+    /// lock immediately so a concurrent hot-reload never waits on a long sync.
+    fn current_llm(&self) -> Option<Arc<LlmStack>> {
+        self.llm_stack.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Replace the live LLM stack (or clear it), so a config change takes
+    /// effect without an app restart.
+    fn set_llm(&self, stack: Option<Arc<LlmStack>>) {
+        if let Ok(mut g) = self.llm_stack.write() {
+            *g = stack;
+        }
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -119,6 +137,33 @@ async fn list_source_channels(
     state: State<'_, AppState>,
     source_id: i64,
 ) -> Result<Vec<ChannelRowDto>, String> {
+    settings::list_source_channels(&state.pool, source_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Refresh the source's folders from the server, then return the list. Called
+/// when the settings view opens so newly created server-side folders appear
+/// without waiting for a sync. Discovery is best-effort: if it fails (offline,
+/// missing creds, non-IMAP) we fall back to whatever is already in the DB
+/// rather than breaking the view.
+#[tauri::command(rename_all = "snake_case")]
+async fn discover_source_channels(
+    state: State<'_, AppState>,
+    source_id: i64,
+) -> Result<Vec<ChannelRowDto>, String> {
+    match orchestrator::build_imap_source(&state.pool, mnemis_engine::source::SourceId(source_id))
+        .await
+    {
+        Ok(source) => {
+            if let Err(e) = orchestrator::discover_channels(&state.pool, &source, source_id).await {
+                warn!(error = %format!("{e:#}"), source_id, "folder discovery failed");
+            }
+        }
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), source_id, "could not build source for folder discovery");
+        }
+    }
     settings::list_source_channels(&state.pool, source_id)
         .await
         .map_err(|e| format!("{e:#}"))
@@ -292,7 +337,7 @@ async fn get_llm_config(_state: State<'_, AppState>) -> Result<LlmConfigDto, Str
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn save_llm_config(cfg: LlmConfigDto) -> Result<(), String> {
+async fn save_llm_config(state: State<'_, AppState>, cfg: LlmConfigDto) -> Result<(), String> {
     config::save_llm(&config::LlmSection {
         base_url: cfg.base_url,
         chat_model: cfg.chat_model,
@@ -304,7 +349,16 @@ async fn save_llm_config(cfg: LlmConfigDto) -> Result<(), String> {
         max_context_tokens: None,
         request_timeout_secs: None,
     })
-    .map_err(|e| format!("{e:#}"))
+    .map_err(|e| format!("{e:#}"))?;
+
+    // Hot-reload: rebuild the live stack from the just-saved config so sync and
+    // chat work immediately, without an app restart. If the reload fails, keep
+    // whatever stack we had and let the user retry.
+    match config::load(None) {
+        Ok(cfg) => state.set_llm(Some(Arc::new(build_llm_stack(&cfg)))),
+        Err(e) => warn!(error = %e, "saved LLM config but could not reload it"),
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -352,9 +406,8 @@ async fn submit_dismissal_feedback(
 #[tauri::command]
 async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
     let stack = state
-        .llm_stack
-        .as_ref()
-        .ok_or_else(|| "No LLM configured. Edit ~/.config/mnemis/config.toml.".to_string())?;
+        .current_llm()
+        .ok_or_else(|| "No LLM configured. Set it in Settings → LLM.".to_string())?;
     let traces = config::traces_dir_for(&state.db_path);
     orchestrator::sync_now(
         &state.pool,
@@ -437,9 +490,8 @@ async fn send_chat_message(
     on_event: Channel<ChatEvent>,
 ) -> Result<(), String> {
     let stack = state
-        .llm_stack
-        .as_ref()
-        .ok_or_else(|| "No LLM configured. Edit ~/.config/mnemis/config.toml.".to_string())?;
+        .current_llm()
+        .ok_or_else(|| "No LLM configured. Set it in Settings → LLM.".to_string())?;
     let system_prompt = chat::prompt::build_system_prompt(&state.pool, chat_id)
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -550,12 +602,12 @@ fn main() {
             // MNEMIS_DISABLE_LLM env (used by ui_smoke) forces this path so
             // tests can exercise sync_now without depending on whatever
             // config.toml the dev machine has.
-            let llm_stack = if std::env::var("MNEMIS_DISABLE_LLM").is_ok() {
+            let llm_stack: Option<Arc<LlmStack>> = if std::env::var("MNEMIS_DISABLE_LLM").is_ok() {
                 info!("MNEMIS_DISABLE_LLM set; sync_now disabled");
                 None
             } else {
                 match config::load(None) {
-                    Ok(cfg) => Some(build_llm_stack(&cfg)),
+                    Ok(cfg) => Some(Arc::new(build_llm_stack(&cfg))),
                     Err(e) => {
                         warn!(error = %e, "no mnemis config; sync_now disabled");
                         None
@@ -565,7 +617,7 @@ fn main() {
 
             app.manage(AppState {
                 pool,
-                llm_stack,
+                llm_stack: RwLock::new(llm_stack),
                 db_path: app_data,
             });
 
@@ -618,6 +670,7 @@ fn main() {
             sync_caldav,
             promote_to_reminder,
             list_source_channels,
+            discover_source_channels,
             set_channel_muted,
             set_channels_muted_bulk,
             get_llm_config,

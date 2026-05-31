@@ -18,8 +18,8 @@ use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
     ChatStream, ChatUiState, FirstRunTick, SyncTick, add_caldav_account, add_imap_source,
     confidence_class, confirm_resolution, create_chat, delete_caldav_account, delete_chat,
-    delete_source, fetch_actions, fetch_caldav_account, fetch_chat_seed, fetch_chat_turns,
-    fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
+    delete_source, discover_source_channels, fetch_actions, fetch_caldav_account, fetch_chat_seed,
+    fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
     fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
     list_caldav_collections, open_external, promote_to_reminder, reject_resolution,
     run_sync_caldav, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
@@ -1168,8 +1168,8 @@ pub fn SettingsSources() -> impl IntoView {
 }
 
 /// IMAP add modal. Pure form — no validation beyond "name/server/username
-/// non-empty". The Tauri command writes to the DB + keychain; channel
-/// discovery happens on the next sync.
+/// non-empty". The Tauri command writes to the DB + keychain; folders are
+/// discovered when this source's folder list opens (and again on each sync).
 #[component]
 fn AddImapModal(on_close: Arc<dyn Fn(bool) + Send + Sync>) -> impl IntoView {
     let toast: RwSignal<Option<String>> = RwSignal::new(None);
@@ -1336,16 +1336,32 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
 
 #[component]
 fn SourceChannels(source_id: i64) -> impl IntoView {
-    let channels =
-        LocalResource::new(move || async move { fetch_source_channels(source_id).await });
-    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || channels.refetch());
+    // First load discovers folders from the server, so newly created
+    // server-side folders show up when the view opens. Later refetches — e.g.
+    // after a mute toggle — just re-read the DB, so muting never triggers a
+    // network round-trip (or, on macOS, a keychain prompt).
+    let reload = RwSignal::new(0u32);
+    let discovered = RwSignal::new(false);
+    let channels = LocalResource::new(move || {
+        let _ = reload.get();
+        async move {
+            if discovered.get_untracked() {
+                fetch_source_channels(source_id).await
+            } else {
+                let rows = discover_source_channels(source_id).await;
+                discovered.set(true);
+                rows
+            }
+        }
+    });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || reload.update(|n| *n += 1));
     view! {
-        <Suspense fallback=|| view! { <div class="loading">"Loading channels…"</div> }>
+        <Suspense fallback=|| view! { <div class="loading">"Loading folders…"</div> }>
             {move || {
                 let refetch = refetch.clone();
                 channels.get().map(move |res| match res {
                     Ok(rows) if rows.is_empty() => view! {
-                        <div class="empty">"No channels yet — sync once to discover them."</div>
+                        <div class="empty">"No folders found for this account."</div>
                     }.into_any(),
                     Ok(rows) => view! {
                         <ChannelsList rows=rows refetch=refetch />
@@ -1460,7 +1476,7 @@ fn ChannelsList(rows: Vec<ChannelRowDto>, refetch: Arc<dyn Fn() + Send + Sync>) 
         <div class="channels-toolbar">
             <button class="btn btn-ghost channels-enable-all" on:click=on_enable_all>"Enable all"</button>
             <button class="btn btn-ghost channels-disable-all" on:click=on_disable_all>"Disable all"</button>
-            <span class="channels-count">{format!("{total} channel(s)")}</span>
+            <span class="channels-count">{format!("{total} folder(s)")}</span>
         </div>
         <ul class="channels-tree channels-list">
             {tree.into_iter().map(|node| {

@@ -159,6 +159,17 @@ pub async fn fetch_source_channels(source_id: i64) -> Result<Vec<ChannelRowDto>,
     serde_wasm_bindgen::from_value::<Vec<ChannelRowDto>>(raw).map_err(|e| e.to_string())
 }
 
+/// Refresh folders from the server, then return the list. Used when the source
+/// settings view opens so newly created folders appear without a sync.
+pub async fn discover_source_channels(source_id: i64) -> Result<Vec<ChannelRowDto>, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&SourceIdArgs { source_id }).map_err(|e| e.to_string())?;
+    let raw = invoke("discover_source_channels", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Vec<ChannelRowDto>>(raw).map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 struct SetChannelMutedArgs {
     channel_id: i64,
