@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use fantoccini::Locator;
 use mnemis_app::test_support::{Harness, HarnessOpts, sibling_app_binary};
 use serde_json::Value;
@@ -2394,6 +2394,242 @@ async fn settings_reminders_shows_connect_form_when_unconfigured() -> Result<()>
     assert!(
         body_text.contains("app-specific password") || body_text.contains("App-specific password"),
         "expected the app-specific-password guidance, got text: {body_text}"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
+
+/// JS that reports the reminder control's state inside the seeded
+/// "Review Q3 roadmap" action card: the toggle button's label, whether the
+/// calendar popover is open, its day count + title, the highlighted day, and
+/// the reminder badge text.
+const REMINDER_PROBE: &str = r#"
+    const card = Array.from(document.querySelectorAll('.action'))
+        .find(a => a.textContent.includes('Review Q3 roadmap'));
+    if (!card) { return null; }
+    const toggle = card.querySelector('.reminder-set > button');
+    const pop = card.querySelector('.cal-popover');
+    const badge = card.querySelector('.reminder-badge');
+    const selected = card.querySelector('.cal-day.cal-selected');
+    return {
+        toggle: toggle ? toggle.textContent.trim() : null,
+        popoverOpen: !!pop,
+        dayCount: pop ? pop.querySelectorAll('.cal-day').length : 0,
+        title: pop && pop.querySelector('.cal-title')
+            ? pop.querySelector('.cal-title').textContent.trim() : null,
+        selectedDay: selected ? selected.textContent.trim() : null,
+        badge: badge ? badge.textContent.trim() : null,
+    };
+"#;
+
+async fn reminder_probe(client: &fantoccini::Client) -> Result<Value> {
+    Ok(client.execute(REMINDER_PROBE, vec![]).await?)
+}
+
+/// Poll the reminder control until `pred` holds (reactive re-render / refetch
+/// can lag a frame), returning the matching probe.
+async fn wait_reminder<P: Fn(&Value) -> bool>(
+    client: &fantoccini::Client,
+    pred: P,
+    what: &str,
+) -> Result<Value> {
+    for _ in 0..40 {
+        let v = reminder_probe(client).await?;
+        if pred(&v) {
+            return Ok(v);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!(
+        "timed out waiting for {what}; last probe: {:?}",
+        reminder_probe(client).await?
+    );
+}
+
+/// Click an element inside the target action card, located by a JS expression
+/// (`card` is in scope). `what` labels failures.
+async fn click_in_card(client: &fantoccini::Client, finder: &str, what: &str) -> Result<()> {
+    let js = format!(
+        r#"
+        const card = Array.from(document.querySelectorAll('.action'))
+            .find(a => a.textContent.includes('Review Q3 roadmap'));
+        if (!card) {{ return 'no-card'; }}
+        const el = {finder};
+        if (!el) {{ return 'missing'; }}
+        el.click();
+        return 'ok';
+        "#
+    );
+    let r = client.execute(&js, vec![]).await?;
+    if r.as_str() != Some("ok") {
+        anyhow::bail!("clicking {what} failed: {r:?}");
+    }
+    Ok(())
+}
+
+/// Drives the per-action reminder calendar popover and asserts the behaviour the
+/// user asked for: a fresh action shows "Remind"; opening reveals a calendar;
+/// clicking the backdrop (anywhere else) dismisses without promoting; clicking a
+/// day commits + closes (badge shows the date, button becomes "Change date");
+/// and reopening highlights the set day. Backed by a DB check that `due_at`
+/// landed. Follows the testing tenets: assert outcomes the user sees.
+#[tokio::test(flavor = "current_thread")]
+async fn reminder_calendar_dismisses_promotes_and_highlights() -> Result<()> {
+    // 1. Seed; capture the auto-claimed (immediately visible) action with no due.
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-reminder.db");
+    let action_id = {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        seed(&pool).await?;
+        let (id, due): (i64, Option<i64>) =
+            sqlx::query_as("SELECT id, due_at FROM actions WHERE title = 'Review Q3 roadmap'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            due, None,
+            "pre-flight: seed action must start with no due date"
+        );
+        pool.close().await;
+        id
+    };
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.app"))
+        .await
+        .context("waiting for div.app")?;
+
+    let toggle_is = |v: &Value, want: &str| v.get("toggle").and_then(Value::as_str) == Some(want);
+    let is_open = |v: &Value| v.get("popoverOpen").and_then(Value::as_bool) == Some(true);
+
+    // 2. Initial state: a "Remind" toggle, no popover, no badge.
+    let p = wait_reminder(&client, |v| toggle_is(v, "Remind"), "the Remind button").await?;
+    assert!(!is_open(&p), "calendar must start closed: {p:?}");
+    assert!(p["badge"].is_null(), "no badge before a date is set: {p:?}");
+
+    // 3. Open the calendar; it renders a month grid.
+    click_in_card(
+        &client,
+        "card.querySelector('.reminder-set > button')",
+        "the Remind toggle",
+    )
+    .await?;
+    let p = wait_reminder(&client, is_open, "the calendar to open").await?;
+    assert!(
+        p["dayCount"].as_u64().unwrap_or(0) >= 28,
+        "calendar should render the month's days: {p:?}"
+    );
+    assert!(
+        p["title"].as_str().is_some(),
+        "calendar shows a month title: {p:?}"
+    );
+
+    // 4. Click the backdrop (anywhere else) → closes, nothing promoted.
+    click_in_card(
+        &client,
+        "card.querySelector('.cal-backdrop')",
+        "the backdrop",
+    )
+    .await?;
+    let p = wait_reminder(
+        &client,
+        |v| !is_open(v),
+        "the calendar to dismiss on outside click",
+    )
+    .await?;
+    assert!(
+        toggle_is(&p, "Remind"),
+        "still a fresh 'Remind' after dismiss: {p:?}"
+    );
+    assert!(
+        p["badge"].is_null(),
+        "outside-click must not promote: {p:?}"
+    );
+
+    // 5. Open again and click day 15 of the (current) month → commits + closes.
+    click_in_card(
+        &client,
+        "card.querySelector('.reminder-set > button')",
+        "the Remind toggle",
+    )
+    .await?;
+    wait_reminder(&client, is_open, "the calendar to reopen").await?;
+    click_in_card(
+        &client,
+        "Array.from(card.querySelectorAll('.cal-day')).find(b => b.textContent.trim() === '15')",
+        "day 15",
+    )
+    .await?;
+
+    // 6. After picking: popover closed, badge shows the date, toggle is "Change date".
+    let p = wait_reminder(
+        &client,
+        |v| toggle_is(v, "Change date"),
+        "the 'Change date' toggle",
+    )
+    .await?;
+    assert!(
+        !is_open(&p),
+        "the calendar closes after picking a day: {p:?}"
+    );
+    let badge = p["badge"].as_str().unwrap_or_default();
+    assert!(
+        badge.to_lowercase().contains("reminder") && badge.contains("15"),
+        "badge should show the reminder + day 15, got {badge:?}"
+    );
+
+    // 7. Backend: due_at landed as day-15 of the current UTC month, midnight UTC.
+    let now = Utc::now();
+    let expected_due = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 15)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (due,): (Option<i64>,) = sqlx::query_as("SELECT due_at FROM actions WHERE id = ?")
+            .bind(action_id)
+            .fetch_one(&pool)
+            .await
+            .context("reading due_at after picking a day")?;
+        assert_eq!(
+            due,
+            Some(expected_due),
+            "due_at should be the 15th of the current month at UTC midnight"
+        );
+        pool.close().await;
+    }
+
+    // 8. The core fix: reopening highlights the set day (not a blank/today view).
+    click_in_card(
+        &client,
+        "card.querySelector('.reminder-set > button')",
+        "the Change-date toggle",
+    )
+    .await?;
+    let p = wait_reminder(
+        &client,
+        |v| is_open(v) && v.get("selectedDay").and_then(Value::as_str) == Some("15"),
+        "the calendar to reopen with day 15 highlighted",
+    )
+    .await?;
+    assert_eq!(
+        p["selectedDay"].as_str(),
+        Some("15"),
+        "reopening must highlight the saved day: {p:?}"
     );
 
     client.close().await.ok();
