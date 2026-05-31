@@ -204,7 +204,7 @@ async fn delete_caldav_account(state: State<'_, AppState>) -> Result<(), String>
         .map_err(|e| format!("{e:#}"))
 }
 
-/// Discover VTODO-capable collections for the stored account (a network probe).
+/// Discover VEVENT-capable calendars for the stored account (a network probe).
 #[tauri::command(rename_all = "snake_case")]
 async fn list_caldav_collections(
     state: State<'_, AppState>,
@@ -216,7 +216,7 @@ async fn list_caldav_collections(
     let password = mnemis_engine::secrets::fetch(&account.keychain_ref)
         .await
         .map_err(|e| format!("fetching CalDAV password: {e:#}"))?;
-    let found = mnemis_engine::sync::caldav::discover_task_collections(
+    let found = mnemis_engine::sync::caldav::discover_event_calendars(
         &account.base_url,
         &account.username,
         &password,

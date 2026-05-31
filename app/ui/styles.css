@@ -708,18 +708,97 @@ h1 {
 }
 
 .reminder-set {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
 }
 
-.reminder-date {
-  font: inherit;
-  padding: 2px 6px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+/* Custom calendar popover (replaces the native date picker). */
+.cal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+
+.cal-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 31;
+  width: 15rem;
+  padding: 0.5rem;
   background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+
+.cal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.35rem;
+}
+
+.cal-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.cal-nav {
+  border: none;
+  background: transparent;
   color: var(--fg);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.cal-nav:hover {
+  background: var(--surface, rgba(127, 127, 127, 0.15));
+}
+
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+
+.cal-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.9rem;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+.cal-dow {
+  color: var(--muted, #888);
+  font-weight: 600;
+}
+
+.cal-blank {
+  visibility: hidden;
+}
+
+.cal-day {
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.cal-day:hover {
+  background: var(--surface, rgba(127, 127, 127, 0.15));
+}
+
+.cal-selected {
+  background: var(--accent);
+  color: #fff;
 }
 
 .settings-toast {

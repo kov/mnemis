@@ -222,6 +222,182 @@ fn ActionsList(rows: Vec<ActionDto>, refetch: Arc<dyn Fn() + Send + Sync>) -> im
     .into_any()
 }
 
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `(year, month 1-12, day)` in UTC for a unix-seconds timestamp.
+fn ymd_of_unix(secs: i64) -> (i32, u32, u32) {
+    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0));
+    (
+        d.get_utc_full_year() as i32,
+        d.get_utc_month() + 1,
+        d.get_utc_date(),
+    )
+}
+
+/// Today's `(year, month 1-12, day)` in UTC — the calendar's default month.
+fn today_ymd() -> (i32, u32, u32) {
+    let d = js_sys::Date::new_0();
+    (
+        d.get_utc_full_year() as i32,
+        d.get_utc_month() + 1,
+        d.get_utc_date(),
+    )
+}
+
+/// A short human date like "Jun 1" for the reminder badge.
+fn unix_to_short_date(secs: i64) -> String {
+    let (_, month, day) = ymd_of_unix(secs);
+    let name = MONTH_NAMES
+        .get((month as usize).wrapping_sub(1))
+        .copied()
+        .unwrap_or("");
+    format!("{name} {day}")
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 30,
+    }
+}
+
+/// Day of week (0 = Sunday … 6 = Saturday) via Sakamoto's algorithm — pure, so
+/// no timezone surprises from `js_sys::Date`.
+fn weekday(year: i32, month: u32, day: u32) -> u32 {
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    let idx = (month as usize).wrapping_sub(1).min(11);
+    let w = (y + y / 4 - y / 100 + y / 400 + T[idx] + day as i32) % 7;
+    (((w % 7) + 7) % 7) as u32
+}
+
+/// A self-contained calendar popover for (re)setting an action's reminder date.
+/// Replaces the native `<input type=date>`, whose picker under webkit2gtk
+/// segments the field on click and won't dismiss on day-click or outside-click.
+/// Here a day-click commits and closes; clicking the backdrop (anywhere else)
+/// closes without changing anything. Prev/next move the visible month.
+#[component]
+fn ReminderDatePicker(
+    action_id: i64,
+    due_at: Option<i64>,
+    label: &'static str,
+    refetch: Arc<dyn Fn() + Send + Sync>,
+) -> impl IntoView {
+    let open = RwSignal::new(false);
+    // The visible month starts on the current due date (so editing lands you on
+    // the set date) or today for a fresh reminder.
+    let (start_y, start_m, _) = due_at.map(ymd_of_unix).unwrap_or_else(today_ymd);
+    let view_year = RwSignal::new(start_y);
+    let view_month = RwSignal::new(start_m); // 1-12
+    // The set day, for highlighting (only when there is a due date).
+    let selected = due_at.map(ymd_of_unix);
+
+    let prev = move |_| {
+        let (y, m) = (view_year.get(), view_month.get());
+        if m == 1 {
+            view_year.set(y - 1);
+            view_month.set(12);
+        } else {
+            view_month.set(m - 1);
+        }
+    };
+    let next = move |_| {
+        let (y, m) = (view_year.get(), view_month.get());
+        if m == 12 {
+            view_year.set(y + 1);
+            view_month.set(1);
+        } else {
+            view_month.set(m + 1);
+        }
+    };
+
+    let popover = move || {
+        if !open.get() {
+            return ().into_any();
+        }
+        // Rebuilt whenever the visible month changes; each day commits on click.
+        let grid = {
+            let refetch = refetch.clone();
+            move || {
+                let (y, m) = (view_year.get(), view_month.get());
+                let lead = weekday(y, m, 1) as usize;
+                let count = days_in_month(y, m);
+                let mut cells: Vec<_> = (0..lead)
+                    .map(|_| view! { <span class="cal-cell cal-blank"></span> }.into_any())
+                    .collect();
+                for day in 1..=count {
+                    let is_selected = selected == Some((y, m, day));
+                    let refetch = refetch.clone();
+                    let pick = move |_| {
+                        let ms = js_sys::Date::parse(&format!("{y:04}-{m:02}-{day:02}T00:00:00Z"));
+                        if ms.is_nan() {
+                            return;
+                        }
+                        let due = (ms / 1000.0) as i64;
+                        let refetch = refetch.clone();
+                        spawn_local(async move {
+                            let _ = promote_to_reminder(action_id, due).await;
+                            open.set(false);
+                            refetch();
+                        });
+                    };
+                    cells.push(
+                        view! {
+                            <button class="cal-cell cal-day" class:cal-selected=is_selected
+                                on:click=pick>
+                                {day.to_string()}
+                            </button>
+                        }
+                        .into_any(),
+                    );
+                }
+                cells.into_iter().collect_view()
+            }
+        };
+        view! {
+            <div class="cal-backdrop" on:click=move |_| open.set(false)></div>
+            <div class="cal-popover">
+                <div class="cal-head">
+                    <button class="cal-nav" on:click=prev>"‹"</button>
+                    <span class="cal-title">
+                        {move || format!(
+                            "{} {}",
+                            MONTH_NAMES
+                                .get((view_month.get() as usize).wrapping_sub(1))
+                                .copied()
+                                .unwrap_or(""),
+                            view_year.get(),
+                        )}
+                    </span>
+                    <button class="cal-nav" on:click=next>"›"</button>
+                </div>
+                <div class="cal-grid">
+                    {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+                        .into_iter()
+                        .map(|d| view! { <span class="cal-cell cal-dow">{d}</span> })
+                        .collect_view()}
+                    {grid}
+                </div>
+            </div>
+        }
+        .into_any()
+    };
+
+    view! {
+        <span class="reminder-set">
+            <button class="btn btn-sm btn-ghost" on:click=move |_| open.update(|o| *o = !*o)>
+                {label}
+            </button>
+            {popover}
+        </span>
+    }
+}
+
 #[component]
 fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
     let conf_class = confidence_class(action.confidence);
@@ -267,10 +443,12 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
     let trigger_unclaim = trigger_status.clone();
     let trigger_reopen = trigger_status.clone();
 
-    // Reminder state: a synced/dirty/needs_review badge (or "pending" when a
-    // due date is set but not yet synced), plus a date control to (re)promote.
+    // Reminder state: a synced/dirty/needs_review badge that shows the due date
+    // (or "pending" when a due date is set but not yet synced), plus a
+    // toggle-to-edit date control to (re)promote.
     let due_at = action.due_at;
-    let badge: Option<(&'static str, bool)> = action
+    let due_label = due_at.map(unix_to_short_date);
+    let badge: Option<(String, bool)> = action
         .sync_status
         .as_deref()
         .map(|s| match s {
@@ -278,7 +456,11 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
             "dirty" => ("⏰ reminder ⟳", false),
             _ => ("⏰ reminder", false),
         })
-        .or_else(|| due_at.map(|_| ("⏰ reminder (pending)", false)));
+        .or_else(|| due_at.map(|_| ("⏰ reminder (pending)", false)))
+        .map(|(label, warn)| match &due_label {
+            Some(date) => (format!("{label} · {date}"), warn),
+            None => (label.to_string(), warn),
+        });
     let can_remind = !matches!(
         current_status,
         ActionStatus::Done | ActionStatus::Cancelled | ActionStatus::Dismissed
@@ -287,28 +469,6 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
         "Change date"
     } else {
         "Remind"
-    };
-    let date_ref: NodeRef<leptos::html::Input> = NodeRef::new();
-    let refetch_for_remind = refetch.clone();
-    let on_remind = move |_| {
-        let val = date_ref
-            .get()
-            .map(|el| el.unchecked_ref::<HtmlInputElement>().value())
-            .unwrap_or_default();
-        if val.is_empty() {
-            return;
-        }
-        // Parse the YYYY-MM-DD picker value as UTC midnight via JS Date.
-        let ms = js_sys::Date::parse(&format!("{val}T00:00:00Z"));
-        if ms.is_nan() {
-            return;
-        }
-        let due = (ms / 1000.0) as i64;
-        let refetch = refetch_for_remind.clone();
-        spawn_local(async move {
-            let _ = promote_to_reminder(id, due).await;
-            refetch();
-        });
     };
 
     view! {
@@ -348,10 +508,12 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                     <button class="btn btn-ghost" on:click=move |_| trigger_reopen(ActionStatus::Pending, None)>"Reopen"</button>
                 })}
                 {can_remind.then(|| view! {
-                    <span class="reminder-set">
-                        <input class="reminder-date" node_ref=date_ref type="date" />
-                        <button class="btn btn-sm btn-ghost" on:click=on_remind>{remind_label}</button>
-                    </span>
+                    <ReminderDatePicker
+                        action_id=id
+                        due_at=due_at
+                        label=remind_label
+                        refetch=refetch.clone()
+                    />
                 })}
                 <TalkAboutButton kind="action" id=id />
             </div>
@@ -707,7 +869,7 @@ pub fn SettingsHome() -> impl IntoView {
             <li><A href="/settings/sources">"Sources"</A>
                 <span class="settings-desc">" — IMAP + chat connectors"</span></li>
             <li><A href="/settings/reminders">"Reminders"</A>
-                <span class="settings-desc">" — CalDAV sync to Apple Reminders / Nextcloud"</span></li>
+                <span class="settings-desc">" — CalDAV sync to your calendar (iCloud, Nextcloud)"</span></li>
         </ul>
     }
 }
@@ -1411,8 +1573,9 @@ pub fn SettingsReminders() -> impl IntoView {
     view! {
         <h1>"Reminders"</h1>
         <p class="settings-desc">
-            "Sync action items that have a due date to a CalDAV task list \
-             (Apple Reminders, Nextcloud Tasks). Give an action a due date to make it a reminder."
+            "Sync action items that have a due date to a CalDAV calendar as all-day events \
+             with a morning-of alert (iCloud, Nextcloud, Fastmail). Give an action a due date \
+             to make it a reminder."
         </p>
         {move || toast.get().map(|m| view! { <div class="settings-toast">{m}</div> })}
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
@@ -1451,7 +1614,7 @@ pub fn SettingsReminders() -> impl IntoView {
                                 match add_caldav_account(base_url, username, password).await {
                                     Ok(()) => {
                                         toast.set(Some(
-                                            "Connected. Now discover and pick a task list."
+                                            "Connected. Now discover and pick a calendar."
                                                 .to_string(),
                                         ));
                                         refetch();
@@ -1495,8 +1658,7 @@ pub fn SettingsReminders() -> impl IntoView {
                             spawn_local(async move {
                                 match list_caldav_collections().await {
                                     Ok(found) if found.is_empty() => toast.set(Some(
-                                        "No VTODO-capable task lists found on this server."
-                                            .to_string(),
+                                        "No calendars found on this server.".to_string(),
                                     )),
                                     Ok(found) => collections.set(Some(found)),
                                     Err(e) => toast.set(Some(format!("Discovery failed: {e}"))),
@@ -1534,9 +1696,9 @@ pub fn SettingsReminders() -> impl IntoView {
                             <div class="caldav-connected" data-caldav="connected">
                                 <div class="caldav-row"><strong>"Server: "</strong>{acc.base_url.clone()}</div>
                                 <div class="caldav-row"><strong>"Account: "</strong>{acc.username.clone()}</div>
-                                <div class="caldav-row"><strong>"Task list: "</strong>{collection_label}</div>
+                                <div class="caldav-row"><strong>"Calendar: "</strong>{collection_label}</div>
                                 <div class="settings-actions">
-                                    <button class="btn btn-secondary" on:click=on_discover>"Discover lists"</button>
+                                    <button class="btn btn-secondary" on:click=on_discover>"Discover calendars"</button>
                                     {has_collection.then(|| view! {
                                         <button class="btn btn-primary" on:click=on_sync>"Sync now"</button>
                                     })}
@@ -1546,7 +1708,7 @@ pub fn SettingsReminders() -> impl IntoView {
                                     let refetch = refetch_pick.clone();
                                     view! {
                                         <div class="caldav-collections">
-                                            <div class="settings-desc">"Choose the task list to sync into:"</div>
+                                            <div class="settings-desc">"Choose the calendar to sync into:"</div>
                                             <For
                                                 each=move || cols.clone()
                                                 key=|c| c.url.clone()
@@ -1566,7 +1728,7 @@ pub fn SettingsReminders() -> impl IntoView {
                                                             match set_caldav_collection(url, dn).await {
                                                                 Ok(()) => {
                                                                     toast.set(Some(
-                                                                        "Task list selected.".to_string(),
+                                                                        "Calendar selected.".to_string(),
                                                                     ));
                                                                     collections.set(None);
                                                                     refetch();
@@ -1581,7 +1743,7 @@ pub fn SettingsReminders() -> impl IntoView {
                                                         <div class="caldav-collection-row">
                                                             <span>{name}</span>
                                                             <button class="btn btn-sm btn-secondary"
-                                                                on:click=on_pick>"Use this list"</button>
+                                                                on:click=on_pick>"Use this calendar"</button>
                                                         </div>
                                                     }
                                                 }
