@@ -1,19 +1,21 @@
-//! Hand-rolled CalDAV client for the VTODO task backend.
+//! Hand-rolled CalDAV client for the VEVENT calendar backend.
 //!
-//! We only need a thin slice of RFC 4791: discover the task collection, list
-//! VTODOs with their ETags, and create/update/delete a resource with optimistic
+//! We only need a thin slice of RFC 4791: discover the calendar, list its
+//! VEVENTs with their ETags, and create/update/delete a resource with optimistic
 //! concurrency. That's a handful of `PROPFIND`/`REPORT`/`PUT`/`DELETE` requests
 //! over the engine's existing reqwest client — no second HTTP stack (see the
 //! `v2-redesign` memory for why `libdav` was rejected). The iCalendar bodies are
-//! built/parsed by [`super::vtodo`]; the XML multistatus responses are parsed
+//! built/parsed by [`super::vevent`]; the XML multistatus responses are parsed
 //! here with `roxmltree`, matching on **local** element names so namespace
 //! prefixes (which differ across servers) don't matter.
 //!
 //! Discovery follows the standard chain: `current-user-principal` →
 //! `calendar-home-set` → list the home's child collections and keep the ones
-//! whose `supported-calendar-component-set` advertises `VTODO`. Servers return
-//! hrefs as absolute paths, so each is resolved against the URL that produced
-//! it (which, after iCloud's redirect to a shard host, is the real origin).
+//! whose `supported-calendar-component-set` advertises `VEVENT`. (We sync events,
+//! not VTODO reminders, because iCloud dropped CalDAV for the latter — see the
+//! `icloud-reminders-no-caldav` memory.) Servers return hrefs as absolute paths,
+//! so each is resolved against the URL that produced it (which, after iCloud's
+//! redirect to a shard host, is the real origin).
 
 use std::time::Duration;
 
@@ -22,8 +24,8 @@ use async_trait::async_trait;
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::{Client, Method, StatusCode, Url};
 
-use super::vtodo;
-use super::{Conditional, Created, RemoteTask, TaskBackend, TaskStatus, TaskWrite};
+use super::vevent;
+use super::{Conditional, Created, RemoteTask, TaskBackend, TaskWrite};
 
 const XML_CT: &str = "application/xml; charset=utf-8";
 const ICS_CT: &str = "text/calendar; charset=utf-8";
@@ -40,10 +42,10 @@ const COLLECTIONS_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 const GETETAG_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"#;
 
-const CALENDAR_QUERY_VTODO: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VTODO"/></c:comp-filter></c:filter></c:calendar-query>"#;
+const CALENDAR_QUERY_VEVENT: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter></c:calendar-query>"#;
 
-/// A task collection found on the server, ready to show in settings.
+/// A calendar found on the server, ready to show in settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredCollection {
     /// Absolute URL of the collection, used verbatim as the backend's binding.
@@ -128,7 +130,7 @@ impl TaskBackend for CaldavBackend {
                 &self.collection,
                 Some("1"),
                 Some(XML_CT),
-                Some(CALENDAR_QUERY_VTODO.into()),
+                Some(CALENDAR_QUERY_VEVENT.into()),
                 &[],
             )
             .await?;
@@ -141,11 +143,11 @@ impl TaskBackend for CaldavBackend {
 
         let mut out = Vec::new();
         for raw in parse_report_tasks(&text) {
-            let Some(parsed) = vtodo::parse_vtodo(&raw.calendar_data) else {
+            let Some(parsed) = vevent::parse_event(&raw.calendar_data) else {
                 continue;
             };
             let Some(uid) = parsed.uid else {
-                // A VTODO without a UID can't be matched to an action; skip it
+                // A VEVENT without a UID can't be matched to an action; skip it
                 // rather than inventing identity.
                 continue;
             };
@@ -160,7 +162,6 @@ impl TaskBackend for CaldavBackend {
                 summary: parsed.summary.unwrap_or_default(),
                 description: parsed.description,
                 due: parsed.due,
-                status: parsed.status.unwrap_or(TaskStatus::NeedsAction),
             });
         }
         Ok(out)
@@ -171,7 +172,7 @@ impl TaskBackend for CaldavBackend {
             .collection
             .join(&resource_name(&task.uid))
             .with_context(|| format!("building resource URL under {}", self.collection))?;
-        let body = vtodo::task_to_ics(task);
+        let body = vevent::task_to_ics(task);
         // If-None-Match: * makes the PUT a pure create — fail rather than
         // clobber if the name already exists.
         let resp = self
@@ -205,7 +206,7 @@ impl TaskBackend for CaldavBackend {
         task: &TaskWrite,
     ) -> Result<Conditional<String>> {
         let url = Url::parse(href).with_context(|| format!("parsing task href {href}"))?;
-        let body = vtodo::task_to_ics(task);
+        let body = vevent::task_to_ics(task);
         let resp = self
             .request(
                 b"PUT",
@@ -247,9 +248,9 @@ impl TaskBackend for CaldavBackend {
     }
 }
 
-/// Discover the VTODO-capable task collections for an account. Returns every
-/// matching collection; the UI lets the user pick (or there's exactly one).
-pub async fn discover_task_collections(
+/// Discover the VEVENT-capable calendars for an account. Returns every matching
+/// calendar; the UI lets the user pick (or there's exactly one).
+pub async fn discover_event_calendars(
     base_url: &str,
     username: &str,
     password: &str,
@@ -274,7 +275,7 @@ pub async fn discover_task_collections(
 
     let mut out = Vec::new();
     for raw in parse_collections(&collections_body) {
-        if is_task_list(&raw) {
+        if is_event_calendar(&raw) {
             let url = after_collections.join(&raw.href)?.to_string();
             out.push(DiscoveredCollection {
                 url,
@@ -404,18 +405,19 @@ struct RawCollection {
     href: String,
     display_name: Option<String>,
     components: Vec<String>,
-    /// Whether `resourcetype` contains a `<C:calendar/>` element. Real calendar
-    /// / reminders collections do; the scheduling inbox/outbox (which can still
-    /// advertise a `VTODO` component-set) do not — so this is what keeps the
-    /// `…/outbox/` collection out of the task-list picker.
-    is_calendar: bool,
+    /// Local element names under `<resourcetype>` (e.g. `collection`,
+    /// `calendar`, `schedule-outbox`). Used to drop the scheduling inbox/outbox.
+    resource_types: Vec<String>,
 }
 
-/// A genuine task list: a calendar collection that advertises `VTODO`. The
-/// `is_calendar` half excludes iCloud's scheduling inbox/outbox, which would
-/// otherwise slip through on the component-set alone.
-fn is_task_list(raw: &RawCollection) -> bool {
-    raw.is_calendar && raw.components.iter().any(|c| c == "VTODO")
+/// An event calendar = a *calendar* collection that advertises `VEVENT`.
+/// Requiring a `<calendar>` resourcetype excludes both the scheduling
+/// inbox/outbox **and** the calendar-home root itself — iCloud reports the home
+/// (a plain `<collection>`) with a component-set but rejects PUTs into it (HTTP
+/// 400), so it must not be offered as a target.
+fn is_event_calendar(raw: &RawCollection) -> bool {
+    raw.resource_types.iter().any(|t| t == "calendar")
+        && raw.components.iter().any(|c| c == "VEVENT")
 }
 
 /// Parse a Depth:1 PROPFIND multistatus into the child collections, reading
@@ -444,16 +446,21 @@ fn parse_collections(xml: &str) -> Vec<RawCollection> {
                 .filter(|n| n.tag_name().name() == "comp")
                 .filter_map(|n| n.attribute("name").map(str::to_owned))
                 .collect();
-            let is_calendar = resp
+            let resource_types = resp
                 .descendants()
                 .find(|n| n.tag_name().name() == "resourcetype")
-                .map(|rt| rt.descendants().any(|n| n.tag_name().name() == "calendar"))
-                .unwrap_or(false);
+                .map(|rt| {
+                    rt.children()
+                        .filter(roxmltree::Node::is_element)
+                        .map(|n| n.tag_name().name().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(RawCollection {
                 href,
                 display_name,
                 components,
-                is_calendar,
+                resource_types,
             })
         })
         .collect()
@@ -512,12 +519,23 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_vtodo_calendars_and_excludes_the_scheduling_outbox() {
-        // iCloud-shaped Depth:1 home listing: a VEVENT calendar, a VTODO
-        // reminders list, and the scheduling outbox — which advertises a VTODO
-        // component-set but is NOT a calendar, so it must be filtered out.
+    fn keeps_only_vevent_calendars() {
+        // iCloud-shaped Depth:1 home listing, mirroring what discovery returned
+        // live: the calendar-*home* root itself (resourcetype <collection> only,
+        // but iCloud advertises a component-set on it — PUTs there 400, so it
+        // must be dropped), a VEVENT calendar, the VTODO reminders list (a
+        // <calendar> but VEVENT-less — not an event target), and the scheduling
+        // outbox. Only the VEVENT calendar is a valid target.
         let xml = r#"<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/123/calendars/</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>Gustavo Noronha Silva</d:displayname>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <cal:supported-calendar-component-set><cal:comp name="VEVENT"/><cal:comp name="VTODO"/></cal:supported-calendar-component-set>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
   <d:response>
     <d:href>/123/calendars/work/</d:href>
     <d:propstat><d:prop>
@@ -544,42 +562,55 @@ mod tests {
 </d:multistatus>"#;
 
         let cols = parse_collections(xml);
-        let task_lists: Vec<_> = cols.iter().filter(|c| is_task_list(c)).collect();
-        assert_eq!(
-            task_lists.len(),
-            1,
-            "only the reminders list is a task list"
-        );
-        assert_eq!(task_lists[0].href, "/123/calendars/reminders/");
-        assert_eq!(task_lists[0].display_name.as_deref(), Some("Reminders"));
+        let names: Vec<_> = cols
+            .iter()
+            .filter(|c| is_event_calendar(c))
+            .filter_map(|c| c.display_name.as_deref())
+            .collect();
+        // Only the <calendar> + VEVENT calendar survives.
+        assert_eq!(names, vec!["Work"]);
 
-        // The outbox parsed (it has a VTODO comp) but is rejected for not being
-        // a calendar — the precise reason it used to leak into the picker.
+        // The calendar-home root advertises VEVENT but lacks a <calendar>
+        // resourcetype — it must be excluded (PUTs into it 400).
+        let home = cols
+            .iter()
+            .find(|c| c.href == "/123/calendars/")
+            .expect("home response should still parse");
+        assert!(home.components.iter().any(|c| c == "VEVENT"));
+        assert!(!home.resource_types.iter().any(|t| t == "calendar"));
+        assert!(!is_event_calendar(home));
+
+        // The VTODO reminders list is a real calendar but advertises no VEVENT.
+        let reminders = cols
+            .iter()
+            .find(|c| c.href == "/123/calendars/reminders/")
+            .expect("reminders response should still parse");
+        assert!(!is_event_calendar(reminders));
+
         let outbox = cols
             .iter()
             .find(|c| c.href == "/123/calendar/outbox/")
             .expect("outbox response should still parse");
-        assert!(outbox.components.iter().any(|c| c == "VTODO"));
-        assert!(!outbox.is_calendar);
-        assert!(!is_task_list(outbox));
+        assert!(!is_event_calendar(outbox));
     }
 
     #[test]
-    fn parses_report_into_tasks_and_through_vtodo() {
+    fn parses_report_into_tasks_and_through_vevent() {
         let xml = r#"<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
   <d:response>
-    <d:href>/123/calendars/reminders/abc.ics</d:href>
+    <d:href>/123/calendars/home/abc.ics</d:href>
     <d:propstat><d:prop>
       <d:getetag>"etag-xyz"</d:getetag>
       <cal:calendar-data>BEGIN:VCALENDAR
 VERSION:2.0
-PRODID:-//Apple//Reminders//EN
-BEGIN:VTODO
+PRODID:-//Apple//Calendar//EN
+BEGIN:VEVENT
 UID:abc-123
 SUMMARY:Pay rent
-STATUS:NEEDS-ACTION
-END:VTODO
+DTSTART;VALUE=DATE:20260601
+DTEND;VALUE=DATE:20260602
+END:VEVENT
 END:VCALENDAR</cal:calendar-data>
     </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
@@ -587,13 +618,13 @@ END:VCALENDAR</cal:calendar-data>
 
         let tasks = parse_report_tasks(xml);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].href, "/123/calendars/reminders/abc.ics");
+        assert_eq!(tasks[0].href, "/123/calendars/home/abc.ics");
         assert_eq!(tasks[0].etag, "\"etag-xyz\"");
 
-        let parsed = vtodo::parse_vtodo(&tasks[0].calendar_data).expect("a VTODO");
+        let parsed = vevent::parse_event(&tasks[0].calendar_data).expect("a VEVENT");
         assert_eq!(parsed.uid.as_deref(), Some("abc-123"));
         assert_eq!(parsed.summary.as_deref(), Some("Pay rent"));
-        assert_eq!(parsed.status, Some(TaskStatus::NeedsAction));
+        assert_eq!(parsed.due, Some(1_780_272_000));
     }
 
     #[test]
@@ -616,18 +647,23 @@ END:VCALENDAR</cal:calendar-data>
         );
     }
 
-    /// Live round-trip against a real CalDAV server. Skipped unless
+    /// Live round-trip against a real CalDAV server, through [`CaldavBackend`]
+    /// itself (create → list → update → delete an all-day VEVENT). Skipped unless
     /// `MNEMIS_TEST_CALDAV=live` plus credentials are set — mirroring the
-    /// `MNEMIS_TEST_LLM=live` convention. It is **self-cleaning**: it removes
-    /// any leftover test task first and deletes the one it creates, so it
-    /// doesn't litter your reminders. It does *not* touch the mnemis database.
+    /// `MNEMIS_TEST_LLM=live` convention. It is **self-cleaning** (deletes the
+    /// event it creates) and does *not* touch the mnemis database.
+    ///
+    /// Pick the calendar with `MNEMIS_TEST_CALDAV_LIST="<name>"` (e.g. a
+    /// throwaway "mnemis" calendar) or `MNEMIS_TEST_CALDAV_COLLECTION=<url>`;
+    /// otherwise the first discovered calendar is used. `MNEMIS_TEST_CALDAV_KEEP=1`
+    /// leaves the event in place so you can confirm it on your phone.
     ///
     /// ```text
     /// MNEMIS_TEST_CALDAV=live \
     ///   MNEMIS_TEST_CALDAV_URL=https://caldav.icloud.com \
     ///   MNEMIS_TEST_CALDAV_USER=you@icloud.com \
     ///   MNEMIS_TEST_CALDAV_PASS=app-specific-password \
-    ///   [MNEMIS_TEST_CALDAV_COLLECTION=https://.../reminders/] \
+    ///   MNEMIS_TEST_CALDAV_LIST="mnemis" [MNEMIS_TEST_CALDAV_KEEP=1] \
     ///   cargo test -p mnemis-engine --lib sync::caldav::tests::live_round_trip -- --nocapture
     /// ```
     #[tokio::test]
@@ -640,53 +676,87 @@ END:VCALENDAR</cal:calendar-data>
         let user = std::env::var("MNEMIS_TEST_CALDAV_USER").expect("MNEMIS_TEST_CALDAV_USER");
         let pass = std::env::var("MNEMIS_TEST_CALDAV_PASS").expect("MNEMIS_TEST_CALDAV_PASS");
 
-        let collections = discover_task_collections(&base, &user, &pass).await?;
-        assert!(!collections.is_empty(), "no VTODO collections discovered");
-        eprintln!("discovered {} task collection(s):", collections.len());
-        for c in &collections {
+        let calendars = discover_event_calendars(&base, &user, &pass).await?;
+        assert!(!calendars.is_empty(), "no VEVENT calendars discovered");
+        eprintln!("discovered {} calendar(s):", calendars.len());
+        for c in &calendars {
             eprintln!("  - {} ({:?})", c.url, c.display_name);
         }
+
+        // Target order: explicit URL, then a calendar picked by display name
+        // (MNEMIS_TEST_CALDAV_LIST="mnemis"), then the first discovered.
+        let by_name = |name: &str| {
+            calendars
+                .iter()
+                .find(|c| c.display_name.as_deref() == Some(name))
+                .map(|c| c.url.clone())
+        };
         let collection = std::env::var("MNEMIS_TEST_CALDAV_COLLECTION")
-            .unwrap_or_else(|_| collections[0].url.clone());
+            .ok()
+            .or_else(|| {
+                std::env::var("MNEMIS_TEST_CALDAV_LIST")
+                    .ok()
+                    .and_then(|n| by_name(&n))
+            })
+            .unwrap_or_else(|| calendars[0].url.clone());
         let backend = CaldavBackend::new(&collection, &user, &pass)?;
+        eprintln!("using calendar: {collection}");
 
         let uid = "mnemis-livetest@mnemis";
-        // Clean any leftover from a prior aborted run.
+        let keep = std::env::var("MNEMIS_TEST_CALDAV_KEEP").as_deref() == Ok("1");
+
+        // Clean any leftover from a prior run.
         for t in backend.list_tasks().await? {
             if t.uid == uid {
                 backend.delete_task(&t.href, &t.etag).await?;
             }
         }
 
-        let created = backend
-            .create_task(&TaskWrite {
-                uid: uid.to_string(),
-                summary: "mnemis live test — safe to delete".to_string(),
-                description: Some("Created by the mnemis live CalDAV test.".to_string()),
-                due: Some(1_780_000_000),
-                status: TaskStatus::NeedsAction,
-            })
-            .await?;
+        let write = TaskWrite {
+            uid: uid.to_string(),
+            summary: "mnemis live test — safe to delete".to_string(),
+            description: Some("Created by the mnemis live CalDAV test.".to_string()),
+            due: Some(1_780_272_000), // 2026-06-01 (all-day)
+        };
+        eprintln!(
+            "--- the iCalendar we PUT ---\n{}",
+            vevent::task_to_ics(&write)
+        );
+        let created = backend.create_task(&write).await?;
+        eprintln!("created resource href: {}", created.href);
+        eprintln!("created etag: {}", created.etag);
 
         let listed = backend.list_tasks().await?;
         let found = listed
             .iter()
             .find(|t| t.uid == uid)
-            .expect("the created task should appear in a fresh list");
+            .cloned()
+            .expect("the created event should appear in a fresh list");
+        eprintln!(
+            "calendar now lists {} event(s); ours is present",
+            listed.len()
+        );
         assert_eq!(found.summary, "mnemis live test — safe to delete");
-        assert_eq!(found.due, Some(1_780_000_000));
+        assert_eq!(found.due, Some(1_780_272_000));
 
-        // Complete it (exercise If-Match update).
+        if keep {
+            eprintln!(
+                "KEEP mode: left an all-day event 'mnemis live test' on 2026-06-01 in \
+                 {collection}. Check the Calendar app on your phone, then delete it by hand."
+            );
+            return Ok(());
+        }
+
+        // Edit it (exercise If-Match update).
         let new_etag = match backend
             .update_task(
                 &created.href,
                 &found.etag,
                 &TaskWrite {
                     uid: uid.to_string(),
-                    summary: "mnemis live test — done".to_string(),
+                    summary: "mnemis live test — updated".to_string(),
                     description: None,
-                    due: Some(1_780_000_000),
-                    status: TaskStatus::Completed,
+                    due: Some(1_780_272_000),
                 },
             )
             .await?
@@ -702,7 +772,7 @@ END:VCALENDAR</cal:calendar-data>
         }
         assert!(
             !backend.list_tasks().await?.iter().any(|t| t.uid == uid),
-            "task should be gone after delete"
+            "event should be gone after delete"
         );
         eprintln!("live round-trip OK (create → list → update → delete)");
         Ok(())

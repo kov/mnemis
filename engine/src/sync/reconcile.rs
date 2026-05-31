@@ -2,29 +2,28 @@
 //!
 //! Direction of authority follows the **ownership rule**: mnemis owns only
 //! `rationale` + `evidence`, which never leave the database (they aren't part of
-//! a VTODO), so they're preserved automatically; the calendar wins on
-//! everything it *can* express — title, due, status. Concretely, per tracked
-//! action:
+//! a VEVENT), so they're preserved automatically; the calendar wins on
+//! everything it *can* express — title and due date. A calendar event has no
+//! "done" state, so completion only flows mnemis → calendar (as a deletion).
+//! Concretely, per tracked action:
 //!
+//! - **Resolved locally** (`done`/`cancelled`/`dismissed`): delete the event and
+//!   drop the calendar linkage (keeping `due_at` + status) — a done item doesn't
+//!   belong on the calendar, and clearing the link stops it being re-created.
 //! - **Remote changed** (its ETag differs from what we stored): pull the remote
-//!   title/due/status into the action, even if we also had a pending local edit
-//!   — the calendar's edit was a deliberate user act, so it wins.
+//!   title/due into the action, even if we also had a pending local edit — the
+//!   calendar's edit was a deliberate user act, so it wins.
 //! - **Only local changed** (`sync_status = 'dirty'`, ETag still matches): push
 //!   our edit with `If-Match`. A `412` (someone raced us) parks the action in
 //!   `needs_review` rather than looping.
-//! - **Tracked but gone from the server**: the user deleted the reminder →
+//! - **Tracked but gone from the server**: the user deleted the event →
 //!   "unpromote" the action (drop `due_at` + the calendar linkage) so it stays
 //!   in mnemis but is no longer a reminder, and isn't immediately re-created.
-//! - **New + has a due date + not terminal**: create a VTODO and record the
-//!   `uid`/`href`/`etag`.
+//! - **New + has a due date + not terminal**: create an all-day VEVENT and record
+//!   the `uid`/`href`/`etag`.
 //!
-//! Remote tasks with no matching action are left alone — mnemis doesn't import
-//! arbitrary reminders the user created directly (out of scope for v1).
-//!
-//! Status mapping is many-to-one (the remote has four states), so a *pulled*
-//! status is only applied when it differs from what the current action would
-//! *push* — see [`TaskStatus`] — which keeps a clean round-trip from demoting
-//! e.g. `auto_claimed` to `pending`.
+//! Remote events with no matching action are left alone — mnemis doesn't import
+//! arbitrary calendar events the user created directly (out of scope for v1).
 
 use std::collections::HashMap;
 
@@ -33,7 +32,7 @@ use chrono::Utc;
 use mnemis_types::ActionStatus;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
-use super::{Conditional, RemoteTask, TaskBackend, TaskStatus, TaskWrite};
+use super::{Conditional, RemoteTask, TaskBackend, TaskWrite};
 
 /// Tally of what a sync run did, for the status panel / logs.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -44,7 +43,9 @@ pub struct SyncSummary {
     pub pushed: usize,
     /// Remote edits pulled into local actions.
     pub pulled: usize,
-    /// Reminders deleted on the server → actions unpromoted locally.
+    /// Events removed from the calendar — either the action was resolved locally
+    /// (linkage cleared, `due_at` kept) or the user deleted it remotely (action
+    /// unpromoted).
     pub removed: usize,
     /// Push conflicts parked as `needs_review`.
     pub conflicts: usize,
@@ -108,7 +109,24 @@ async fn reconcile_one(
             Some(rt) => {
                 let remote_changed = row.etag.as_deref() != Some(rt.etag.as_str());
                 let dirty = row.sync_status.as_deref() == Some("dirty");
-                if remote_changed {
+                if is_terminal(row.status) {
+                    // Resolved locally → a calendar event can't be "done", so
+                    // remove it. Use the freshly-listed etag for If-Match.
+                    let href = row
+                        .href
+                        .as_deref()
+                        .context("terminal action has no external_href")?;
+                    match backend.delete_task(href, &rt.etag).await? {
+                        Conditional::Ok(()) => {
+                            clear_link(pool, row.id).await?;
+                            Ok(Outcome::Removed)
+                        }
+                        Conditional::Conflict => {
+                            mark_needs_review(pool, row.id).await?;
+                            Ok(Outcome::Conflict)
+                        }
+                    }
+                } else if remote_changed {
                     apply_remote(pool, row, rt).await?;
                     Ok(Outcome::Pulled)
                 } else if dirty {
@@ -163,7 +181,6 @@ fn task_write(row: &LocalRow, uid: &str) -> TaskWrite {
         summary: row.title.clone(),
         description: row.details.clone(),
         due: row.due_at,
-        status: TaskStatus::from_action_status(row.status),
     }
 }
 
@@ -211,9 +228,9 @@ async fn load_local(pool: &SqlitePool) -> Result<Vec<LocalRow>> {
         .collect()
 }
 
-/// Calendar-wins: overwrite local title/details/due (and status, only if it
-/// genuinely changed) from the remote task. `rationale`/`evidence` are never
-/// touched — they aren't in the VTODO.
+/// Calendar-wins: overwrite local title/details/due from the remote event.
+/// `rationale`/`evidence` are never touched — they aren't in the VEVENT. There
+/// is no status to pull: a calendar event has no "done" state.
 async fn apply_remote(pool: &SqlitePool, row: &LocalRow, rt: &RemoteTask) -> Result<()> {
     let now = Utc::now().timestamp();
     let title = if rt.summary.is_empty() {
@@ -237,76 +254,16 @@ async fn apply_remote(pool: &SqlitePool, row: &LocalRow, rt: &RemoteTask) -> Res
     .await
     .context("applying remote fields")?;
 
-    let pushed_status = TaskStatus::from_action_status(row.status);
-    if rt.status != pushed_status {
-        let new_status = rt.status.to_action_status();
-        set_status_columns(&mut tx, row.id, new_status, now).await?;
-        insert_event(
-            &mut tx,
-            row.id,
-            event_kind_for_pull(new_status),
-            serde_json::json!({ "caldav": "pulled", "to": status_str(new_status) }),
-            now,
-        )
-        .await?;
-    } else {
-        insert_event(
-            &mut tx,
-            row.id,
-            "updated",
-            serde_json::json!({ "caldav": "pulled" }),
-            now,
-        )
-        .await?;
-    }
+    insert_event(
+        &mut tx,
+        row.id,
+        "updated",
+        serde_json::json!({ "caldav": "pulled" }),
+        now,
+    )
+    .await?;
 
     tx.commit().await.context("commit caldav reconcile tx")
-}
-
-async fn set_status_columns(
-    tx: &mut Transaction<'_, Sqlite>,
-    action_id: i64,
-    new_status: ActionStatus,
-    now: i64,
-) -> Result<()> {
-    match new_status {
-        ActionStatus::Claimed => {
-            sqlx::query(
-                "UPDATE actions SET status = 'claimed', claimed_at = ?, resolved_at = NULL \
-                 WHERE id = ?",
-            )
-            .bind(now)
-            .bind(action_id)
-            .execute(&mut **tx)
-            .await?;
-        }
-        ActionStatus::Done | ActionStatus::Cancelled => {
-            sqlx::query("UPDATE actions SET status = ?, resolved_at = ? WHERE id = ?")
-                .bind(status_str(new_status))
-                .bind(now)
-                .bind(action_id)
-                .execute(&mut **tx)
-                .await?;
-        }
-        ActionStatus::Pending => {
-            sqlx::query(
-                "UPDATE actions SET status = 'pending', claimed_at = NULL, resolved_at = NULL \
-                 WHERE id = ?",
-            )
-            .bind(action_id)
-            .execute(&mut **tx)
-            .await?;
-        }
-        // The pull mapping never produces these.
-        ActionStatus::AutoClaimed | ActionStatus::Dismissed => {
-            sqlx::query("UPDATE actions SET status = ? WHERE id = ?")
-                .bind(status_str(new_status))
-                .bind(action_id)
-                .execute(&mut **tx)
-                .await?;
-        }
-    }
-    Ok(())
 }
 
 async fn mark_pushed(pool: &SqlitePool, action_id: i64, new_etag: &str) -> Result<()> {
@@ -397,6 +354,30 @@ async fn link_created(
     tx.commit().await.map_err(Into::into)
 }
 
+/// The action was resolved locally and its event removed from the calendar.
+/// Drop the calendar linkage but keep `due_at` + the resolved status — unlike
+/// [`unpromote`], the action stays "done with a date", just no longer synced.
+async fn clear_link(pool: &SqlitePool, action_id: i64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE actions SET external_calendar_uid = NULL, external_href = NULL, \
+         external_etag = NULL, sync_status = NULL, sync_error = NULL WHERE id = ?",
+    )
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await?;
+    insert_event(
+        &mut tx,
+        action_id,
+        "updated",
+        serde_json::json!({ "caldav": "completed_removed" }),
+        now,
+    )
+    .await?;
+    tx.commit().await.map_err(Into::into)
+}
+
 async fn insert_event(
     tx: &mut Transaction<'_, Sqlite>,
     action_id: i64,
@@ -418,26 +399,6 @@ async fn insert_event(
     Ok(())
 }
 
-fn event_kind_for_pull(new_status: ActionStatus) -> &'static str {
-    match new_status {
-        ActionStatus::Claimed => "claimed",
-        ActionStatus::Done | ActionStatus::Cancelled => "resolved",
-        ActionStatus::Pending => "unresolved",
-        _ => "updated",
-    }
-}
-
-fn status_str(status: ActionStatus) -> &'static str {
-    match status {
-        ActionStatus::Pending => "pending",
-        ActionStatus::AutoClaimed => "auto_claimed",
-        ActionStatus::Claimed => "claimed",
-        ActionStatus::Done => "done",
-        ActionStatus::Cancelled => "cancelled",
-        ActionStatus::Dismissed => "dismissed",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +416,7 @@ mod tests {
         tasks: Mutex<HashMap<String, RemoteTask>>,
         created: Mutex<Vec<TaskWrite>>,
         updated: Mutex<Vec<TaskWrite>>,
+        deleted: Mutex<Vec<String>>,
         force_update_conflict: bool,
         next_etag: Mutex<u64>,
     }
@@ -489,7 +451,6 @@ mod tests {
                     summary: task.summary.clone(),
                     description: task.description.clone(),
                     due: task.due,
-                    status: task.status,
                 },
             );
             Ok(Created { href, etag })
@@ -508,12 +469,13 @@ mod tests {
             if let Some(t) = self.tasks.lock().unwrap().get_mut(&task.uid) {
                 t.summary = task.summary.clone();
                 t.due = task.due;
-                t.status = task.status;
                 t.etag = etag.clone();
             }
             Ok(Conditional::Ok(etag))
         }
-        async fn delete_task(&self, _href: &str, _etag: &str) -> Result<Conditional<()>> {
+        async fn delete_task(&self, href: &str, _etag: &str) -> Result<Conditional<()>> {
+            self.deleted.lock().unwrap().push(href.to_owned());
+            self.tasks.lock().unwrap().retain(|_, t| t.href != href);
             Ok(Conditional::Ok(()))
         }
     }
@@ -556,13 +518,7 @@ mod tests {
         Ok(id)
     }
 
-    fn remote(
-        uid: &str,
-        summary: &str,
-        etag: &str,
-        status: TaskStatus,
-        due: Option<i64>,
-    ) -> RemoteTask {
+    fn remote(uid: &str, summary: &str, etag: &str, due: Option<i64>) -> RemoteTask {
         RemoteTask {
             uid: uid.into(),
             href: format!("https://srv/cal/{uid}.ics"),
@@ -570,7 +526,6 @@ mod tests {
             summary: summary.into(),
             description: None,
             due,
-            status,
         }
     }
 
@@ -593,7 +548,6 @@ mod tests {
             "mnemis-1@mnemis",
             "new title",
             "\"e2\"",
-            TaskStatus::NeedsAction,
             Some(200),
         ));
 
@@ -624,46 +578,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_completion_marks_done() -> Result<()> {
+    async fn done_action_deletes_remote_event() -> Result<()> {
+        // A calendar event has no "done" state, so resolving an action locally
+        // removes its event and drops the linkage — but keeps due_at + status.
         let (_tmp, pool) = pool().await?;
         let id = insert_action(
             &pool,
             "task",
-            "r",
-            "pending",
+            "because Ana asked",
+            "done",
             Some(100),
             Some("mnemis-1@mnemis"),
-            Some("h"),
+            Some("https://srv/cal/mnemis-1@mnemis.ics"),
             Some("\"e1\""),
-            Some("synced"),
+            Some("dirty"),
         )
         .await?;
         let backend = MockBackend::default().with_task(remote(
             "mnemis-1@mnemis",
             "task",
-            "\"e2\"",
-            TaskStatus::Completed,
+            "\"e1\"",
             Some(100),
         ));
 
-        sync_caldav(&pool, &backend).await?;
+        let summary = sync_caldav(&pool, &backend).await?;
+        assert_eq!(summary.removed, 1);
+        assert_eq!(
+            backend.deleted.lock().unwrap().as_slice(),
+            ["https://srv/cal/mnemis-1@mnemis.ics"]
+        );
+        assert!(
+            backend.tasks.lock().unwrap().is_empty(),
+            "the event should be gone from the server"
+        );
 
-        let (status, resolved): (String, Option<i64>) =
-            sqlx::query_as("SELECT status, resolved_at FROM actions WHERE id = ?")
-                .bind(id)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(status, "done");
-        assert!(resolved.is_some());
-
-        let (kind, actor): (String, String) = sqlx::query_as(
-            "SELECT event_kind, actor FROM action_events WHERE action_id = ? ORDER BY id DESC LIMIT 1",
+        let (status, due, uid, sync_status, rationale): (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT status, due_at, external_calendar_uid, sync_status, rationale \
+             FROM actions WHERE id = ?",
         )
         .bind(id)
         .fetch_one(&pool)
         .await?;
-        assert_eq!(kind, "resolved");
-        assert_eq!(actor, "caldav_sync");
+        assert_eq!(status, "done", "status is unchanged");
+        assert_eq!(due, Some(100), "due_at is kept");
+        assert_eq!(uid, None, "calendar linkage is cleared");
+        assert_eq!(sync_status, None);
+        assert_eq!(rationale, "because Ana asked", "rationale preserved");
+
+        let (kind,): (String,) = sqlx::query_as(
+            "SELECT event_kind FROM action_events WHERE action_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(kind, "updated");
         Ok(())
     }
 
@@ -742,7 +716,6 @@ mod tests {
             "mnemis-1@mnemis",
             "old title",
             "\"e1\"",
-            TaskStatus::NeedsAction,
             Some(100),
         ));
 
@@ -778,13 +751,8 @@ mod tests {
             Some("dirty"),
         )
         .await?;
-        let mut backend = MockBackend::default().with_task(remote(
-            "mnemis-1@mnemis",
-            "old",
-            "\"e1\"",
-            TaskStatus::NeedsAction,
-            Some(100),
-        ));
+        let mut backend =
+            MockBackend::default().with_task(remote("mnemis-1@mnemis", "old", "\"e1\"", Some(100)));
         backend.force_update_conflict = true;
 
         let summary = sync_caldav(&pool, &backend).await?;
