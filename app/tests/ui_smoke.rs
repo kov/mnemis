@@ -620,6 +620,203 @@ async fn settings_sources_per_channel_mute_round_trips() -> Result<()> {
     Ok(())
 }
 
+/// Regression guard for the scroll-reset bug: toggling a folder checkbox must
+/// not move the page's scroll offset. The per-channel mute state lives in
+/// signals owned by `ChannelsList`, so a toggle updates one row in place
+/// instead of refetching and rebuilding the whole `<ul>` (which collapsed the
+/// document back to the top). Seed enough flat folders to overflow the window,
+/// scroll to the bottom, toggle a checkbox, and assert the offset survives.
+#[tokio::test(flavor = "current_thread")]
+async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-channel-scroll.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        let (sid,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        // 60 flat mailboxes render ~1300px of rows — taller than the 750px
+        // window — so there's a real scroll offset to lose.
+        for i in 0..60 {
+            let name = format!("Folder{i:02}");
+            sqlx::query(
+                "INSERT INTO channels (source_id, external_id, name, kind) \
+                 VALUES (?, ?, ?, 'mailbox')",
+            )
+            .bind(sid)
+            .bind(&name)
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+        }
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    // Navigate Actions → Settings → Sources.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("nav.nav"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/settings"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("ul.settings-home"))
+        .await?;
+    client
+        .execute(
+            r#"document.querySelector('ul.settings-home a[href="/settings/sources"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("table.sources-table tr.source-row"))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Expand the source and wait for every seeded folder to render (discovery
+    // falls back to the DB list when the fake source can't connect), so the
+    // page is at full height before we measure scroll.
+    client
+        .execute(
+            r#"document.querySelector('tr.source-row[data-source-id] button.source-expand').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("ul.channels-tree li.channel-row"))
+        .await
+        .context("waiting for channels tree to render")?;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let count = client
+            .execute(
+                r#"return String(document.querySelectorAll('li.channel-row').length);"#,
+                vec![],
+            )
+            .await?;
+        if count.as_str() == Some("60") {
+            break;
+        }
+    }
+    let count = client
+        .execute(
+            r#"return String(document.querySelectorAll('li.channel-row').length);"#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(count.as_str(), Some("60"), "expected 60 folder rows");
+
+    // Scroll to the bottom and record where it landed. If the content doesn't
+    // overflow the viewport this guard is meaningless, so require a real offset.
+    let before = client
+        .execute(
+            r#"
+            const se = document.scrollingElement;
+            se.scrollTop = se.scrollHeight;
+            return String(se.scrollTop);
+            "#,
+            vec![],
+        )
+        .await?;
+    let before_px: f64 = before.as_str().unwrap_or("0").parse().unwrap_or(0.0);
+    assert!(
+        before_px > 50.0,
+        "page should be scrollable; scrollTop was {before_px}"
+    );
+
+    // Toggle a checkbox while scrolled down. Programmatic .click() never moves
+    // the viewport, so any scroll change here is the rebuild-resets-scroll bug.
+    let click = client
+        .execute(
+            r#"
+            const li = Array.from(document.querySelectorAll('li.channel-row'))
+                .find(el => el.querySelector('.channel-name')?.textContent.trim() === 'Folder30');
+            if (!li) { return 'missing-li'; }
+            const cb = li.querySelector('input.channel-checkbox');
+            if (!cb) { return 'missing-checkbox'; }
+            cb.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        click.as_str(),
+        Some("ok"),
+        "checkbox click failed: {click:?}"
+    );
+
+    // Wait for the toggle to land (the DB write completes; in the buggy code
+    // this is also when the refetch would have rebuilt the list and reset
+    // scroll), then assert the offset is unchanged.
+    let mut toggled = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let state = client
+            .execute(
+                r#"
+                const li = Array.from(document.querySelectorAll('li.channel-row'))
+                    .find(el => el.querySelector('.channel-name')?.textContent.trim() === 'Folder30');
+                return li ? li.getAttribute('data-channel-muted') : 'gone';
+                "#,
+                vec![],
+            )
+            .await?;
+        if state.as_str() == Some("true") {
+            toggled = true;
+            break;
+        }
+    }
+    assert!(toggled, "Folder30 should be muted after the toggle");
+
+    let after = client
+        .execute(
+            r#"return String(document.scrollingElement.scrollTop);"#,
+            vec![],
+        )
+        .await?;
+    let after_px: f64 = after.as_str().unwrap_or("0").parse().unwrap_or(0.0);
+    assert!(
+        (after_px - before_px).abs() < 8.0,
+        "scroll offset jumped on checkbox toggle: was {before_px}, now {after_px}"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
+
 /// Two adjacent flows share one seeded DB: dismissing a pending action with
 /// a comment writes a `dismissal_feedback` row, while undoing an auto-claim
 /// via the Skip path writes none (the user often took the action out of band

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -20,12 +21,11 @@ use crate::{
     confidence_class, confirm_resolution, create_chat, delete_caldav_account, delete_chat,
     delete_source, discover_source_channels, fetch_actions, fetch_caldav_account, fetch_chat_seed,
     fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
-    fetch_settings_sources, fetch_source_channels, fetch_status, fetch_user_profile,
-    list_caldav_collections, open_external, promote_to_reminder, reject_resolution,
-    run_sync_caldav, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
-    set_caldav_collection, set_channel_muted, set_channels_muted_bulk, set_chat_archived,
-    set_chat_show_reasoning, set_source_muted, status_label, submit_dismissal_feedback,
-    update_action,
+    fetch_settings_sources, fetch_status, fetch_user_profile, list_caldav_collections,
+    open_external, promote_to_reminder, reject_resolution, run_sync_caldav, run_sync_now,
+    save_llm_config, save_user_profile, send_chat_message, set_caldav_collection,
+    set_channel_muted, set_channels_muted_bulk, set_chat_archived, set_chat_show_reasoning,
+    set_source_muted, status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -1336,35 +1336,23 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
 
 #[component]
 fn SourceChannels(source_id: i64) -> impl IntoView {
-    // First load discovers folders from the server, so newly created
-    // server-side folders show up when the view opens. Later refetches — e.g.
-    // after a mute toggle — just re-read the DB, so muting never triggers a
-    // network round-trip (or, on macOS, a keychain prompt).
-    let reload = RwSignal::new(0u32);
-    let discovered = RwSignal::new(false);
-    let channels = LocalResource::new(move || {
-        let _ = reload.get();
-        async move {
-            if discovered.get_untracked() {
-                fetch_source_channels(source_id).await
-            } else {
-                let rows = discover_source_channels(source_id).await;
-                discovered.set(true);
-                rows
-            }
-        }
-    });
-    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || reload.update(|n| *n += 1));
+    // Discover folders from the server when the view opens, so folders created
+    // server-side since the last sync show up. Mute toggles update state in
+    // place (see `ChannelsList`) and never refetch, so the list is never
+    // remounted mid-edit — the scroll offset and tree expansion survive every
+    // click, and muting triggers no network round-trip (or macOS keychain
+    // prompt).
+    let channels =
+        LocalResource::new(move || async move { discover_source_channels(source_id).await });
     view! {
         <Suspense fallback=|| view! { <div class="loading">"Loading folders…"</div> }>
             {move || {
-                let refetch = refetch.clone();
-                channels.get().map(move |res| match res {
+                channels.get().map(|res| match res {
                     Ok(rows) if rows.is_empty() => view! {
                         <div class="empty">"No folders found for this account."</div>
                     }.into_any(),
                     Ok(rows) => view! {
-                        <ChannelsList rows=rows refetch=refetch />
+                        <ChannelsList rows=rows />
                     }.into_any(),
                     Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
                 })
@@ -1430,39 +1418,34 @@ fn build_tree(rows: Vec<ChannelRowDto>) -> Vec<ChannelNode> {
     roots
 }
 
-/// Walk the tree collecting every channel id (skipping pure folders).
-fn collect_channel_ids(nodes: &[ChannelNode], out: &mut Vec<i64>) {
-    for n in nodes {
-        if let Some(c) = &n.channel {
-            out.push(c.id);
-        }
-        collect_channel_ids(&n.children, out);
-    }
-}
-
 #[component]
-fn ChannelsList(rows: Vec<ChannelRowDto>, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
+fn ChannelsList(rows: Vec<ChannelRowDto>) -> impl IntoView {
     let tree = build_tree(rows.clone());
-    let all_ids = {
-        let mut v = Vec::new();
-        collect_channel_ids(&tree, &mut v);
-        v
-    };
-    let total = all_ids.len();
 
-    // Deliberately *don't* bump the source-list refetch on channel writes:
-    // remounting the source row from a fresh fetch would collapse the
-    // expanded tree mid-toggle. The source-level "Muted" badge can be
-    // slightly stale until next nav — acceptable trade-off because the user
-    // is now working at channel granularity.
+    // One muted-signal per channel, owned by this list so both single toggles
+    // and the bulk buttons can update state *in place*. Nothing refetches on a
+    // write, so the `<ul>` is never recreated — the scroll offset and tree
+    // expansion survive every click. (The source-level "Muted" badge can be
+    // slightly stale until next nav — fine, the user is editing at channel
+    // granularity here.)
+    let muted_signals: Arc<HashMap<i64, RwSignal<bool>>> = Arc::new(
+        rows.iter()
+            .map(|r| (r.id, RwSignal::new(r.muted)))
+            .collect(),
+    );
+    let total = muted_signals.len();
+
     let bulk = {
-        let refetch = refetch.clone();
+        let muted_signals = muted_signals.clone();
         move |muted: bool| {
-            let refetch = refetch.clone();
-            let ids = all_ids.clone();
+            let muted_signals = muted_signals.clone();
+            let ids: Vec<i64> = muted_signals.keys().copied().collect();
             spawn_local(async move {
-                let _ = set_channels_muted_bulk(ids, muted).await;
-                refetch();
+                if set_channels_muted_bulk(ids, muted).await.is_ok() {
+                    for sig in muted_signals.values() {
+                        sig.set(muted);
+                    }
+                }
             });
         }
     };
@@ -1480,13 +1463,13 @@ fn ChannelsList(rows: Vec<ChannelRowDto>, refetch: Arc<dyn Fn() + Send + Sync>) 
         </div>
         <ul class="channels-tree channels-list">
             {tree.into_iter().map(|node| {
-                render_node(node, refetch.clone())
+                render_node(node, muted_signals.clone())
             }).collect_view()}
         </ul>
     }
 }
 
-fn render_node(node: ChannelNode, refetch: Arc<dyn Fn() + Send + Sync>) -> AnyView {
+fn render_node(node: ChannelNode, muted_signals: Arc<HashMap<i64, RwSignal<bool>>>) -> AnyView {
     let label = node.label.clone();
     let children = node.children;
     let row_view = match node.channel {
@@ -1494,19 +1477,20 @@ fn render_node(node: ChannelNode, refetch: Arc<dyn Fn() + Send + Sync>) -> AnyVi
             let id = channel.id;
             let kind = channel.kind.clone();
             let count = channel.message_count;
-            let muted = RwSignal::new(channel.muted);
-            let on_toggle = {
-                let refetch = refetch.clone();
-                move |_| {
-                    let refetch = refetch.clone();
-                    let next = !muted.get();
-                    spawn_local(async move {
-                        if set_channel_muted(id, next).await.is_ok() {
-                            muted.set(next);
-                        }
-                        refetch();
-                    });
-                }
+            // Signal is owned by `ChannelsList`, so toggling updates in place
+            // with no DOM rebuild. Fall back to a local signal if a path
+            // somehow has no entry, so a malformed tree can't panic.
+            let muted = muted_signals
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| RwSignal::new(channel.muted));
+            let on_toggle = move |_| {
+                let next = !muted.get();
+                spawn_local(async move {
+                    if set_channel_muted(id, next).await.is_ok() {
+                        muted.set(next);
+                    }
+                });
             };
             view! {
                 <li class="channel-row"
@@ -1540,11 +1524,10 @@ fn render_node(node: ChannelNode, refetch: Arc<dyn Fn() + Send + Sync>) -> AnyVi
     let children_view = if children.is_empty() {
         ().into_any()
     } else {
-        let refetch = refetch.clone();
         view! {
             <ul class="channel-children">
                 {children.into_iter().map(|c| {
-                    render_node(c, refetch.clone())
+                    render_node(c, muted_signals.clone())
                 }).collect_view()}
             </ul>
         }
