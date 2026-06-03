@@ -143,6 +143,7 @@ pub async fn sync(cfg: &Config) -> Result<()> {
         embedder,
         &cfg.llm.chat_model,
         mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens()),
+        std::time::Duration::from_secs(cfg.llm.resolved_chat_idle_timeout_secs()),
         Some(&traces),
     )
     .await?;
@@ -238,6 +239,7 @@ pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
         channel_id,
         &cfg.llm.chat_model,
         mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens()),
+        std::time::Duration::from_secs(cfg.llm.resolved_chat_idle_timeout_secs()),
         Some(&traces),
     )
     .await?;
@@ -287,11 +289,14 @@ pub async fn chat(
     };
 
     let system_prompt = chat::prompt::build_system_prompt(&pool, chat_id).await?;
-    let budget =
-        mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens());
+    let max_context_tokens = cfg.llm.resolved_max_context_tokens();
+    let budget = mnemis_engine::extract::window_char_budget_for(max_context_tokens);
 
     println!("you: {text}\n");
     let sink = |e: ChatEvent| match e {
+        // The CLI prints the whole answer once it lands (below); ignore the
+        // incremental deltas so the text isn't doubled.
+        ChatEvent::Delta { .. } => {}
         ChatEvent::Reasoning { text } => println!("  💭 {}", text.replace('\n', "\n     ")),
         ChatEvent::ToolCall { name, arguments } => println!("  → {name}({arguments})"),
         ChatEvent::ToolResult { name, output } => {
@@ -299,6 +304,7 @@ pub async fn chat(
             println!("  ← {name}: {trimmed}");
         }
         ChatEvent::AssistantMessage { text } => println!("\n{text}"),
+        ChatEvent::Compacting => println!("  … condensing earlier conversation to fit context"),
         ChatEvent::Done => {}
         ChatEvent::Error { message } => eprintln!("\nerror: {message}"),
     };
@@ -311,6 +317,9 @@ pub async fn chat(
         chat_id,
         text,
         budget,
+        max_context_tokens,
+        std::time::Duration::from_secs(cfg.llm.resolved_chat_idle_timeout_secs()),
+        None,
         &sink,
         Some(&traces),
     )

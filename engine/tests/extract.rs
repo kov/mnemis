@@ -63,6 +63,7 @@ async fn extracts_explicit_ask_into_high_confidence_action() -> Result<()> {
         ctx.channel_id,
         &ctx.model,
         DEFAULT_WINDOW_CHAR_BUDGET,
+        std::time::Duration::from_secs(60),
         None,
     )
     .await?;
@@ -128,6 +129,7 @@ async fn skips_purely_informational_message() -> Result<()> {
         ctx.channel_id,
         &ctx.model,
         DEFAULT_WINDOW_CHAR_BUDGET,
+        std::time::Duration::from_secs(60),
         None,
     )
     .await?;

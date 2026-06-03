@@ -21,15 +21,30 @@ use crate::source::Recipient;
 
 // ---------- MockLlm ------------------------------------------------------
 
-/// Returns scripted responses in FIFO order. Panics on unscripted call.
+/// One scripted send outcome: a reply, or an error the transport returns (e.g.
+/// to exercise the chat loop's reactive compaction on a context-overflow 400).
+pub enum MockStep {
+    Reply(ResponsesResponse),
+    Error(String),
+}
+
+/// Returns scripted outcomes in FIFO order. Panics on unscripted call.
 pub struct MockLlm {
-    queue: Mutex<Vec<ResponsesResponse>>,
+    queue: Mutex<Vec<MockStep>>,
 }
 
 impl MockLlm {
     pub fn new(responses: Vec<ResponsesResponse>) -> Self {
         Self {
-            queue: Mutex::new(responses),
+            queue: Mutex::new(responses.into_iter().map(MockStep::Reply).collect()),
+        }
+    }
+
+    /// Script arbitrary outcomes — interleave `MockStep::Error` to simulate a
+    /// server rejection on a specific send.
+    pub fn scripted(steps: Vec<MockStep>) -> Self {
+        Self {
+            queue: Mutex::new(steps),
         }
     }
 }
@@ -43,11 +58,17 @@ impl LlmTransport for MockLlm {
         _tools: &[ToolDef],
         _previous_response_id: Option<&str>,
     ) -> Result<ResponsesResponse> {
-        let mut q = self.queue.lock().expect("MockLlm queue poisoned");
-        if q.is_empty() {
-            panic!("MockLlm: agent loop called send() with empty script");
+        let step = {
+            let mut q = self.queue.lock().expect("MockLlm queue poisoned");
+            if q.is_empty() {
+                panic!("MockLlm: agent loop called send() with empty script");
+            }
+            q.remove(0)
+        };
+        match step {
+            MockStep::Reply(r) => Ok(r),
+            MockStep::Error(msg) => Err(anyhow::anyhow!(msg)),
         }
-        Ok(q.remove(0))
     }
 }
 
@@ -127,6 +148,16 @@ pub mod mock {
                 text: text.to_string(),
             }],
         }])
+    }
+
+    /// A scripted send that fails the way omlx rejects an oversize prompt —
+    /// for exercising the chat loop's reactive compaction + retry.
+    pub fn context_overflow() -> super::MockStep {
+        super::MockStep::Error(
+            "LLM API error (HTTP 400 Bad Request): Prompt too long: 40000 tokens exceeds max \
+             context window of 32768 tokens"
+                .to_string(),
+        )
     }
 
     /// Build a turn from arbitrary output items.

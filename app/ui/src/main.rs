@@ -437,6 +437,16 @@ pub async fn delete_chat(chat_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Stop the in-flight chat send for `chat_id` (the Stop button). Best-effort:
+/// the streaming send returns its partial answer and the turn ends cleanly.
+pub async fn cancel_chat_message(chat_id: i64) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&ChatIdArgs { chat_id }).map_err(|e| e.to_string())?;
+    invoke("cancel_chat_message", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct CreateChatArgs {
     seeded_from_kind: Option<String>,
@@ -620,6 +630,10 @@ pub struct ChatUiState {
     /// The user message being answered (shown optimistically until its
     /// persisted copy appears in the transcript).
     pub pending_user: RwSignal<Option<String>>,
+    /// Assistant text accumulated from streamed `Delta` events for the
+    /// in-flight turn — rendered live, then cleared the moment the completed
+    /// (persisted) message arrives so nothing shows twice.
+    pub streaming_text: RwSignal<String>,
     /// True while a send is in flight (one at a time).
     pub sending: RwSignal<bool>,
     /// Bumped on every streamed event (and on completion) so any mounted
@@ -645,6 +659,7 @@ fn App() -> impl IntoView {
         show_reasoning: RwSignal::new(true),
         active_id: RwSignal::new(None),
         pending_user: RwSignal::new(None),
+        streaming_text: RwSignal::new(String::new()),
         sending: RwSignal::new(false),
         refresh: RwSignal::new(0u32),
         error: RwSignal::new(None),

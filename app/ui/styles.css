@@ -664,6 +664,31 @@ h1 {
 }
 
 .chat-thinking { color: var(--muted); align-self: flex-start; }
+/* While the conversation is being condensed to fit the context window. */
+.chat-thinking.chat-compacting { font-style: italic; font-size: 0.85rem; }
+
+/* The assistant bubble while it's still streaming: raw text (not yet
+   markdown-rendered), so keep newlines, and trail a blinking caret to show
+   it's live. Cleared the moment the persisted, rendered copy takes over. */
+.chat-streaming {
+  white-space: pre-wrap;
+}
+.chat-streaming::after {
+  content: "\258d";
+  margin-left: 1px;
+  color: var(--muted);
+  animation: chat-caret-blink 1s steps(2, start) infinite;
+}
+@keyframes chat-caret-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* Stop replaces Send while a turn is in flight. */
+.chat-stop {
+  color: var(--fg);
+}
 
 .chat-error { align-self: flex-start; margin-top: 0.25rem; }
 

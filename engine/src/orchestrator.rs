@@ -19,7 +19,7 @@ use chrono::Utc;
 use mnemis_types::SyncOutcome;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, trace, warn};
 
 use crate::embed::{Embedder, drain_once};
@@ -44,6 +44,7 @@ pub async fn sync_now(
     embedder: Arc<dyn Embedder>,
     model_name: &str,
     window_char_budget: usize,
+    idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
@@ -68,6 +69,7 @@ pub async fn sync_now(
             &embedder,
             model_name,
             window_char_budget,
+            idle_timeout,
             traces_dir,
         )
         .await
@@ -183,6 +185,7 @@ async fn sync_one_source(
     embedder: &Arc<dyn Embedder>,
     model_name: &str,
     window_char_budget: usize,
+    idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     let source = build_imap_source(pool, SourceId(source_id)).await?;
@@ -195,6 +198,7 @@ async fn sync_one_source(
         embedder,
         model_name,
         window_char_budget,
+        idle_timeout,
         traces_dir,
     )
     .await
@@ -212,6 +216,7 @@ async fn sync_one_source_with(
     embedder: &Arc<dyn Embedder>,
     model_name: &str,
     window_char_budget: usize,
+    idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     // Refresh the folder list from the server first, so a freshly added source
@@ -318,6 +323,7 @@ async fn sync_one_source_with(
             channel_id,
             model_name,
             window_char_budget,
+            idle_timeout,
             traces_dir,
         )
         .await
@@ -513,6 +519,7 @@ mod tests {
             embedder,
             "test-model",
             crate::extract::DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await?;
@@ -648,6 +655,7 @@ mod tests {
             &embedder,
             "test-model",
             crate::extract::DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await?;
@@ -720,6 +728,7 @@ mod tests {
             &embedder,
             "test-model",
             crate::extract::DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await?;

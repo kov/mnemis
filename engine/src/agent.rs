@@ -13,6 +13,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::llm::{InputItem, LlmTransport, ResponsesResponse, ToolDef};
@@ -41,6 +43,15 @@ pub(crate) fn is_transient_stall(err_chain: &str) -> bool {
         || err_chain.contains("timed out")
 }
 
+/// True when an error chain is the server rejecting an oversize prompt (omlx:
+/// `Prompt too long: N tokens exceeds max context window of M`). Unlike a
+/// transient stall this is deterministic — retrying the identical request can't
+/// help — so both agent loops treat it as a signal to *shrink* the input (chat
+/// compacts; extraction splits the batch) rather than to retry as-is.
+pub(crate) fn is_context_overflow(err_chain: &str) -> bool {
+    err_chain.contains("max context window") || err_chain.contains("Prompt too long")
+}
+
 /// What happened on a send attempt that didn't immediately succeed — handed to
 /// the caller's hook so it can record the attempt (e.g. into an extraction
 /// trace) without this module depending on any particular tracer.
@@ -51,42 +62,108 @@ pub enum StallEvent<'a> {
     GaveUp { error: &'a str },
 }
 
+/// Streaming controls for a send. `idle_timeout` bounds the gap between SSE
+/// events (a longer silence is treated as a stall and retried); `cancel` is the
+/// user's Stop button (fires once to abort, returning the partial answer rather
+/// than an error); `deltas`, when `Some`, receives assistant output-text chunks
+/// for live rendering.
+///
+/// Built by the interactive chat loop. The compaction summarizer reuses the
+/// chat's Stop token with `deltas: None` (idle timeout + Stop, no live
+/// rendering). Background callers with neither a Stop button nor live rendering
+/// — extraction's agent loop, whose batch prefill can outlast the non-streaming
+/// total timeout — use [`StreamCtx::headless`]: a never-fired token, no deltas.
+pub(crate) struct StreamCtx {
+    pub idle_timeout: Duration,
+    pub cancel: CancellationToken,
+    pub deltas: Option<UnboundedSender<String>>,
+}
+
+impl StreamCtx {
+    /// Streaming purely for its idle timeout: no Stop button (a never-fired
+    /// cancel token) and no live delta sink. For non-interactive callers like
+    /// extraction, where the win is replacing the short total timeout with the
+    /// per-chunk idle timeout so a slow-but-progressing batch isn't cut.
+    pub(crate) fn headless(idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout,
+            cancel: CancellationToken::new(),
+            deltas: None,
+        }
+    }
+}
+
 /// Send one turn to the LLM, retrying transient server stalls with backoff.
 ///
 /// `history` is cloned per attempt (the transport consumes it), so the caller
-/// keeps ownership. `on_event` is invoked for each retry and on terminal
-/// failure — a no-op closure is fine when the caller doesn't trace. On final
-/// failure the error is annotated with the turn number. Both agent loops route
-/// every send through here so the stall handling stays identical.
+/// keeps ownership. When `stream` is `Some`, the send goes over the SSE
+/// streaming path ([`LlmTransport::send_stream`]) — idle-timeout bounded,
+/// cancellable, delta-forwarding; when `None`, the legacy non-streaming
+/// [`LlmTransport::send`] (total-timeout) is used. `on_event` is invoked for
+/// each retry and on terminal failure — a no-op closure is fine when the caller
+/// doesn't trace. On final failure the error is annotated with the loop `step`.
+/// Both agent loops route every send through here so the stall handling stays
+/// identical.
 pub(crate) async fn send_with_stall_retry(
     llm: &dyn LlmTransport,
     system_prompt: &str,
     history: &[InputItem],
     tools: &[ToolDef],
-    turn: usize,
+    step: usize,
+    stream: Option<&StreamCtx>,
     mut on_event: impl FnMut(StallEvent<'_>),
 ) -> Result<ResponsesResponse> {
     let mut attempt = 0usize;
     loop {
-        match llm.send(system_prompt, history.to_vec(), tools, None).await {
+        let result = match stream {
+            Some(ctx) => {
+                llm.send_stream(
+                    system_prompt,
+                    history.to_vec(),
+                    tools,
+                    None,
+                    ctx.idle_timeout,
+                    ctx.cancel.clone(),
+                    ctx.deltas.clone(),
+                )
+                .await
+            }
+            None => llm.send(system_prompt, history.to_vec(), tools, None).await,
+        };
+        match result {
             Ok(r) => return Ok(r),
             Err(e) => {
                 let chain = format!("{e:#}");
                 if is_transient_stall(&chain) && attempt < STALL_RETRIES {
                     attempt += 1;
                     warn!(
-                        turn,
+                        step,
                         attempt, "LLM stalled (empty body / timeout); retrying after backoff"
                     );
                     on_event(StallEvent::Retry {
                         attempt,
                         error: &chain,
                     });
-                    tokio::time::sleep(STALL_BACKOFF * attempt as u32).await;
+                    // Back off before retrying, but wake immediately if the user
+                    // pressed Stop during the stall — the next attempt then
+                    // returns the cancelled (empty) response right away.
+                    let backoff = STALL_BACKOFF * attempt as u32;
+                    match stream {
+                        Some(ctx) => {
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {}
+                                _ = ctx.cancel.cancelled() => {}
+                            }
+                        }
+                        None => tokio::time::sleep(backoff).await,
+                    }
                     continue;
                 }
                 on_event(StallEvent::GaveUp { error: &chain });
-                return Err(e).with_context(|| format!("LLM send failed on turn {turn}"));
+                // "step" (not "turn"): this is the Nth model call while
+                // answering one user message, which resets per message — not a
+                // count of conversation turns.
+                return Err(e).with_context(|| format!("LLM send failed on step {step}"));
             }
         }
     }

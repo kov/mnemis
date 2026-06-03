@@ -311,7 +311,50 @@ pub fn chat_definitions() -> Vec<ToolDef> {
                 .to_string(),
             update_action_params(),
         ),
+        ToolDef::function(
+            "search_conversation".to_string(),
+            "Keyword search THIS conversation's own earlier turns — use it when the summary at \
+             the top of the conversation isn't specific enough and you need to recall what was \
+             actually said before. Returns up to 10 matches with a turn_id, role, timestamp, and \
+             snippet. Follow up with recall_turns to read the full text. This searches the chat \
+             history, not the user's ingested messages (that's search_messages)."
+                .to_string(),
+            search_conversation_params(),
+        ),
+        ToolDef::function(
+            "recall_turns".to_string(),
+            "Fetch the full text of specific earlier turns in THIS conversation by their turn_id \
+             (from search_conversation). Use this to recover exact wording the summary condensed \
+             away. Batch the ids. Long turns are truncated and the total is capped per call."
+                .to_string(),
+            recall_turns_params(),
+        ),
     ]
+}
+
+fn search_conversation_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "keyword(s) to find in earlier turns" }
+        },
+        "required": ["query"]
+    })
+}
+
+fn recall_turns_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "turn_ids": {
+                "type": "array",
+                "items": { "type": "integer" },
+                "minItems": 1,
+                "description": "turn_id values returned by search_conversation"
+            }
+        },
+        "required": ["turn_ids"]
+    })
 }
 
 /// Result of dispatching a single tool call.

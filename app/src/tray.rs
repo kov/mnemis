@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use mnemis_engine::{config, orchestrator};
@@ -87,6 +88,7 @@ fn spawn_sync(app: &AppHandle) {
             Arc::clone(&stack.embedder),
             &stack.chat_model,
             stack.window_char_budget,
+            Duration::from_secs(stack.chat_idle_timeout_secs),
             Some(&traces),
         )
         .await

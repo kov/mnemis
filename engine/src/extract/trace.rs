@@ -159,6 +159,16 @@ impl TraceWriter {
         }));
     }
 
+    /// A chat conversation was compacted: `folded_turns` turns up to
+    /// `up_to_turn_id` were rolled into the running summary.
+    pub fn compaction(&mut self, folded_turns: usize, up_to_turn_id: i64) {
+        self.write(&json!({
+            "event": "compaction",
+            "folded_turns": folded_turns,
+            "up_to_turn_id": up_to_turn_id,
+        }));
+    }
+
     fn write<T: Serialize>(&mut self, value: &T) {
         let Some(file) = self.file.as_mut() else {
             return;

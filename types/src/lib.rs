@@ -330,6 +330,12 @@ pub struct ChatTurnDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatEvent {
+    /// A chunk of assistant-visible text as it streams in. Transient and *not*
+    /// persisted — a live-rendering accelerator. The authoritative copy arrives
+    /// as the `AssistantMessage` for the completed turn, which the UI then shows
+    /// from the persisted transcript; the accumulated deltas are dropped at that
+    /// point so nothing renders twice.
+    Delta { text: String },
     /// The model's reasoning for the turn (display-only, never replayed).
     Reasoning { text: String },
     /// Assistant-visible text.
@@ -338,6 +344,11 @@ pub enum ChatEvent {
     ToolCall { name: String, arguments: String },
     /// The tool returned (the raw JSON string the model will see next).
     ToolResult { name: String, output: String },
+    /// The conversation is being condensed to fit the model's context window.
+    /// Transient and *not* persisted (it carries no transcript) — a UI hint
+    /// that the next answer will take a little longer. Cleared by the next
+    /// real event.
+    Compacting,
     /// The turn finished cleanly — no more events are coming.
     Done,
     /// The turn failed; `message` is a human-readable reason.

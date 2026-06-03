@@ -3,8 +3,10 @@
 #[cfg(target_os = "macos")]
 mod tray;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use mnemis_engine::config::Config;
@@ -19,6 +21,7 @@ use mnemis_types::{
 use sqlx::SqlitePool;
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Wraps shared mutable engine state held by the Tauri runtime.
@@ -33,6 +36,11 @@ pub(crate) struct AppState {
     /// Resolved path to the SQLite file, kept so commands can derive the
     /// traces directory (`<db_parent>/traces/`) without recomputing it.
     pub db_path: PathBuf,
+    /// Cancellation tokens for in-flight chat sends, keyed by chat id, so the
+    /// Stop button (`cancel_chat_message`) can abort the matching send. The UI
+    /// runs one send per chat at a time, so a plain replace-on-insert /
+    /// remove-on-finish keyed by chat id is enough.
+    pub chat_cancels: Mutex<HashMap<i64, CancellationToken>>,
 }
 
 pub(crate) struct LlmStack {
@@ -40,6 +48,13 @@ pub(crate) struct LlmStack {
     pub embedder: Arc<dyn Embedder>,
     pub chat_model: String,
     pub window_char_budget: usize,
+    /// The server's context window in tokens — chat uses it to keep the
+    /// conversation within range (compaction). Same value the budget above is
+    /// derived from.
+    pub max_context_tokens: usize,
+    /// Idle timeout (seconds) for streaming chat sends — see
+    /// [`mnemis_engine::config::LlmSection::resolved_chat_idle_timeout_secs`].
+    pub chat_idle_timeout_secs: u64,
 }
 
 impl AppState {
@@ -344,10 +359,11 @@ async fn save_llm_config(state: State<'_, AppState>, cfg: LlmConfigDto) -> Resul
         embedding_model: cfg.embedding_model,
         bearer_token: cfg.bearer_token.filter(|s| !s.trim().is_empty()),
         // None → save_llm keeps whatever's already in the file. This form
-        // edits neither max_context_tokens nor request_timeout_secs
-        // (config.toml-only knobs for now).
+        // edits none of max_context_tokens / request_timeout_secs /
+        // chat_idle_timeout_secs (config.toml-only knobs for now).
         max_context_tokens: None,
         request_timeout_secs: None,
+        chat_idle_timeout_secs: None,
     })
     .map_err(|e| format!("{e:#}"))?;
 
@@ -415,6 +431,7 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
         Arc::clone(&stack.embedder),
         &stack.chat_model,
         stack.window_char_budget,
+        Duration::from_secs(stack.chat_idle_timeout_secs),
         Some(&traces),
     )
     .await
@@ -502,18 +519,31 @@ async fn send_chat_message(
         let _ = on_event.send(e);
     };
     let traces = config::traces_dir_for(&state.db_path);
-    chat::run_chat_turn(
+
+    // Register a cancellation token so the Stop button (`cancel_chat_message`)
+    // can abort this send mid-stream. Cleared when the turn finishes.
+    let cancel = CancellationToken::new();
+    if let Ok(mut map) = state.chat_cancels.lock() {
+        map.insert(chat_id, cancel.clone());
+    }
+    let result = chat::run_chat_turn(
         &state.pool,
         &stack.llm,
         &system_prompt,
         chat_id,
         &text,
         stack.window_char_budget,
+        stack.max_context_tokens,
+        Duration::from_secs(stack.chat_idle_timeout_secs),
+        Some(cancel),
         &sink,
         Some(&traces),
     )
-    .await
-    .map_err(|e| format!("{e:#}"))?;
+    .await;
+    if let Ok(mut map) = state.chat_cancels.lock() {
+        map.remove(&chat_id);
+    }
+    result.map_err(|e| format!("{e:#}"))?;
 
     // Best-effort: give an unseeded chat a real title from its first message.
     // Detached so it doesn't hold the channel open — the composer re-enables as
@@ -526,6 +556,20 @@ async fn send_chat_message(
             tracing::debug!(error = %format!("{e:#}"), "chat title generation failed");
         }
     });
+    Ok(())
+}
+
+/// Stop the in-flight chat send for `chat_id` (the Stop button). Fires the
+/// registered cancellation token, which the streaming send observes and returns
+/// the partial answer for — so the turn ends cleanly rather than erroring. A
+/// no-op if nothing is in flight for that chat.
+#[tauri::command(rename_all = "snake_case")]
+async fn cancel_chat_message(state: State<'_, AppState>, chat_id: i64) -> Result<(), String> {
+    if let Ok(map) = state.chat_cancels.lock()
+        && let Some(token) = map.get(&chat_id)
+    {
+        token.cancel();
+    }
     Ok(())
 }
 
@@ -619,6 +663,7 @@ fn main() {
                 pool,
                 llm_stack: RwLock::new(llm_stack),
                 db_path: app_data,
+                chat_cancels: Mutex::new(HashMap::new()),
             });
 
             // macOS: tray-resident. Linux/Windows: window-only for now.
@@ -682,6 +727,7 @@ fn main() {
             get_chat_turns,
             get_chat_seed,
             send_chat_message,
+            cancel_chat_message,
             get_chat_show_reasoning,
             set_chat_show_reasoning
         ])
@@ -706,6 +752,8 @@ fn build_llm_stack(cfg: &Config) -> LlmStack {
         window_char_budget: mnemis_engine::extract::window_char_budget_for(
             cfg.llm.resolved_max_context_tokens(),
         ),
+        max_context_tokens: cfg.llm.resolved_max_context_tokens(),
+        chat_idle_timeout_secs: cfg.llm.resolved_chat_idle_timeout_secs(),
     }
 }
 

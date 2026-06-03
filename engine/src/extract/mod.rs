@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use crate::agent;
@@ -93,12 +93,6 @@ enum BatchResult {
     Overflow,
 }
 
-/// True when an error chain is the server rejecting an oversize prompt
-/// (omlx: `Prompt too long: N tokens exceeds max context window of M`).
-fn is_context_overflow(err_chain: &str) -> bool {
-    err_chain.contains("max context window") || err_chain.contains("Prompt too long")
-}
-
 #[derive(Debug)]
 pub struct ExtractionOutcome {
     pub result: &'static str,
@@ -107,12 +101,14 @@ pub struct ExtractionOutcome {
     pub summary: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_for_channel(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
     channel_id: i64,
     model_name: &str,
     window_char_budget: usize,
+    idle_timeout: Duration,
     traces_dir: Option<&Path>,
 ) -> Result<ExtractionOutcome> {
     let channel = load_channel(pool, channel_id).await?;
@@ -180,6 +176,7 @@ pub async fn extract_for_channel(
             &feedback,
             &batch,
             window_char_budget,
+            idle_timeout,
             traces_dir,
         )
         .await
@@ -274,6 +271,7 @@ async fn extract_one_batch(
     feedback: &[FeedbackExample],
     batch: &[WindowRow],
     window_char_budget: usize,
+    idle_timeout: Duration,
     traces_dir: Option<&Path>,
 ) -> Result<BatchResult> {
     let up_to = batch.last().map(|m| m.id);
@@ -325,6 +323,7 @@ async fn extract_one_batch(
         scope,
         system_prompt,
         window_char_budget,
+        idle_timeout,
         writer.as_mut(),
     )
     .await;
@@ -365,7 +364,7 @@ async fn extract_one_batch(
             // the caller halve it and retry. Don't record a run for the
             // discarded attempt (the trace already captured the agent_error);
             // the sub-batches will record their own.
-            if is_context_overflow(&chain) && batch.len() > 1 {
+            if crate::agent::is_context_overflow(&chain) && batch.len() > 1 {
                 debug!(
                     channel_id,
                     messages = batch.len(),
@@ -598,12 +597,14 @@ async fn load_user_profile_for(pool: &SqlitePool, source_kind: &str) -> Result<U
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
     scope: ExtractionScope,
     system_prompt: String,
     fetch_budget_chars: usize,
+    idle_timeout: Duration,
     mut trace: Option<&mut TraceWriter>,
 ) -> Result<(usize, Option<String>)> {
     let tool_defs = tools::definitions();
@@ -626,6 +627,12 @@ async fn run_agent_loop(
     // for re-fetches / search_messages pulls.
     let mut fetch_budget = tools::FetchBudget::new(fetch_budget_chars);
 
+    // Stream the extraction sends too — same wedge risk as chat: a large batch
+    // prefill can legitimately emit nothing for longer than the non-streaming
+    // total timeout, getting cut mid-generation. Headless (no Stop button, no
+    // live rendering): the win here is purely the per-chunk idle timeout.
+    let stream = agent::StreamCtx::headless(idle_timeout);
+
     for turn in 0..MAX_AGENT_TURNS {
         let t = Instant::now();
         if let Some(w) = trace.as_deref_mut() {
@@ -637,8 +644,14 @@ async fn run_agent_loop(
         // retries transient stalls with backoff (deterministic failures, like
         // context overflow, bubble straight to the caller's split-down path)
         // and reports each attempt so we can record it in the trace.
-        let response =
-            agent::send_with_stall_retry(llm, &system_prompt, &history, &tool_defs, turn, |ev| {
+        let response = agent::send_with_stall_retry(
+            llm,
+            &system_prompt,
+            &history,
+            &tool_defs,
+            turn,
+            Some(&stream),
+            |ev| {
                 if let Some(w) = trace.as_deref_mut() {
                     match ev {
                         agent::StallEvent::Retry { attempt, error } => {
@@ -647,8 +660,9 @@ async fn run_agent_loop(
                         agent::StallEvent::GaveUp { error } => w.llm_error(turn, error),
                     }
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
         let elapsed = t.elapsed().as_secs();
         if let Some(w) = trace.as_deref_mut() {
             w.llm_recv(turn, elapsed, &response);
@@ -1119,9 +1133,17 @@ mod tests {
             crate::test_util::mock::no_tools("nothing here"),
         ]);
 
-        let outcome = extract_for_channel(&pool, &llm, channel_id, "test-model", 1, None)
-            .await
-            .expect("multi-batch extraction should succeed");
+        let outcome = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            1,
+            Duration::from_secs(60),
+            None,
+        )
+        .await
+        .expect("multi-batch extraction should succeed");
         assert_eq!(outcome.result, "ok");
         assert_eq!(outcome.up_to_message_id, Some(last_id));
 
@@ -1152,7 +1174,16 @@ mod tests {
 
         let llm =
             FailingLlm("error sending request for url: connection closed before message completed");
-        let result = extract_for_channel(&pool, &llm, channel_id, "test-model", 1, None).await;
+        let result = extract_for_channel(
+            &pool,
+            &llm,
+            channel_id,
+            "test-model",
+            1,
+            Duration::from_secs(60),
+            None,
+        )
+        .await;
         assert!(result.is_err(), "a failing batch should bubble an error");
 
         // No successful run recorded → watermark stays unset, so the next
@@ -1219,6 +1250,7 @@ mod tests {
             channel_id,
             "test-model",
             DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await
@@ -1283,6 +1315,7 @@ mod tests {
             channel_id,
             "test-model",
             DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await
@@ -1337,6 +1370,7 @@ mod tests {
             channel_id,
             "test-model",
             DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await
@@ -1391,6 +1425,7 @@ mod tests {
             channel_id,
             "test-model",
             DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await;
@@ -1425,6 +1460,7 @@ mod tests {
             channel_id,
             "test-model",
             DEFAULT_WINDOW_CHAR_BUDGET,
+            Duration::from_secs(60),
             None,
         )
         .await;

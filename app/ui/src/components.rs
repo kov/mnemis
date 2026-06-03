@@ -18,14 +18,15 @@ use wasm_bindgen::JsCast;
 use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
     ChatStream, ChatUiState, FirstRunTick, SyncTick, add_caldav_account, add_imap_source,
-    confidence_class, confirm_resolution, create_chat, delete_caldav_account, delete_chat,
-    delete_source, discover_source_channels, fetch_actions, fetch_caldav_account, fetch_chat_seed,
-    fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config, fetch_pending_resolutions,
-    fetch_settings_sources, fetch_status, fetch_user_profile, list_caldav_collections,
-    open_external, promote_to_reminder, reject_resolution, run_sync_caldav, run_sync_now,
-    save_llm_config, save_user_profile, send_chat_message, set_caldav_collection,
-    set_channel_muted, set_channels_muted_bulk, set_chat_archived, set_chat_show_reasoning,
-    set_source_muted, status_label, submit_dismissal_feedback, update_action,
+    cancel_chat_message, confidence_class, confirm_resolution, create_chat, delete_caldav_account,
+    delete_chat, delete_source, discover_source_channels, fetch_actions, fetch_caldav_account,
+    fetch_chat_seed, fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config,
+    fetch_pending_resolutions, fetch_settings_sources, fetch_status, fetch_user_profile,
+    list_caldav_collections, open_external, promote_to_reminder, reject_resolution,
+    run_sync_caldav, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
+    set_caldav_collection, set_channel_muted, set_channels_muted_bulk, set_chat_archived,
+    set_chat_show_reasoning, set_source_muted, status_label, submit_dismissal_feedback,
+    update_action,
 };
 
 #[component]
@@ -1898,6 +1899,7 @@ pub fn ChatDetail() -> impl IntoView {
         show_reasoning,
         active_id,
         pending_user,
+        streaming_text,
         sending,
         refresh,
         error,
@@ -1951,6 +1953,11 @@ pub fn ChatDetail() -> impl IntoView {
 
     let input_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
 
+    // Set while the engine streams `Compacting` (condensing the conversation to
+    // fit the model's context window); cleared by the next real event or End.
+    // Drives the "condensing…" hint so a longer pause reads as expected.
+    let compacting = RwSignal::new(false);
+
     let do_send = move || {
         let Some(id) = chat_id.get() else { return };
         if sending.get() {
@@ -1965,23 +1972,50 @@ pub fn ChatDetail() -> impl IntoView {
         active_id.set(Some(id));
         sending.set(true);
         error.set(None);
+        streaming_text.set(String::new());
         pending_user.set(Some(text.clone()));
         send_chat_message(id, text, move |msg| match msg {
             // A turn-level failure isn't persisted, so surface it off to the
             // side instead of refetching for it.
             ChatStream::Event(ChatEvent::Error { message }) => error.set(Some((id, message))),
+            // Transient (not persisted): the engine is condensing the
+            // conversation before the next model call. Show the hint; the next
+            // real event clears it.
+            ChatStream::Event(ChatEvent::Compacting) => compacting.set(true),
+            // Assistant text as it streams: accumulate into the live bubble.
+            // Not persisted yet — the completed message (below) supersedes it.
+            ChatStream::Event(ChatEvent::Delta { text }) => {
+                compacting.set(false);
+                streaming_text.update(|s| s.push_str(&text));
+            }
             // Each turn was persisted before its event fired, so a refetch shows
             // exactly what was just streamed. Driving the transcript straight
             // from the DB (instead of a separate live buffer) means returning to
             // the chat mid-send can't double the in-flight turns against their
-            // persisted copies.
-            ChatStream::Event(_) => refresh.update(|n| *n += 1),
+            // persisted copies. Clearing the live buffer here hands the bubble
+            // off to its persisted copy without a flicker of both.
+            ChatStream::Event(_) => {
+                compacting.set(false);
+                streaming_text.set(String::new());
+                refresh.update(|n| *n += 1);
+            }
             ChatStream::End => {
                 sending.set(false);
+                compacting.set(false);
+                streaming_text.set(String::new());
                 pending_user.set(None);
                 active_id.set(None);
                 refresh.update(|n| *n += 1);
             }
+        });
+    };
+
+    // Stop the in-flight send for this chat. The engine returns the partial
+    // answer and ends the turn cleanly, so the normal End handling above runs.
+    let do_stop = move || {
+        let Some(id) = chat_id.get() else { return };
+        spawn_local(async move {
+            let _ = cancel_chat_message(id).await;
         });
     };
 
@@ -2080,7 +2114,33 @@ pub fn ChatDetail() -> impl IntoView {
                     (!already_persisted)
                         .then(|| view! { <div class="chat-msg chat-user">{pending}</div> })
                 }}
-                {move || (is_active.get() && sending.get()).then(|| view! { <div class="chat-thinking">"\u{2026}"</div> })}
+                // The assistant's answer as it streams in, before its persisted
+                // copy lands. Cleared (handed off to the transcript) on the
+                // completed message — see the Delta handler in `do_send`.
+                {move || {
+                    if !is_active.get() {
+                        return None;
+                    }
+                    let text = streaming_text.get();
+                    (!text.is_empty())
+                        .then(|| view! { <div class="chat-msg chat-assistant chat-streaming">{text}</div> })
+                }}
+                {move || {
+                    // While streaming text is on screen the live bubble already
+                    // shows progress, so the dots only fill the gap before the
+                    // first token (prefill) or while condensing.
+                    let show =
+                        is_active.get() && sending.get() && streaming_text.get().is_empty();
+                    let condensing = compacting.get();
+                    show.then(|| {
+                        let label = if condensing {
+                            "Condensing earlier conversation\u{2026}"
+                        } else {
+                            "\u{2026}"
+                        };
+                        view! { <div class="chat-thinking" class:chat-compacting=condensing>{label}</div> }
+                    })
+                }}
                 // A turn-level failure for *this* chat (survives the spinner
                 // stopping so the user actually sees why it stopped).
                 {move || error.get()
@@ -2096,13 +2156,29 @@ pub fn ChatDetail() -> impl IntoView {
                     placeholder="Ask about your actions or messages\u{2026}"
                     on:keydown=on_keydown
                 />
-                <button
-                    class="btn btn-primary"
-                    on:click=move |_| do_send()
-                    prop:disabled=move || sending.get()
-                >
-                    "Send"
-                </button>
+                // Send becomes Stop while this chat's turn is in flight, so the
+                // user decides when a slow answer has gone on long enough.
+                {move || {
+                    if sending.get() && is_active.get() {
+                        view! {
+                            <button class="btn btn-secondary chat-stop" on:click=move |_| do_stop()>
+                                "Stop"
+                            </button>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <button
+                                class="btn btn-primary"
+                                on:click=move |_| do_send()
+                                prop:disabled=move || sending.get()
+                            >
+                                "Send"
+                            </button>
+                        }
+                        .into_any()
+                    }
+                }}
             </div>
         </div>
     }

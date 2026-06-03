@@ -254,64 +254,248 @@ pub(crate) fn title_from(text: &str) -> String {
     }
 }
 
+/// A persisted chat turn with its id. Carries enough to (a) reconstruct the
+/// model `InputItem` it replays as and (b) let the compaction planner pick a
+/// safe boundary by turn id without re-querying.
+#[derive(Debug, Clone)]
+pub struct TurnRow {
+    pub id: i64,
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+}
+
+/// The active compaction checkpoint for a chat: the summary that stands in for
+/// every turn with `id <= up_to_turn_id`. `None` when the chat has never been
+/// compacted.
+#[derive(Debug, Clone)]
+pub struct SummaryCheckpoint {
+    pub up_to_turn_id: i64,
+    pub summary: String,
+}
+
+/// Map one persisted turn to the model `InputItem` it replays as, or `None` for
+/// a row that carries neither text nor a tool reference (e.g. a reasoning-only
+/// placeholder). Never consults the reasoning table — that's what keeps
+/// reasoning out of the prompt. Shared by [`build_history`] and the compaction
+/// planner so they agree exactly on what the model sees.
+pub(crate) fn row_to_input(row: &TurnRow) -> Option<InputItem> {
+    match (row.role.as_str(), &row.tool_name, &row.tool_call_id) {
+        // Assistant tool call: arguments live in `content`.
+        ("assistant", Some(name), Some(call_id)) => Some(InputItem::FunctionCall {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            arguments: row.content.clone().unwrap_or_default(),
+        }),
+        // Tool result.
+        ("tool", _, Some(call_id)) => Some(InputItem::FunctionCallOutput {
+            call_id: call_id.clone(),
+            output: row.content.clone().unwrap_or_default(),
+        }),
+        // Plain user/assistant text.
+        ("user", _, _) => row.content.clone().map(|content| InputItem::Message {
+            role: Role::User,
+            content,
+        }),
+        ("assistant", _, _) => row.content.clone().map(|content| InputItem::Message {
+            role: Role::Assistant,
+            content,
+        }),
+        _ => None,
+    }
+}
+
+/// Load the chat's turns with `id > after_turn_id`, in replay order. `after = 0`
+/// loads them all. Filtering by id (not `created_at`) is what lets a compaction
+/// checkpoint cleanly exclude everything it folded in. Used by both history
+/// reconstruction and the compaction planner.
+pub async fn load_turn_rows(
+    pool: &SqlitePool,
+    chat_id: i64,
+    after_turn_id: i64,
+) -> Result<Vec<TurnRow>> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, role, content, tool_name, tool_call_id \
+         FROM chat_turns WHERE chat_id = ? AND id > ? ORDER BY created_at, id",
+    )
+    .bind(chat_id)
+    .bind(after_turn_id)
+    .fetch_all(pool)
+    .await
+    .context("loading chat turn rows")?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, role, content, tool_name, tool_call_id)| TurnRow {
+            id,
+            role,
+            content,
+            tool_name,
+            tool_call_id,
+        })
+        .collect())
+}
+
+/// The active compaction checkpoint (the row with the greatest `up_to_turn_id`),
+/// or `None` if the chat was never compacted.
+pub async fn latest_summary(pool: &SqlitePool, chat_id: i64) -> Result<Option<SummaryCheckpoint>> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT up_to_turn_id, summary FROM chat_summaries \
+         WHERE chat_id = ? ORDER BY up_to_turn_id DESC LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await
+    .context("loading latest chat summary")?;
+    Ok(row.map(|(up_to_turn_id, summary)| SummaryCheckpoint {
+        up_to_turn_id,
+        summary,
+    }))
+}
+
+/// Record a new compaction checkpoint. Append-only — the greatest
+/// `up_to_turn_id` wins, so re-compaction just inserts a fresh row.
+pub async fn insert_summary(
+    pool: &SqlitePool,
+    chat_id: i64,
+    up_to_turn_id: i64,
+    summary: &str,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO chat_summaries (chat_id, up_to_turn_id, summary, created_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(chat_id)
+    .bind(up_to_turn_id)
+    .bind(summary)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("inserting chat summary")?;
+    Ok(())
+}
+
+/// Keyword search over a single chat's turns — what the model uses to find
+/// earlier content the summary dropped. Case-insensitive `LIKE`: a chat
+/// transcript is small (one conversation), so there's no FTS index for it the
+/// way there is for ingested messages. Returns `(turn_id, role, created_at,
+/// snippet)`, most-recent first.
+pub async fn search_turns(
+    pool: &SqlitePool,
+    chat_id: i64,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<(i64, String, i64, String)>> {
+    // Escape LIKE metacharacters so a literal query can't act as a wildcard.
+    let like = format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let rows: Vec<(i64, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, role, content, created_at FROM chat_turns \
+         WHERE chat_id = ? AND content LIKE ? ESCAPE '\\' \
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+    )
+    .bind(chat_id)
+    .bind(&like)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("searching chat turns")?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, role, content, created_at)| {
+            (
+                id,
+                role,
+                created_at,
+                crate::extract::tools::snippet(content.as_deref().unwrap_or(""), 200),
+            )
+        })
+        .collect())
+}
+
+/// Load full turns by id within a chat (the model recalls these after
+/// [`search_turns`]). Scoped to `chat_id` so a chat can never read another's
+/// turns.
+pub async fn load_turn_contents(
+    pool: &SqlitePool,
+    chat_id: i64,
+    ids: &[i64],
+) -> Result<Vec<TurnRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // sqlite has no array binding — build an IN list of placeholders. Only the
+    // count of `?`s is interpolated (never any data), so this is injection-safe.
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT id, role, content, tool_name, tool_call_id FROM chat_turns \
+         WHERE chat_id = ? AND id IN ({placeholders}) ORDER BY created_at, id"
+    );
+    let mut q = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, Option<String>)>(
+        sqlx::AssertSqlSafe(sql),
+    )
+    .bind(chat_id);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .context("loading chat turn contents")?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, role, content, tool_name, tool_call_id)| TurnRow {
+            id,
+            role,
+            content,
+            tool_name,
+            tool_call_id,
+        })
+        .collect())
+}
+
+/// The leading message that stands in for a compacted prefix. Framed as recap
+/// context so the model treats it as background and knows it can pull exact
+/// earlier wording back with the recall tools.
+pub(crate) fn summary_input_item(summary: &str) -> InputItem {
+    InputItem::Message {
+        role: Role::User,
+        content: format!(
+            "[Summary of the earlier part of this conversation, condensed to fit the context \
+             window. If you need exact earlier wording, use search_conversation then \
+             recall_turns.]\n\n{summary}"
+        ),
+    }
+}
+
 /// Rebuild the model's input from the persisted turns. Joins **only**
 /// `chat_turns` (never the reasoning table), mapping each row to the right
-/// `InputItem`:
+/// `InputItem` via [`row_to_input`]:
 /// - user/assistant text → `Message`
 /// - assistant tool-call rows (`tool_name` set) → `FunctionCall`
 /// - tool rows → `FunctionCallOutput`
 ///
-/// Rows that carry neither text nor a tool reference (e.g. a reasoning-only
-/// placeholder) are skipped.
+/// When the chat has a compaction checkpoint, the folded prefix
+/// (`id <= up_to_turn_id`) is replaced by a single leading summary message and
+/// only the verbatim tail is replayed. `chat_turns` itself is untouched, so the
+/// UI's [`load_turns`] still shows the whole conversation.
 pub async fn build_history(pool: &SqlitePool, chat_id: i64) -> Result<Vec<InputItem>> {
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT role, content, tool_name, tool_call_id \
-         FROM chat_turns WHERE chat_id = ? ORDER BY created_at, id",
-    )
-    .bind(chat_id)
-    .fetch_all(pool)
-    .await
-    .context("building chat history")?;
+    let checkpoint = latest_summary(pool, chat_id).await?;
+    let after = checkpoint.as_ref().map(|c| c.up_to_turn_id).unwrap_or(0);
+    let rows = load_turn_rows(pool, chat_id, after).await?;
 
-    let mut history = Vec::with_capacity(rows.len());
-    for (role, content, tool_name, tool_call_id) in rows {
-        match (role.as_str(), tool_name, tool_call_id) {
-            // Assistant tool call: arguments live in `content`.
-            ("assistant", Some(name), Some(call_id)) => {
-                history.push(InputItem::FunctionCall {
-                    call_id,
-                    name,
-                    arguments: content.unwrap_or_default(),
-                });
-            }
-            // Tool result.
-            ("tool", _, Some(call_id)) => {
-                history.push(InputItem::FunctionCallOutput {
-                    call_id,
-                    output: content.unwrap_or_default(),
-                });
-            }
-            // Plain user/assistant text.
-            ("user", _, _) => {
-                if let Some(text) = content {
-                    history.push(InputItem::Message {
-                        role: Role::User,
-                        content: text,
-                    });
-                }
-            }
-            ("assistant", _, _) => {
-                if let Some(text) = content {
-                    history.push(InputItem::Message {
-                        role: Role::Assistant,
-                        content: text,
-                    });
-                }
-            }
-            _ => {}
-        }
+    let mut history = Vec::with_capacity(rows.len() + 1);
+    if let Some(c) = &checkpoint {
+        history.push(summary_input_item(&c.summary));
     }
+    history.extend(rows.iter().filter_map(row_to_input));
     Ok(history)
 }
 
@@ -416,6 +600,118 @@ mod tests {
         assert!(
             !serialized.contains("let me look it up"),
             "reasoning must never appear in reconstructed history: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_history_substitutes_the_summary_for_the_folded_prefix() {
+        let (_tmp, pool) = empty_db().await;
+        let chat = create_chat(&pool, None, None).await.unwrap();
+        append_turn(
+            &pool,
+            chat,
+            "user",
+            Some("first question"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let t2 = append_turn(
+            &pool,
+            chat,
+            "assistant",
+            Some("first answer"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        append_turn(
+            &pool,
+            chat,
+            "user",
+            Some("second question"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Fold everything up to and including the first answer into a summary.
+        insert_summary(&pool, chat, t2, "CONDENSED RECAP")
+            .await
+            .unwrap();
+
+        // The model now sees the recap message + only the post-watermark turn.
+        let history = build_history(&pool, chat).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            matches!(&history[0], InputItem::Message { role: Role::User, content } if content.contains("CONDENSED RECAP")),
+            "first item should be the summary message"
+        );
+        assert!(
+            matches!(&history[1], InputItem::Message { role: Role::User, content } if content == "second question"),
+            "only the verbatim tail should follow the summary"
+        );
+
+        // The UI transcript is untouched — it still shows the whole conversation.
+        assert_eq!(load_turns(&pool, chat).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn search_and_recall_reach_a_chat_s_own_turns() {
+        let (_tmp, pool) = empty_db().await;
+        let chat = create_chat(&pool, None, None).await.unwrap();
+        append_turn(
+            &pool,
+            chat,
+            "user",
+            Some("Let's discuss the quarterly budget plan"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let target = append_turn(
+            &pool,
+            chat,
+            "assistant",
+            Some("The budget is approved for Q3"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        append_turn(
+            &pool,
+            chat,
+            "user",
+            Some("unrelated chatter"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = search_turns(&pool, chat, "budget", 10).await.unwrap();
+        assert!(hits.iter().any(|(id, ..)| *id == target));
+        assert!(hits.len() >= 2, "both budget turns should match: {hits:?}");
+
+        let rows = load_turn_contents(&pool, chat, &[target]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("approved for Q3")
         );
     }
 
