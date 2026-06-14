@@ -39,6 +39,18 @@ const MAX_CHAT_TURNS: usize = 12;
 /// message is genuinely too big for the window.
 const MAX_COMPACT_RETRIES: usize = 3;
 
+/// Surfaced as the assistant reply when a turn ends with no tool call and no
+/// visible text, so an empty turn shows *something* instead of silence.
+const EMPTY_REPLY_NOTICE: &str = "(I didn't produce an answer that time — I may have gotten stuck. Try asking again \
+     or rephrasing.)";
+
+/// Fed back as the tool result when the model re-issues an identical tool call
+/// (same name + arguments) within a turn, instead of running it a second time.
+const REPEATED_CALL_NUDGE: &str = "You already called this tool with these exact arguments earlier in this turn and got \
+     a result; calling it again returns the same data. If you need more results, use the \
+     pagination cursor from the previous result (e.g. `next_before`). Otherwise, stop \
+     calling tools and answer the user using what you already have.";
+
 /// Where the agent loop pushes streamed events. The app adapts a
 /// `tauri::ipc::Channel<ChatEvent>` to this; the CLI prints them; tests collect
 /// them. A trait object keeps the engine Tauri-agnostic.
@@ -155,6 +167,13 @@ async fn run_inner(
         deltas: Some(delta_tx),
     };
 
+    // Tool calls already made this turn, by (name, arguments). A model that
+    // re-issues the *identical* call — e.g. ignoring a pagination cursor and
+    // re-fetching the same page — gets a nudge instead of a real dispatch the
+    // second time, which breaks the loop rather than spinning to MAX_CHAT_TURNS.
+    let mut seen_tool_calls: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
     for step in 0..MAX_CHAT_TURNS {
         // A Stop pressed between sends (e.g. during a tool dispatch) ends the
         // turn cleanly here rather than firing one more model call.
@@ -168,21 +187,29 @@ async fn run_inner(
         // the model input from what's persisted (excludes reasoning;
         // `history_for_send` also drops the summary on a turn whose verbatim
         // tail alone is near the limit).
-        if let compact::Compacted::Cancelled = compact::maybe_compact(
-            pool,
-            llm,
-            chat_id,
-            system_prompt,
-            &tool_defs,
-            budgets,
-            idle_timeout,
-            &cancel,
-            sink,
-            trace.as_deref_mut(),
-        )
-        .await?
+        //
+        // Only proactively *before the turn's first send* (step 0). Compacting
+        // between this turn's own tool-call rounds folds the in-progress steps
+        // into a summary, erasing the model's memory of what it just did — it
+        // then re-issues the same calls or gives up with an empty reply. A
+        // genuinely oversize mid-turn context is still caught by the reactive
+        // backstop on the send below.
+        if step == 0
+            && let compact::Compacted::Cancelled = compact::maybe_compact(
+                pool,
+                llm,
+                chat_id,
+                system_prompt,
+                &tool_defs,
+                budgets,
+                idle_timeout,
+                &cancel,
+                sink,
+                trace.as_deref_mut(),
+            )
+            .await?
         {
-            // Stop pressed during the "Condensing…" phase: end the turn cleanly.
+            // Stop pressed during the "Condensing…" phase: end cleanly.
             store::touch_chat(pool, chat_id).await?;
             return Ok(());
         }
@@ -308,6 +335,7 @@ async fn run_inner(
         let mut function_calls = Vec::new();
         let mut pending_reasoning: Option<String> = None;
         let mut reasoning_attached = false;
+        let mut emitted_message = false;
 
         for item in response.output {
             match item {
@@ -361,6 +389,7 @@ async fn run_inner(
                         )
                         .await?;
                         sink(ChatEvent::AssistantMessage { text });
+                        emitted_message = true;
                     }
                 }
                 OutputItem::FunctionCall {
@@ -396,23 +425,48 @@ async fn run_inner(
             }
         }
 
-        // Reasoning with no assistant turn to ride on: park it on a bare turn so
-        // it isn't lost (rare — the model emitted only reasoning).
-        if pending_reasoning.is_some() && !reasoning_attached {
-            let turn_id =
-                store::append_turn(pool, chat_id, "assistant", None, None, None, None).await?;
-            attach_reasoning(
-                pool,
-                turn_id,
-                &mut pending_reasoning,
-                &mut reasoning_attached,
-                sink,
-            )
-            .await?;
-        }
-
-        // No tool calls → the model has answered. Done.
+        // No tool calls → the model has finished this turn.
         if function_calls.is_empty() {
+            if !emitted_message {
+                // No tool call *and* no visible text: a degenerate empty turn
+                // (the model gave up or got stuck — often after looping on a
+                // tool). Don't end silently; surface a clear note so the user
+                // sees what happened, and let any dangling reasoning ride on it.
+                let turn_id = store::append_turn(
+                    pool,
+                    chat_id,
+                    "assistant",
+                    Some(EMPTY_REPLY_NOTICE),
+                    None,
+                    None,
+                    response_id.as_deref(),
+                )
+                .await?;
+                attach_reasoning(
+                    pool,
+                    turn_id,
+                    &mut pending_reasoning,
+                    &mut reasoning_attached,
+                    sink,
+                )
+                .await?;
+                sink(ChatEvent::AssistantMessage {
+                    text: EMPTY_REPLY_NOTICE.to_string(),
+                });
+            } else if pending_reasoning.is_some() && !reasoning_attached {
+                // Reasoning emitted with no assistant turn to ride on: park it
+                // on a bare turn so it isn't lost (rare).
+                let turn_id =
+                    store::append_turn(pool, chat_id, "assistant", None, None, None, None).await?;
+                attach_reasoning(
+                    pool,
+                    turn_id,
+                    &mut pending_reasoning,
+                    &mut reasoning_attached,
+                    sink,
+                )
+                .await?;
+            }
             store::touch_chat(pool, chat_id).await?;
             return Ok(());
         }
@@ -420,25 +474,33 @@ async fn run_inner(
         // Run the tools, persist each result, stream it. The next iteration
         // rebuilds history from the DB (now including these tool turns).
         for (call_id, name, arguments) in function_calls {
-            debug!(name = %name, chat_id, "chat dispatching tool");
-            let out = tools::dispatch(pool, chat_id, &mut fetch_budget, &name, &arguments).await;
-            if let Some(w) = trace.as_deref_mut() {
-                w.tool_dispatch(step, &call_id, &name, &arguments, &out.output);
-            }
+            // First time we see this exact (name, arguments) this turn → run
+            // it. A repeat means the model is spinning — e.g. it ignored a
+            // pagination cursor and is re-fetching the same page — so feed back
+            // a nudge instead of re-running, breaking the loop.
+            let output = if seen_tool_calls.insert((name.clone(), arguments.clone())) {
+                debug!(name = %name, chat_id, "chat dispatching tool");
+                let out =
+                    tools::dispatch(pool, chat_id, &mut fetch_budget, &name, &arguments).await;
+                if let Some(w) = trace.as_deref_mut() {
+                    w.tool_dispatch(step, &call_id, &name, &arguments, &out.output);
+                }
+                out.output
+            } else {
+                warn!(name = %name, chat_id, "chat: model repeated an identical tool call; nudging");
+                REPEATED_CALL_NUDGE.to_string()
+            };
             store::append_turn(
                 pool,
                 chat_id,
                 "tool",
-                Some(&out.output),
+                Some(&output),
                 Some(&name),
                 Some(&call_id),
                 None,
             )
             .await?;
-            sink(ChatEvent::ToolResult {
-                name,
-                output: out.output,
-            });
+            sink(ChatEvent::ToolResult { name, output });
         }
         store::touch_chat(pool, chat_id).await?;
     }
@@ -1214,6 +1276,136 @@ mod tests {
             "LLM streaming error: {\"error\":\"Memory limit exceeded during prefill\"}",
         )
         .await;
+    }
+
+    /// Returns an empty assistant turn — no tool call, no visible text.
+    struct EmptyReplyLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmTransport for EmptyReplyLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            _input: Vec<InputItem>,
+            tools: &[crate::llm::ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<crate::llm::ResponsesResponse> {
+            if tools.is_empty() {
+                return Ok(mock::no_tools("CONDENSED"));
+            }
+            Ok(mock::no_tools(""))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_reply_surfaces_a_notice_not_silence() {
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let chat = store::create_chat(&pool, None, None).await.unwrap();
+
+        let llm = EmptyReplyLlm;
+        let (events, sink) = collector();
+        run_chat_turn(
+            &pool,
+            &llm,
+            "system",
+            chat,
+            "hi",
+            100_000,
+            8192,
+            Duration::from_secs(60),
+            None,
+            &sink,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::AssistantMessage { text } if text.contains("didn't produce an answer")
+            )),
+            "an empty turn must surface a notice instead of ending silently"
+        );
+    }
+
+    /// Re-issues the identical tool call (same name + arguments) twice, then
+    /// answers — to exercise the repeated-call guard.
+    struct RepeatThenAnswerLlm {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmTransport for RepeatThenAnswerLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            _input: Vec<InputItem>,
+            tools: &[crate::llm::ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<crate::llm::ResponsesResponse> {
+            if tools.is_empty() {
+                return Ok(mock::no_tools("CONDENSED"));
+            }
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n <= 2 {
+                Ok(mock::turn(vec![OutputItem::FunctionCall {
+                    call_id: format!("c{n}"),
+                    name: "list_messages".to_string(),
+                    arguments: "{\"since\":\"2026-01-01T00:00:00Z\"}".to_string(),
+                }]))
+            } else {
+                Ok(mock::no_tools("here is what I found"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_identical_tool_call_is_nudged_not_re_dispatched() {
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let chat = store::create_chat(&pool, None, None).await.unwrap();
+
+        let llm = RepeatThenAnswerLlm {
+            calls: Mutex::new(0),
+        };
+        let (events, sink) = collector();
+        run_chat_turn(
+            &pool,
+            &llm,
+            "system",
+            chat,
+            "look at my messages",
+            100_000,
+            8192,
+            Duration::from_secs(60),
+            None,
+            &sink,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolResult { output, .. } if output.contains("already called this tool")
+            )),
+            "the repeated identical call should be answered with a nudge, not re-run"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::AssistantMessage { text } if text.contains("here is what I found")
+            )),
+            "after the nudge the model should move on and answer"
+        );
     }
 
     /// Streams output-text deltas over the `deltas` sink, then answers — and can
