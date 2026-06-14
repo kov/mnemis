@@ -43,13 +43,25 @@ pub(crate) fn is_transient_stall(err_chain: &str) -> bool {
         || err_chain.contains("timed out")
 }
 
-/// True when an error chain is the server rejecting an oversize prompt (omlx:
-/// `Prompt too long: N tokens exceeds max context window of M`). Unlike a
-/// transient stall this is deterministic — retrying the identical request can't
-/// help — so both agent loops treat it as a signal to *shrink* the input (chat
-/// compacts; extraction splits the batch) rather than to retry as-is.
+/// True when an error chain is the server rejecting a prompt that's too big to
+/// process — either by token count or by memory. Two shapes:
+/// - **token window** (omlx 400: `Prompt too long: N tokens exceeds max context
+///   window of M`) — the prompt is over the model's context window.
+/// - **memory** — on a memory-constrained box omlx can accept a prompt that's
+///   *within* the token window yet still fail to prefill it: a streaming
+///   `Memory limit exceeded during prefill`, or a 507 whose projected memory
+///   `would exceed the memory ceiling`. Here the effective limit is RAM, not the
+///   token window, so the token-count check alone misses it (this is what let
+///   long chats surface a raw error instead of compacting).
+///
+/// All are deterministic — retrying the identical request can't help — so both
+/// agent loops treat them as a signal to *shrink* the input (chat compacts;
+/// extraction splits the batch) rather than to retry as-is.
 pub(crate) fn is_context_overflow(err_chain: &str) -> bool {
-    err_chain.contains("max context window") || err_chain.contains("Prompt too long")
+    err_chain.contains("max context window")
+        || err_chain.contains("Prompt too long")
+        || err_chain.contains("Memory limit exceeded")
+        || err_chain.contains("memory ceiling")
 }
 
 /// What happened on a send attempt that didn't immediately succeed — handed to
@@ -166,5 +178,43 @@ pub(crate) async fn send_with_stall_retry(
                 return Err(e).with_context(|| format!("LLM send failed on step {step}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_context_overflow;
+
+    #[test]
+    fn token_window_rejections_are_overflow() {
+        assert!(is_context_overflow(
+            "LLM API error (HTTP 400 Bad Request): Prompt too long: 40000 tokens \
+             exceeds max context window of 32768 tokens"
+        ));
+        assert!(is_context_overflow(
+            "... exceeds max context window of 32768"
+        ));
+    }
+
+    #[test]
+    fn memory_pressure_failures_are_overflow() {
+        // Streaming prefill OOM: omlx accepts a prompt within the token window
+        // but can't prefill it on a memory-constrained box. Previously slipped
+        // through as a raw error instead of triggering compaction.
+        assert!(is_context_overflow(
+            "LLM streaming error: {\"error\":\"Memory limit exceeded during prefill\"}"
+        ));
+        // 507 projected-memory rejection.
+        assert!(is_context_overflow(
+            "LLM API error (HTTP 507): projected memory 32.73GB would exceed the \
+             memory ceiling 24.00GB"
+        ));
+    }
+
+    #[test]
+    fn transient_and_unrelated_errors_are_not_overflow() {
+        assert!(!is_context_overflow("connection reset by peer"));
+        assert!(!is_context_overflow("LLM streaming error: timed out"));
+        assert!(!is_context_overflow("HTTP 500: internal server error"));
     }
 }

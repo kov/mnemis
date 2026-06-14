@@ -1098,10 +1098,11 @@ mod tests {
         );
     }
 
-    /// Overflows the first chat send, then answers once the conversation has
-    /// been compacted. Summarizer calls (tool-less) always succeed.
+    /// Fails the first chat send with `err`, then answers once the conversation
+    /// has been compacted. Summarizer calls (tool-less) always succeed.
     struct OverflowThenAnswerLlm {
         chat_calls: std::sync::Mutex<usize>,
+        err: &'static str,
     }
 
     #[async_trait::async_trait]
@@ -1119,17 +1120,17 @@ mod tests {
             let mut n = self.chat_calls.lock().unwrap();
             *n += 1;
             if *n == 1 {
-                anyhow::bail!(
-                    "LLM API error (HTTP 400 Bad Request): Prompt too long: 40000 tokens \
-                     exceeds max context window of 32768 tokens"
-                );
+                anyhow::bail!(self.err);
             }
             Ok(mock::no_tools("answer after compaction"))
         }
     }
 
-    #[tokio::test]
-    async fn reactive_compaction_recovers_from_an_overflow_rejection() {
+    /// A send that fails once with `err` must trigger a compaction and then
+    /// answer on retry, with the transcript left intact. Shared by the
+    /// token-window and memory-pressure cases — both are context overflows the
+    /// reactive path should recover from.
+    async fn reactive_compaction_recovers(err: &'static str) {
         let tmp = TempDir::new().unwrap();
         let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
         db::migrate(&pool).await.unwrap();
@@ -1155,6 +1156,7 @@ mod tests {
 
         let llm = OverflowThenAnswerLlm {
             chat_calls: std::sync::Mutex::new(0),
+            err,
         };
         let (events, sink) = collector();
         run_chat_turn(
@@ -1177,7 +1179,7 @@ mod tests {
             let events = events.lock().unwrap();
             assert!(
                 events.iter().any(|e| matches!(e, ChatEvent::Compacting)),
-                "the 400 should have triggered a compaction"
+                "the rejection should have triggered a compaction"
             );
             assert!(
                 events
@@ -1192,6 +1194,26 @@ mod tests {
             before + 2,
             "transcript intact after the reactive fold"
         );
+    }
+
+    #[tokio::test]
+    async fn reactive_compaction_recovers_from_a_token_window_rejection() {
+        reactive_compaction_recovers(
+            "LLM API error (HTTP 400 Bad Request): Prompt too long: 40000 tokens \
+             exceeds max context window of 32768 tokens",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reactive_compaction_recovers_from_a_memory_limit_error() {
+        // omlx accepted a within-window prompt but couldn't prefill it on the
+        // memory-constrained box. Before the matcher learned this shape, it
+        // surfaced raw instead of compacting.
+        reactive_compaction_recovers(
+            "LLM streaming error: {\"error\":\"Memory limit exceeded during prefill\"}",
+        )
+        .await;
     }
 
     /// Streams output-text deltas over the `deltas` sink, then answers — and can
