@@ -47,9 +47,11 @@ optional = true
 
 # Linux system appearance (accent color + color scheme) via the XDG desktop
 # portal. `settings` gates the org.freedesktop.portal.Settings wrapper; `tokio`
-# routes zbus through the app's runtime.
+# routes zbus through the app's runtime. `futures-util` drives the live
+# SettingChanged stream that powers re-theming while the app is open.
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13.11", default-features = false, features = ["tokio", "settings"] }
+futures-util = "0.3.31"
 
 # macOS system appearance via NSUserDefaults (AppleInterfaceStyle for dark mode,
 # AppleAccentColor for the accent). Same objc2 family the keychain backend uses.

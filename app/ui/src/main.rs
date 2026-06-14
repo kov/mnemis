@@ -134,6 +134,54 @@ fn apply_appearance(a: &AppearanceDto) {
     }
 }
 
+/// The envelope the `watch_appearance` channel callback receives — same shape as
+/// `ChannelEnvelope`, but carrying an `AppearanceDto` payload.
+#[derive(Deserialize)]
+struct AppearanceEnvelope {
+    #[serde(default)]
+    end: bool,
+    message: Option<AppearanceDto>,
+}
+
+#[derive(Serialize)]
+struct WatchAppearanceArgs {
+    on_change: String,
+}
+
+/// Subscribe to live OS appearance changes: each pushed `AppearanceDto` re-themes
+/// the document root, so flipping the system accent or light/dark while the app is
+/// open updates it immediately. Same Tauri `Channel` wiring as `send_chat_message`
+/// — register a JS callback via `transformCallback` and hand its id to the backend
+/// as `"__CHANNEL__:<id>"`. The callback lives for the app's lifetime (the backend
+/// watcher only stops when the webview is gone).
+pub fn watch_appearance() {
+    let closure = Closure::wrap(Box::new(move |payload: JsValue| {
+        let Some(s) = js_sys::JSON::stringify(&payload)
+            .ok()
+            .and_then(|v| v.as_string())
+        else {
+            return;
+        };
+        if let Ok(env) = serde_json::from_str::<AppearanceEnvelope>(&s)
+            && !env.end
+            && let Some(a) = env.message
+        {
+            apply_appearance(&a);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let id = transformCallback(&closure, false);
+    // Fires for the app's whole lifetime, so it must outlive this function.
+    closure.forget();
+
+    let on_change = format!("__CHANNEL__:{}", id as u64);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(args) = serde_wasm_bindgen::to_value(&WatchAppearanceArgs { on_change }) {
+            let _ = invoke("watch_appearance", args).await;
+        }
+    });
+}
+
 pub async fn run_sync_now() -> Result<SyncOutcome, String> {
     let raw = invoke("sync_now", JsValue::NULL)
         .await
@@ -768,6 +816,9 @@ fn App() -> impl IntoView {
             apply_appearance(&appearance);
         }
     });
+    // Keep tracking the OS appearance: re-theme live when the system accent or
+    // light/dark preference changes while the app is open.
+    watch_appearance();
 
     view! {
         <Router>

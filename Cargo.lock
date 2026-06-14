@@ -2900,6 +2900,7 @@ dependencies = [
  "ashpd",
  "chrono",
  "fantoccini",
+ "futures-util",
  "libc",
  "mnemis-engine",
  "mnemis-types",

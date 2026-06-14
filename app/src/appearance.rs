@@ -11,6 +11,7 @@
 //! - **Anything else**: no preference, no accent (the CSS fallback applies).
 
 use mnemis_types::AppearanceDto;
+use tauri::ipc::Channel;
 
 /// One-shot read of the current system appearance. Best-effort: any failure
 /// (no portal, key unset) yields `AppearanceDto::default()` so the frontend
@@ -18,6 +19,51 @@ use mnemis_types::AppearanceDto;
 #[tauri::command]
 pub async fn get_appearance() -> Result<AppearanceDto, String> {
     Ok(read_appearance().await)
+}
+
+/// Subscribe to live OS appearance changes, pushing a fresh `AppearanceDto`
+/// through `on_change` whenever the accent or color scheme changes while the app
+/// is open. Returns immediately; a detached task owns the channel for the app's
+/// lifetime. Only Linux (the XDG portal's `SettingChanged` signal) is wired —
+/// elsewhere the boot-time `get_appearance` read still themes the app.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn watch_appearance(on_change: Channel<AppearanceDto>) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        tauri::async_runtime::spawn(watch_appearance_linux(on_change));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = on_change;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn watch_appearance_linux(on_change: Channel<AppearanceDto>) {
+    use ashpd::desktop::settings::Settings;
+    use futures_util::StreamExt;
+
+    let Ok(settings) = Settings::new().await else {
+        return;
+    };
+    // One generic stream for every setting change; we re-read the whole
+    // appearance on each and dedupe, so contrast/reduced-motion churn is
+    // ignored and only real accent/scheme changes reach the UI.
+    let Ok(mut changes) = settings.receive_setting_changed().await else {
+        return;
+    };
+    let mut last = read_appearance().await;
+    while changes.next().await.is_some() {
+        let current = read_appearance().await;
+        if current != last {
+            last = current.clone();
+            // A send error means the webview is gone — stop watching.
+            if on_change.send(current).is_err() {
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
