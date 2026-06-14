@@ -1055,6 +1055,48 @@ h1 {
   font-size: 0.95rem;
 }
 
+/* ---- Inline chat embedded in an action card ---- */
+.action-chat {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.action-chat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-12);
+  color: var(--fg-muted);
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.action-chat-pop {
+  margin-left: auto;
+  font-weight: 500;
+  font-size: var(--fs-12);
+}
+.action-chat-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.action-chat-empty {
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+  font-style: italic;
+}
+/* The inline composer is more compact than the full Chats view's. */
+.action-chat .chat-input {
+  margin-top: 0;
+}
+.action-chat .chat-input textarea {
+  min-height: 2.2rem;
+  font-size: var(--fs-13);
+}
+
 /* ---- CalDAV reminders ---- */
 
 .reminder-badge {

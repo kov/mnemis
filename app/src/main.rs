@@ -493,6 +493,19 @@ async fn create_chat(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// The most recent chat seeded from an entity (e.g. an action), if any — so the
+/// inline action chat resumes rather than starting a new conversation.
+#[tauri::command(rename_all = "snake_case")]
+async fn find_seeded_chat(
+    state: State<'_, AppState>,
+    seeded_from_kind: String,
+    seeded_from_id: i64,
+) -> Result<Option<i64>, String> {
+    chat::store::find_seeded_chat(&state.pool, &seeded_from_kind, seeded_from_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn get_chat_turns(
     state: State<'_, AppState>,
@@ -739,6 +752,7 @@ fn main() {
             save_llm_config,
             list_chats,
             create_chat,
+            find_seeded_chat,
             set_chat_archived,
             delete_chat,
             get_chat_turns,

@@ -539,6 +539,25 @@ pub async fn create_chat(
 }
 
 #[derive(Serialize)]
+struct FindSeededChatArgs {
+    seeded_from_kind: String,
+    seeded_from_id: i64,
+}
+
+/// The most recent chat seeded from an entity (e.g. an action), if any.
+pub async fn fetch_seeded_chat(kind: &str, id: i64) -> Result<Option<i64>, String> {
+    let args = serde_wasm_bindgen::to_value(&FindSeededChatArgs {
+        seeded_from_kind: kind.to_string(),
+        seeded_from_id: id,
+    })
+    .map_err(|e| e.to_string())?;
+    let raw = invoke("find_seeded_chat", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<Option<i64>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
 struct ChatIdArgs {
     chat_id: i64,
 }

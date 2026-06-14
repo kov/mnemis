@@ -22,8 +22,8 @@ use crate::{
     cancel_chat_message, confidence_class, confirm_resolution, create_chat, delete_caldav_account,
     delete_chat, delete_source, discover_source_channels, fetch_actions, fetch_caldav_account,
     fetch_chat_seed, fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config,
-    fetch_message, fetch_pending_resolutions, fetch_settings_sources, fetch_status,
-    fetch_user_profile, list_caldav_collections, open_external, promote_to_reminder,
+    fetch_message, fetch_pending_resolutions, fetch_seeded_chat, fetch_settings_sources,
+    fetch_status, fetch_user_profile, list_caldav_collections, open_external, promote_to_reminder,
     reject_resolution, run_sync_caldav, run_sync_now, save_llm_config, save_user_profile,
     send_chat_message, set_caldav_collection, set_channel_muted, set_channels_muted_bulk,
     set_chat_archived, set_chat_show_reasoning, set_source_muted, status_label,
@@ -425,6 +425,8 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
     // we hold off refetching until the user picks Submit or Skip so the card
     // stays on screen while they decide.
     let feedback_open: RwSignal<Option<FeedbackKind>> = RwSignal::new(None);
+    // Reveals the inline chat grounded in this action.
+    let chat_open = RwSignal::new(false);
 
     let refetch_for_status = refetch.clone();
     let trigger_status = move |target: ActionStatus, then_open: Option<FeedbackKind>| {
@@ -516,8 +518,11 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                         refetch=refetch.clone()
                     />
                 })}
-                <TalkAboutButton kind="action" id=id />
+                <button class="btn btn-ghost" on:click=move |_| chat_open.update(|v| *v = !*v)>
+                    {move || if chat_open.get() { "\u{25C8} Hide chat" } else { "\u{25C8} Chat" }}
+                </button>
             </div>
+            {move || chat_open.get().then(|| view! { <ActionInlineChat action_id=id /> })}
             <Show when=move || feedback_open.get().is_some() fallback=|| view! { <></> }>
                 {
                     let refetch = refetch.clone();
@@ -1778,6 +1783,179 @@ fn TalkAboutButton(kind: &'static str, id: i64) -> impl IntoView {
         });
     };
     view! { <button class="btn btn-ghost" on:click=on_click>"Talk about this"</button> }
+}
+
+/// An inline, collapsible chat grounded in an action — "start a chat just by
+/// sending a message". Resumes the action's existing seeded chat when there is
+/// one (`find_seeded_chat`), otherwise creates one on the first send. It shares
+/// the app-scoped `ChatUiState` streaming buffers with the full Chats view, so a
+/// turn started here keeps streaming if the user opens `/chats/{id}`.
+#[component]
+fn ActionInlineChat(action_id: i64) -> impl IntoView {
+    let ui = use_context::<ChatUiState>().expect("chat ui state context");
+    let ChatUiState {
+        show_reasoning,
+        active_id,
+        pending_user,
+        streaming_text,
+        sending,
+        refresh,
+        error,
+    } = ui;
+
+    // The chat backing this action, resolved lazily: None until an existing one
+    // is found or the first send creates it.
+    let chat_id = RwSignal::new(None::<i64>);
+    spawn_local(async move {
+        if let Ok(Some(id)) = fetch_seeded_chat("action", action_id).await {
+            chat_id.set(Some(id));
+        }
+    });
+
+    let turns = LocalResource::new(move || {
+        let _ = refresh.get();
+        let id = chat_id.get();
+        async move {
+            match id {
+                Some(id) => fetch_chat_turns(id).await,
+                None => Ok(Vec::new()),
+            }
+        }
+    });
+
+    let input_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+    let is_active =
+        Memo::new(move |_| active_id.get().is_some() && active_id.get() == chat_id.get());
+
+    let do_send = move || {
+        if sending.get() {
+            return;
+        }
+        let Some(input) = input_ref.get() else { return };
+        let text = input.value();
+        if text.trim().is_empty() {
+            return;
+        }
+        input.set_value("");
+        spawn_local(async move {
+            // Resume the action's chat, or create it on the first send.
+            let id = match chat_id.get_untracked() {
+                Some(id) => id,
+                None => match create_chat(Some("action".to_string()), Some(action_id)).await {
+                    Ok(id) => {
+                        chat_id.set(Some(id));
+                        id
+                    }
+                    Err(_) => return,
+                },
+            };
+            active_id.set(Some(id));
+            sending.set(true);
+            error.set(None);
+            streaming_text.set(String::new());
+            pending_user.set(Some(text.clone()));
+            send_chat_message(id, text, move |msg| match msg {
+                ChatStream::Event(ChatEvent::Error { message }) => error.set(Some((id, message))),
+                ChatStream::Event(ChatEvent::Compacting) => {}
+                ChatStream::Event(ChatEvent::Delta { text }) => {
+                    streaming_text.update(|s| s.push_str(&text))
+                }
+                ChatStream::Event(_) => {
+                    streaming_text.set(String::new());
+                    refresh.update(|n| *n += 1);
+                }
+                ChatStream::End => {
+                    sending.set(false);
+                    streaming_text.set(String::new());
+                    pending_user.set(None);
+                    active_id.set(None);
+                    refresh.update(|n| *n += 1);
+                }
+            });
+        });
+    };
+
+    let on_keydown = move |ev: KeyboardEvent| {
+        if ev.key() == "Enter" && !ev.shift_key() {
+            ev.prevent_default();
+            do_send();
+        }
+    };
+
+    view! {
+        <div class="action-chat">
+            <div class="action-chat-head">
+                "\u{25C8} Chat about this action"
+                {move || chat_id.get().map(|id| view! {
+                    <A href=format!("/chats/{id}") attr:class="action-chat-pop">
+                        "Open in Chats \u{2197}"
+                    </A>
+                })}
+            </div>
+            <div class="action-chat-thread">
+                <Transition fallback=|| view! { <div class="loading">"Loading\u{2026}"</div> }>
+                    {move || turns.get().map(|res| match res {
+                        Ok(rows) if rows.is_empty() && !is_active.get() => view! {
+                            <div class="action-chat-empty">
+                                "No chat yet \u{2014} send a message to start one grounded in this action."
+                            </div>
+                        }.into_any(),
+                        Ok(rows) => view! {
+                            <ChatTranscript turns=rows show_reasoning=show_reasoning />
+                        }.into_any(),
+                        Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                    })}
+                </Transition>
+                // Optimistic echo of the just-sent message until its persisted
+                // copy lands in `turns`.
+                {move || {
+                    if !is_active.get() {
+                        return None;
+                    }
+                    let pending = pending_user.get()?;
+                    let already = turns
+                        .get()
+                        .and_then(|r| r.ok())
+                        .map(|rows| {
+                            rows.iter().any(|t| {
+                                t.role == "user" && t.content.as_deref() == Some(pending.as_str())
+                            })
+                        })
+                        .unwrap_or(false);
+                    (!already).then(|| view! { <div class="chat-msg chat-user">{pending}</div> })
+                }}
+                // The assistant's answer as it streams, before its persisted copy.
+                {move || {
+                    if !is_active.get() {
+                        return None;
+                    }
+                    let text = streaming_text.get();
+                    (!text.is_empty())
+                        .then(|| view! { <div class="chat-msg chat-assistant chat-streaming">{text}</div> })
+                }}
+                // Dots before the first token.
+                {move || (is_active.get() && sending.get() && streaming_text.get().is_empty())
+                    .then(|| view! { <div class="chat-thinking">"\u{2026}"</div> })}
+                {move || error.get()
+                    .filter(|(cid, _)| Some(*cid) == chat_id.get())
+                    .map(|(_, msg)| view! { <div class="error chat-error">{msg}</div> })}
+            </div>
+            <div class="chat-input">
+                <textarea
+                    node_ref=input_ref
+                    placeholder="Ask mnemis about this action\u{2026}"
+                    on:keydown=on_keydown
+                />
+                <button
+                    class="btn btn-primary"
+                    on:click=move |_| do_send()
+                    prop:disabled=move || sending.get() && is_active.get()
+                >
+                    "Send"
+                </button>
+            </div>
+        </div>
+    }
 }
 
 /// CalDAV reminders settings: connect an account, discover + pick a VTODO task

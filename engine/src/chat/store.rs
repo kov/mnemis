@@ -39,6 +39,27 @@ pub async fn create_chat(
     Ok(id)
 }
 
+/// The id of the most recent non-archived chat seeded from a specific entity
+/// (e.g. an action), or `None`. Lets the inline action chat resume an existing
+/// conversation instead of starting a fresh one each time the action is opened.
+pub async fn find_seeded_chat(
+    pool: &SqlitePool,
+    seeded_from_kind: &str,
+    seeded_from_id: i64,
+) -> Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM chats \
+         WHERE seeded_from_kind = ? AND seeded_from_id = ? AND archived = 0 \
+         ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(seeded_from_kind)
+    .bind(seeded_from_id)
+    .fetch_optional(pool)
+    .await
+    .context("finding seeded chat")?;
+    Ok(row.map(|(id,)| id))
+}
+
 /// List chats most-recently-active first. Archived chats are excluded unless
 /// `include_archived` is set, in which case they sort after the active ones.
 pub async fn list_chats(pool: &SqlitePool, include_archived: bool) -> Result<Vec<ChatDto>> {
@@ -510,6 +531,28 @@ mod tests {
         let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
         db::migrate(&pool).await.unwrap();
         (tmp, pool)
+    }
+
+    #[tokio::test]
+    async fn find_seeded_chat_resumes_matching_action_only() {
+        let (_tmp, pool) = empty_db().await;
+        // Nothing seeded yet.
+        assert_eq!(find_seeded_chat(&pool, "action", 7).await.unwrap(), None);
+
+        let a7 = create_chat(&pool, Some("action"), Some(7)).await.unwrap();
+        let _a8 = create_chat(&pool, Some("action"), Some(8)).await.unwrap();
+        let _m7 = create_chat(&pool, Some("message"), Some(7)).await.unwrap();
+
+        // Matches exactly (kind, id) — not a different id, nor a different kind.
+        assert_eq!(
+            find_seeded_chat(&pool, "action", 7).await.unwrap(),
+            Some(a7)
+        );
+        assert_eq!(find_seeded_chat(&pool, "action", 99).await.unwrap(), None);
+
+        // Archived chats are skipped so a resume never lands on a hidden one.
+        set_archived(&pool, a7, true).await.unwrap();
+        assert_eq!(find_seeded_chat(&pool, "action", 7).await.unwrap(), None);
     }
 
     #[tokio::test]

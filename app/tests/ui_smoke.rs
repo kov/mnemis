@@ -2270,6 +2270,125 @@ async fn chat_view_auto_scrolls_to_the_latest_message() -> Result<()> {
     Ok(())
 }
 
+/// The inline action chat resumes the action's existing seeded conversation:
+/// toggling "Chat" on an action card loads its prior transcript inline
+/// (find_seeded_chat → get_chat_turns), no LLM required.
+#[tokio::test(flavor = "current_thread")]
+async fn action_inline_chat_resumes_seeded_conversation() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-action-chat.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        // High-confidence + pending, so the card is visible up front (not behind
+        // the low-confidence revealer).
+        let (action_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, details, confidence, rationale, status, extracted_at) \
+             VALUES ('Renew the TLS cert', 'x', 'high', 'r', 'pending', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+
+        // A chat already grounded in that action, with a transcript to resume.
+        let chat_id = store::create_chat(&pool, Some("action"), Some(action_id)).await?;
+        let q = "what does this need from me?";
+        store::append_turn(&pool, chat_id, "user", Some(q), None, None, None).await?;
+        store::ensure_title(&pool, chat_id, q).await?;
+        store::append_turn(
+            &pool,
+            chat_id,
+            "assistant",
+            Some("Renew the cert before Friday."),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    // Actions is the default route; wait for the card.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.action"))
+        .await
+        .context("waiting for the action card")?;
+
+    // Toggle the inline chat on the action card.
+    let toggle = client
+        .execute(
+            r#"
+            const card = Array.from(document.querySelectorAll('div.action'))
+                .find(c => c.textContent.includes('Renew the TLS cert'));
+            if (!card) { return 'missing-card'; }
+            const btn = Array.from(card.querySelectorAll('button'))
+                .find(b => b.textContent.includes('Chat'));
+            if (!btn) { return 'missing-chat-toggle'; }
+            btn.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        toggle.as_str(),
+        Some("ok"),
+        "chat toggle click failed: {toggle:?}"
+    );
+
+    // The inline panel appears and resumes the prior transcript.
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("div.action-chat"))
+        .await
+        .context("waiting for the inline chat panel")?;
+
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let t = client
+            .find(Locator::Css("div.action-chat"))
+            .await?
+            .text()
+            .await
+            .unwrap_or_default()
+            .to_lowercase();
+        if t.contains("renew the cert before friday") {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "expected the seeded inline transcript to render in the action chat"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
+
 async fn seed(pool: &SqlitePool) -> Result<()> {
     let now = Utc::now().timestamp();
 
