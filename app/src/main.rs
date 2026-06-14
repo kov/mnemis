@@ -17,8 +17,8 @@ use mnemis_engine::llm::LlmClient;
 use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
-    ChatDto, ChatEvent, ChatTurnDto, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto,
-    SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
+    ChatDto, ChatEvent, ChatTurnDto, FeedbackKind, LlmConfigDto, MessageDetailDto, MessageDto,
+    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tauri::ipc::Channel;
@@ -95,6 +95,16 @@ async fn list_messages(
         None => queries::MessageFilter::default(),
     };
     queries::list_messages(&state.pool, filter)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_message(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> Result<MessageDetailDto, String> {
+    queries::get_message(&state.pool, message_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -699,6 +709,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_actions,
             list_messages,
+            get_message,
             get_status,
             sync_now,
             update_action,

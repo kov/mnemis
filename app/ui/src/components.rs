@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -10,9 +10,9 @@ use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavCollectionDto, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto,
-    Confidence, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, ProfileIdentifier,
-    SourceHealth, SourceRowDto, StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
-    summarize_sync_error,
+    Confidence, FeedbackKind, LlmConfigDto, MessageActionRef, MessageDetailDto, MessageDto,
+    PendingResolutionDto, ProfileIdentifier, SourceHealth, SourceRowDto, StatusSnapshot,
+    SyncOutcome, ThinkingLevel, UserProfileDto, summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
@@ -22,12 +22,12 @@ use crate::{
     cancel_chat_message, confidence_class, confirm_resolution, create_chat, delete_caldav_account,
     delete_chat, delete_source, discover_source_channels, fetch_actions, fetch_caldav_account,
     fetch_chat_seed, fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config,
-    fetch_pending_resolutions, fetch_settings_sources, fetch_status, fetch_user_profile,
-    list_caldav_collections, open_external, promote_to_reminder, reject_resolution,
-    run_sync_caldav, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
-    set_caldav_collection, set_channel_muted, set_channels_muted_bulk, set_chat_archived,
-    set_chat_show_reasoning, set_source_muted, status_label, submit_dismissal_feedback,
-    update_action,
+    fetch_message, fetch_pending_resolutions, fetch_settings_sources, fetch_status,
+    fetch_user_profile, list_caldav_collections, open_external, promote_to_reminder,
+    reject_resolution, run_sync_caldav, run_sync_now, save_llm_config, save_user_profile,
+    send_chat_message, set_caldav_collection, set_channel_muted, set_channels_muted_bulk,
+    set_chat_archived, set_chat_show_reasoning, set_source_muted, status_label,
+    submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -778,49 +778,253 @@ fn format_relative(posted_at: i64) -> String {
     }
 }
 
+/// The Inbox as a true list | reading pane (the Mail.app shape). The list
+/// carries snippet-only rows; selecting one lazily loads the full message
+/// (`get_message`) into the reading pane. The first message is auto-selected.
 #[component]
-pub fn InboxList(rows: Vec<MessageDto>) -> impl IntoView {
-    if rows.is_empty() {
-        return view! { <div class="empty">"No messages yet."</div> }.into_any();
-    }
+pub fn InboxPane(rows: Vec<MessageDto>) -> impl IntoView {
+    let first = rows.first().map(|m| m.id);
+    let selected = RwSignal::new(first);
+    // Session-local "read" state: the unread dot clears once a row is opened.
+    // (There's no persisted read flag yet — this is purely a per-view cue.)
+    let opened: RwSignal<HashSet<i64>> = RwSignal::new(first.into_iter().collect());
+    let count = rows.len();
+
+    let detail = LocalResource::new(move || {
+        let id = selected.get();
+        async move {
+            match id {
+                Some(id) => fetch_message(id).await.map(Some),
+                None => Ok(None),
+            }
+        }
+    });
+    let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || detail.refetch());
+
     view! {
-        <div>
-            <For
-                each=move || rows.clone()
-                key=|m| m.id
-                children=move |m: MessageDto| view! { <MessageRow msg=m /> }
-            />
+        <div class="body">
+            <div class="list">
+                <div class="list-head">
+                    <span class="h">{format!("Inbox · {count}")}</span>
+                </div>
+                {if rows.is_empty() {
+                    view! { <div class="list-empty">"No messages yet."</div> }.into_any()
+                } else {
+                    view! {
+                        <For
+                            each=move || rows.clone()
+                            key=|m| m.id
+                            children=move |m: MessageDto| view! {
+                                <MessageListRow msg=m selected=selected opened=opened />
+                            }
+                        />
+                    }
+                    .into_any()
+                }}
+            </div>
+            <div class="reading">
+                <Suspense fallback=|| view! {
+                    <div class="reading-empty">"Loading…"</div>
+                }>
+                    {move || {
+                        let refetch = refetch.clone();
+                        detail.get().map(move |res| match res {
+                            Ok(Some(d)) => view! { <MessageReading detail=d refetch=refetch /> }.into_any(),
+                            Ok(None) => view! {
+                                <div class="reading-empty">"Select a message to read it."</div>
+                            }.into_any(),
+                            Err(e) => view! {
+                                <div class="reading-empty">{format!("Error: {e}")}</div>
+                            }.into_any(),
+                        })
+                    }}
+                </Suspense>
+            </div>
         </div>
     }
-    .into_any()
 }
 
 #[component]
-fn MessageRow(msg: MessageDto) -> impl IntoView {
+fn MessageListRow(
+    msg: MessageDto,
+    selected: RwSignal<Option<i64>>,
+    opened: RwSignal<HashSet<i64>>,
+) -> impl IntoView {
+    let id = msg.id;
+    let from = msg
+        .author_display
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
     let subject = msg
         .subject
         .clone()
         .unwrap_or_else(|| "(no subject)".to_string());
-    let author = msg
-        .author_display
-        .clone()
-        .unwrap_or_else(|| "?".to_string());
-    let source = msg.source_name.clone().unwrap_or_else(|| "?".to_string());
-    let channel = msg.channel_name.clone().unwrap_or_else(|| "?".to_string());
+    let snippet = msg.snippet.clone();
     let when = format_relative(msg.posted_at);
+    let has_action = msg.has_action;
+
+    let is_selected = move || selected.get() == Some(id);
+    let is_read = move || opened.get().contains(&id);
+    let on_click = move |_| {
+        opened.update(|s| {
+            s.insert(id);
+        });
+        selected.set(Some(id));
+    };
 
     view! {
-        <div class="message">
-            <div class="message-head">
-                <span class="message-author">{author}</span>
-                <span class="message-subject">{subject}</span>
-                {msg.has_action.then(|| view! { <span class="badge badge-high">"action"</span> })}
-                <span class="message-when">{when}</span>
+        <div
+            class="row"
+            class:selected=is_selected
+            class:read=is_read
+            data-message-id=id.to_string()
+            on:click=on_click
+        >
+            <span class="udot"></span>
+            <span class="from">{from}</span>
+            <span class="when">{when}</span>
+            <span class="subj">{subject}</span>
+            <span class="snip">{snippet}</span>
+            {has_action.then(|| view! {
+                <span class="tags"><span class="pill action">"\u{25CE} action"</span></span>
+            })}
+        </div>
+    }
+}
+
+/// First initials of a display name, for the reading-pane avatar.
+fn initials_of(name: &str) -> String {
+    let mut words = name.split_whitespace();
+    let a = words.next().and_then(|w| w.chars().next());
+    let b = words.next().and_then(|w| w.chars().next());
+    match (a, b) {
+        (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
+        (Some(a), None) => a.to_uppercase().to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+#[component]
+fn MessageReading(detail: MessageDetailDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
+    let subject = detail
+        .subject
+        .clone()
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let name = detail
+        .author_display
+        .clone()
+        .or_else(|| detail.author_addr.clone())
+        .unwrap_or_else(|| "?".to_string());
+    let addr = detail.author_addr.clone().unwrap_or_default();
+    let initials = initials_of(&name);
+    let when = unix_to_short_date(detail.posted_at);
+    let source = detail.source_name.clone().unwrap_or_default();
+    let channel = detail.channel_name.clone().unwrap_or_default();
+    let origin = [source, channel]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let actions = detail.actions.clone();
+    let body = detail.body.clone();
+
+    view! {
+        <div class="read-wrap">
+            <div class="read-from">
+                <span class="avatar">{initials}</span>
+                <span>
+                    <div class="name">{name}</div>
+                    <div class="addr">{addr}</div>
+                </span>
+                <span class="when">{when}</span>
             </div>
-            <div class="message-snippet">{msg.snippet.clone()}</div>
-            <div class="message-meta">
-                <span>{format!("{source} · {channel}")}</span>
-                <TalkAboutButton kind="message" id=msg.id />
+            <div class="read-to">{origin}</div>
+            <div class="read-subject">{subject}</div>
+            {actions.into_iter().map(|a| {
+                let refetch = refetch.clone();
+                view! { <ExtractedAction action=a refetch=refetch /> }
+            }).collect_view()}
+            <div class="read-body">{body}</div>
+        </div>
+    }
+}
+
+/// The "mnemis extracted an action" callout inside the reading pane. Wired to
+/// the same mutations the Actions page uses (claim / remind / dismiss), and
+/// refetches the message detail so the callout reflects the new status.
+#[component]
+fn ExtractedAction(
+    action: MessageActionRef,
+    refetch: Arc<dyn Fn() + Send + Sync>,
+) -> impl IntoView {
+    let id = action.id;
+    let conf_class = confidence_class(action.confidence);
+    let conf_label = match action.confidence {
+        Confidence::High => "high",
+        Confidence::Medium => "medium",
+        Confidence::Low => "low",
+    };
+    let status = status_label(action.status);
+    let due_label = action.due_at.map(unix_to_short_date);
+    let meta = match &due_label {
+        Some(d) => format!("{status} · due {d}"),
+        None => status.to_string(),
+    };
+    let active = !matches!(
+        action.status,
+        ActionStatus::Done | ActionStatus::Cancelled | ActionStatus::Dismissed
+    );
+    let remind_label = if action.due_at.is_some() {
+        "Change date"
+    } else {
+        "Remind"
+    };
+
+    let refetch_claim = refetch.clone();
+    let on_claim = move |_| {
+        let refetch = refetch_claim.clone();
+        spawn_local(async move {
+            let _ = update_action(id, ActionStatus::Claimed, None).await;
+            refetch();
+        });
+    };
+    let refetch_dismiss = refetch.clone();
+    let on_dismiss = move |_| {
+        let refetch = refetch_dismiss.clone();
+        spawn_local(async move {
+            let _ = update_action(id, ActionStatus::Dismissed, None).await;
+            refetch();
+        });
+    };
+
+    view! {
+        <div class="extracted">
+            <div class="ex-head">"\u{25CE} mnemis extracted an action"</div>
+            <div class="ex-title">{action.title.clone()}</div>
+            <div class="ex-meta">
+                <span class=conf_class>{conf_label}</span>
+                " "
+                {meta}
+            </div>
+            <div class="ex-actions">
+                {active.then(|| view! {
+                    <button class="btn btn-secondary" on:click=on_claim>"Claim"</button>
+                })}
+                {active.then(|| {
+                    let refetch = refetch.clone();
+                    view! {
+                        <ReminderDatePicker
+                            action_id=id
+                            due_at=action.due_at
+                            label=remind_label
+                            refetch=refetch
+                        />
+                    }
+                })}
+                {active.then(|| view! {
+                    <button class="btn btn-ghost" on:click=on_dismiss>"Dismiss"</button>
+                })}
+                <TalkAboutButton kind="action" id=id />
             </div>
         </div>
     }

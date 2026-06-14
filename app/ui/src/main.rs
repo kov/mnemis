@@ -6,8 +6,8 @@ use leptos_router::path;
 use mnemis_types::{
     ActionDto, ActionStatus, AppearanceDto, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto,
     ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, ColorScheme, Confidence, FeedbackKind,
-    LlmConfigDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome,
-    UserProfileDto,
+    LlmConfigDto, MessageDetailDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot,
+    SyncOutcome, UserProfileDto,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
@@ -58,6 +58,21 @@ async fn fetch_messages(limit: Option<i64>) -> Result<Vec<MessageDto>, String> {
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     serde_wasm_bindgen::from_value::<Vec<MessageDto>>(raw).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct MessageIdArgs {
+    message_id: i64,
+}
+
+/// Full detail for one message (the reading pane), loaded on selection.
+pub async fn fetch_message(message_id: i64) -> Result<MessageDetailDto, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&MessageIdArgs { message_id }).map_err(|e| e.to_string())?;
+    let raw = invoke("get_message", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<MessageDetailDto>(raw).map_err(|e| e.to_string())
 }
 
 async fn fetch_status() -> Result<StatusSnapshot, String> {
@@ -741,7 +756,7 @@ fn App() -> impl IntoView {
                 <Sidebar />
                 <main class="main">
                     <Toolbar />
-                    <div class="content">
+                    <div class="outlet">
                         <components::FirstRunBanner />
                         <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
                     <Route path=path!("/") view=ActionsPage />
@@ -848,42 +863,42 @@ fn Toolbar() -> impl IntoView {
 
 #[component]
 fn SettingsPage() -> impl IntoView {
-    view! { <components::SettingsHome /> }
+    view! { <div class="doc"><components::SettingsHome /></div> }
 }
 
 #[component]
 fn SettingsProfilePage() -> impl IntoView {
-    view! { <components::SettingsProfile /> }
+    view! { <div class="doc"><components::SettingsProfile /></div> }
 }
 
 #[component]
 fn SettingsLlmPage() -> impl IntoView {
-    view! { <components::SettingsLlm /> }
+    view! { <div class="doc"><components::SettingsLlm /></div> }
 }
 
 #[component]
 fn SettingsSourcesPage() -> impl IntoView {
-    view! { <components::SettingsSources /> }
+    view! { <div class="doc"><components::SettingsSources /></div> }
 }
 
 #[component]
 fn SettingsRemindersPage() -> impl IntoView {
-    view! { <components::SettingsReminders /> }
+    view! { <div class="doc"><components::SettingsReminders /></div> }
 }
 
 #[component]
 fn ActionsPage() -> impl IntoView {
-    view! { <components::ActionsPage /> }
+    view! { <div class="doc"><components::ActionsPage /></div> }
 }
 
 #[component]
 fn ChatsListPage() -> impl IntoView {
-    view! { <components::ChatsPage /> }
+    view! { <div class="doc"><components::ChatsPage /></div> }
 }
 
 #[component]
 fn ChatDetailPage() -> impl IntoView {
-    view! { <components::ChatDetail /> }
+    view! { <div class="doc"><components::ChatDetail /></div> }
 }
 
 #[component]
@@ -896,10 +911,17 @@ fn InboxPage() -> impl IntoView {
         async move { fetch_messages(None).await }
     });
     view! {
-        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+        <Suspense fallback=|| view! {
+            <div class="body">
+                <div class="list"></div>
+                <div class="reading"><div class="reading-empty">"Loading…"</div></div>
+            </div>
+        }>
             {move || messages.get().map(|res| match res {
-                Ok(rows) => view! { <components::InboxList rows=rows /> }.into_any(),
-                Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                Ok(rows) => view! { <components::InboxPane rows=rows /> }.into_any(),
+                Err(e) => view! {
+                    <div class="reading-empty">{format!("Error: {e}")}</div>
+                }.into_any(),
             })}
         </Suspense>
     }

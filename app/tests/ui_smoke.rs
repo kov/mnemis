@@ -235,18 +235,22 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     client
         .wait()
         .at_most(SETTLE_TIMEOUT)
-        .for_element(Locator::Css("div.message"))
+        .for_element(Locator::Css(".list .row[data-message-id]"))
         .await
-        .context("waiting for inbox to render")?;
+        .context("waiting for inbox list to render")?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Read the list pane's full text via textContent, so the CSS ellipsis on
+    // the subject/snippet columns can't hide a subject from the assertions.
     let inbox_text = client
-        .find(Locator::Css("body"))
+        .execute(
+            r#"return (document.querySelector('.list')?.textContent || '').toLowerCase();"#,
+            vec![],
+        )
         .await?
-        .text()
-        .await
+        .as_str()
         .unwrap_or_default()
-        .to_lowercase();
+        .to_string();
     assert!(
         inbox_text.contains("q3 roadmap draft"),
         "expected the high-action message subject in the inbox. text: {inbox_text}"
@@ -259,15 +263,12 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         inbox_text.contains("fyi no action"),
         "expected the action-less message subject in the inbox. text: {inbox_text}"
     );
-    // Exactly two messages are linked to actions in the seed; the third
-    // should not carry an "action" badge. Count the badge spans directly
-    // — text-based counting trips on "no action needed" in the subject.
+    // Exactly two messages are linked to actions in the seed; the third should
+    // not carry an action pill. Count the list rows' action pills directly —
+    // a dedicated class, so a subject like "fyi no action" can't inflate it.
     let badge_count_raw = client
         .execute(
-            r#"
-            return String(Array.from(document.querySelectorAll('div.message span.badge'))
-                .filter(s => s.textContent.trim() === 'action').length);
-            "#,
+            r#"return String(document.querySelectorAll('.list .row .pill.action').length);"#,
             vec![],
         )
         .await?;
@@ -738,14 +739,14 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
         .await?;
     assert_eq!(count.as_str(), Some("60"), "expected 60 folder rows");
 
-    // Scroll the content pane to the bottom and record where it landed. The
-    // three-pane shell makes `.content` (not the page/window) the scroll
-    // container, so this is what holds the channel list's offset. If it doesn't
-    // overflow this guard is meaningless, so require a real offset.
+    // Scroll the document pane to the bottom and record where it landed. The
+    // three-pane shell makes `.doc` (the per-page padded scroll container, not
+    // the page/window) hold the channel list's offset. If it doesn't overflow
+    // this guard is meaningless, so require a real offset.
     let before = client
         .execute(
             r#"
-            const se = document.querySelector('.content');
+            const se = document.querySelector('.doc');
             se.scrollTop = se.scrollHeight;
             return String(se.scrollTop);
             "#,
@@ -755,7 +756,7 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
     let before_px: f64 = before.as_str().unwrap_or("0").parse().unwrap_or(0.0);
     assert!(
         before_px > 50.0,
-        "content pane should be scrollable; scrollTop was {before_px}"
+        "document pane should be scrollable; scrollTop was {before_px}"
     );
 
     // Toggle a checkbox while scrolled down. Programmatic .click() never moves
@@ -805,7 +806,7 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
 
     let after = client
         .execute(
-            r#"return String(document.querySelector('.content').scrollTop);"#,
+            r#"return String(document.querySelector('.doc').scrollTop);"#,
             vec![],
         )
         .await?;

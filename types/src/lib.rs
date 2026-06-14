@@ -177,6 +177,41 @@ pub struct MessageDto {
     pub has_action: bool,
 }
 
+/// A message's full detail for the reading pane: the complete body plus the
+/// actions mnemis extracted from it. Loaded on demand (the list wire stays
+/// snippet-only) when a row is selected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDetailDto {
+    pub id: i64,
+    pub subject: Option<String>,
+    /// Full body text. IMAP bodies are stored as plain `text`.
+    pub body: String,
+    /// `'text'` | `'markdown'` | `'html'` — currently always `'text'`.
+    pub body_format: String,
+    pub author_display: Option<String>,
+    /// The author's handle/address (e.g. email), when known.
+    pub author_addr: Option<String>,
+    /// Unix seconds.
+    pub posted_at: i64,
+    pub channel_name: Option<String>,
+    pub source_name: Option<String>,
+    /// Actions extracted from this message (the "mnemis extracted an action"
+    /// callout in the reading pane).
+    pub actions: Vec<MessageActionRef>,
+}
+
+/// A compact reference to an action that a message produced, shown in the
+/// reading pane's extracted-action callout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageActionRef {
+    pub id: i64,
+    pub title: String,
+    pub confidence: Confidence,
+    pub status: ActionStatus,
+    /// Unix seconds, when the action has a reminder due date.
+    pub due_at: Option<i64>,
+}
+
 /// A single action as rendered in the actions list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionDto {

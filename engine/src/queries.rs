@@ -3,8 +3,8 @@
 
 use anyhow::{Context, Result};
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, MessageDto, PendingResolutionDto, SourceHealth,
-    SourceStatus, StatusSnapshot,
+    ActionDto, ActionStatus, Confidence, MessageActionRef, MessageDetailDto, MessageDto,
+    PendingResolutionDto, SourceHealth, SourceStatus, StatusSnapshot,
 };
 use sqlx::SqlitePool;
 
@@ -179,6 +179,71 @@ pub async fn list_messages(pool: &SqlitePool, filter: MessageFilter) -> Result<V
             },
         )
         .collect())
+}
+
+/// Full detail for one message (the reading pane): the complete body plus the
+/// actions extracted from it. Errors if the id doesn't exist.
+#[allow(clippy::type_complexity)]
+pub async fn get_message(pool: &SqlitePool, message_id: i64) -> Result<MessageDetailDto> {
+    let row: (
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT m.subject, m.body, m.body_format, p.display_name, p.handle, m.posted_at, \
+                c.name, s.name \
+         FROM messages m \
+         LEFT JOIN people p ON p.id = m.author_id \
+         LEFT JOIN channels c ON c.id = m.channel_id \
+         LEFT JOIN sources s ON s.id = c.source_id \
+         WHERE m.id = ?",
+    )
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .context("loading message detail")?;
+
+    let action_rows: Vec<(i64, String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT a.id, a.title, a.confidence, a.status, a.due_at \
+         FROM actions a \
+         JOIN action_evidence ae ON ae.action_id = a.id \
+         WHERE ae.message_id = ? \
+         GROUP BY a.id \
+         ORDER BY a.extracted_at DESC",
+    )
+    .bind(message_id)
+    .fetch_all(pool)
+    .await
+    .context("loading message actions")?;
+
+    let actions = action_rows
+        .into_iter()
+        .map(|(id, title, confidence, status, due_at)| MessageActionRef {
+            id,
+            title,
+            confidence: Confidence::parse(&confidence).unwrap_or(Confidence::Low),
+            status: ActionStatus::parse(&status).unwrap_or(ActionStatus::Pending),
+            due_at,
+        })
+        .collect();
+
+    Ok(MessageDetailDto {
+        id: message_id,
+        subject: row.0,
+        body: row.1,
+        body_format: row.2,
+        author_display: row.3,
+        author_addr: row.4,
+        posted_at: row.5,
+        channel_name: row.6,
+        source_name: row.7,
+        actions,
+    })
 }
 
 /// First non-empty line, capped at SNIPPET_LEN characters with an ellipsis.
@@ -456,6 +521,85 @@ mod tests {
         assert_eq!(rows[1].snippet, "first line");
         assert!(!rows[0].has_action);
         assert!(rows[1].has_action);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_message_returns_full_body_and_linked_actions() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+
+        let (source_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO sources (kind, name, config_ref, created_at) \
+             VALUES ('imap', 'work', 'kc/work', ?) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        let (channel_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO channels (source_id, external_id, name, kind) \
+             VALUES (?, 'INBOX', 'INBOX', 'mailbox') RETURNING id",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await?;
+        let (author_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO people (source_id, external_id, display_name, handle) \
+             VALUES (?, 'ana@example.com', 'Ana', 'ana@example.com') RETURNING id",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await?;
+        let (message_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO messages (channel_id, external_id, author_id, posted_at, \
+                                   subject, body, body_format, ingested_at, flags) \
+             VALUES (?, 'm1', ?, ?, 'Budget', 'Full body line one.\n\nLine two.', 'text', ?, 0) \
+             RETURNING id",
+        )
+        .bind(channel_id)
+        .bind(author_id)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+
+        // An action extracted from the message, with a due date.
+        let (action_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, confidence, status, extracted_at, due_at) \
+             VALUES ('Confirm budget', 'high', 'pending', ?, ?) RETURNING id",
+        )
+        .bind(now)
+        .bind(now + 86_400)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+             VALUES (?, ?, 'source', 1)",
+        )
+        .bind(action_id)
+        .bind(message_id)
+        .execute(&pool)
+        .await?;
+
+        let detail = get_message(&pool, message_id).await?;
+        assert_eq!(detail.subject.as_deref(), Some("Budget"));
+        // Full body, not a snippet.
+        assert!(detail.body.contains("Full body line one."));
+        assert!(detail.body.contains("Line two."));
+        assert_eq!(detail.author_display.as_deref(), Some("Ana"));
+        assert_eq!(detail.author_addr.as_deref(), Some("ana@example.com"));
+        assert_eq!(detail.source_name.as_deref(), Some("work"));
+        assert_eq!(detail.channel_name.as_deref(), Some("INBOX"));
+
+        assert_eq!(detail.actions.len(), 1);
+        let a = &detail.actions[0];
+        assert_eq!(a.id, action_id);
+        assert_eq!(a.title, "Confirm budget");
+        assert!(matches!(a.confidence, Confidence::High));
+        assert!(matches!(a.status, ActionStatus::Pending));
+        assert_eq!(a.due_at, Some(now + 86_400));
         Ok(())
     }
 
