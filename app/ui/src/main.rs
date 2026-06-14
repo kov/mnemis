@@ -907,7 +907,7 @@ fn SettingsRemindersPage() -> impl IntoView {
 
 #[component]
 fn ActionsPage() -> impl IntoView {
-    view! { <div class="doc"><components::ActionsPage /></div> }
+    view! { <components::ActionsPage /> }
 }
 
 #[component]

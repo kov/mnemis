@@ -848,22 +848,38 @@ async fn dismiss_records_feedback_and_undo_skip_records_none() -> Result<()> {
     client
         .wait()
         .at_most(SETTLE_TIMEOUT)
-        .for_element(Locator::Css("div.action"))
+        .for_element(Locator::Css(".arow[data-action-id]"))
         .await
-        .context("waiting for actions to render")?;
+        .context("waiting for the actions list to render")?;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // 1. Click Undo on the auto-claimed action ("Review Q3 roadmap"), then
-    //    Skip the feedback modal. The action should drop out of the default
-    //    list (it goes back to pending — still listed) but the modal must
-    //    appear and close cleanly.
+    // 1. Open the auto-claimed action ("Review Q3 roadmap") in the reading pane,
+    //    click Undo there, then Skip the feedback modal. The action goes back to
+    //    pending (still listed) but the modal must appear and close cleanly.
+    let select = client
+        .execute(
+            r#"
+            const row = Array.from(document.querySelectorAll('.arow'))
+                .find(r => r.textContent.includes('Review Q3 roadmap'));
+            if (!row) { return 'missing-row'; }
+            row.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        select.as_str(),
+        Some("ok"),
+        "selecting the action row failed: {select:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
     let undo = client
         .execute(
             r#"
-            const card = Array.from(document.querySelectorAll('div.action'))
-                .find(c => c.textContent.includes('Review Q3 roadmap'));
-            if (!card) { return 'missing-card'; }
-            const btn = Array.from(card.querySelectorAll('button')).find(b => b.textContent.trim() === 'Undo');
+            const btn = Array.from(document.querySelectorAll('.action-actions button'))
+                .find(b => b.textContent.trim() === 'Undo');
             if (!btn) { return 'missing-undo'; }
             btn.click();
             return 'ok';
@@ -917,7 +933,7 @@ async fn dismiss_records_feedback_and_undo_skip_records_none() -> Result<()> {
     );
 
     // 2. Reveal the low-confidence list (the pending "Background reading"
-    //    action lives there) and Dismiss it with a comment.
+    //    action lives there), open it in the reading pane, and Dismiss it.
     let reveal = client
         .execute(
             r#"
@@ -932,13 +948,30 @@ async fn dismiss_records_feedback_and_undo_skip_records_none() -> Result<()> {
     assert_eq!(reveal.as_str(), Some("ok"));
     tokio::time::sleep(Duration::from_millis(400)).await;
 
+    let select_low = client
+        .execute(
+            r#"
+            const row = Array.from(document.querySelectorAll('.arow'))
+                .find(r => r.textContent.toLowerCase().includes('background reading'));
+            if (!row) { return 'missing-row'; }
+            row.click();
+            return 'ok';
+            "#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        select_low.as_str(),
+        Some("ok"),
+        "selecting the low-confidence row failed: {select_low:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
     let dismiss = client
         .execute(
             r#"
-            const card = Array.from(document.querySelectorAll('div.action'))
-                .find(c => c.textContent.toLowerCase().includes('background reading'));
-            if (!card) { return 'missing-card'; }
-            const btn = Array.from(card.querySelectorAll('button')).find(b => b.textContent.trim() === 'Dismiss');
+            const btn = Array.from(document.querySelectorAll('.action-actions button'))
+                .find(b => b.textContent.trim() === 'Dismiss');
             if (!btn) { return 'missing-dismiss'; }
             btn.click();
             return 'ok';
@@ -2327,37 +2360,15 @@ async fn action_inline_chat_resumes_seeded_conversation() -> Result<()> {
     let harness = Harness::start(HarnessOpts::default(), env).await?;
     let client = harness.open_session(&app_bin).await?;
 
-    // Actions is the default route; wait for the card.
+    // Actions is the default route; the single seeded action auto-selects and
+    // the reading pane always shows its inline chat — which resumes the prior
+    // transcript (no toggle needed in the master-detail layout).
     client
         .wait()
         .at_most(SETTLE_TIMEOUT)
-        .for_element(Locator::Css("div.action"))
+        .for_element(Locator::Css(".arow[data-action-id]"))
         .await
-        .context("waiting for the action card")?;
-
-    // Toggle the inline chat on the action card.
-    let toggle = client
-        .execute(
-            r#"
-            const card = Array.from(document.querySelectorAll('div.action'))
-                .find(c => c.textContent.includes('Renew the TLS cert'));
-            if (!card) { return 'missing-card'; }
-            const btn = Array.from(card.querySelectorAll('button'))
-                .find(b => b.textContent.includes('Chat'));
-            if (!btn) { return 'missing-chat-toggle'; }
-            btn.click();
-            return 'ok';
-            "#,
-            vec![],
-        )
-        .await?;
-    assert_eq!(
-        toggle.as_str(),
-        Some("ok"),
-        "chat toggle click failed: {toggle:?}"
-    );
-
-    // The inline panel appears and resumes the prior transcript.
+        .context("waiting for the actions list")?;
     client
         .wait()
         .at_most(SETTLE_TIMEOUT)
@@ -2719,14 +2730,13 @@ async fn settings_reminders_shows_connect_form_when_unconfigured() -> Result<()>
     Ok(())
 }
 
-/// JS that reports the reminder control's state inside the seeded
-/// "Review Q3 roadmap" action card: the toggle button's label, whether the
-/// calendar popover is open, its day count + title, the highlighted day, and
-/// the reminder badge text.
+/// JS that reports the reminder control's state for the seeded "Review Q3
+/// roadmap" action in the reading pane (auto-selected up front): the toggle
+/// button's label, whether the calendar popover is open, its day count + title,
+/// the highlighted day, and the reminder badge text.
 const REMINDER_PROBE: &str = r#"
-    const card = Array.from(document.querySelectorAll('.action'))
-        .find(a => a.textContent.includes('Review Q3 roadmap'));
-    if (!card) { return null; }
+    const card = document.querySelector('.read-wrap');
+    if (!card || !card.textContent.includes('Review Q3 roadmap')) { return null; }
     const toggle = card.querySelector('.reminder-set > button');
     const pop = card.querySelector('.cal-popover');
     const badge = card.querySelector('.reminder-badge');
@@ -2766,14 +2776,13 @@ async fn wait_reminder<P: Fn(&Value) -> bool>(
     );
 }
 
-/// Click an element inside the target action card, located by a JS expression
-/// (`card` is in scope). `what` labels failures.
+/// Click an element inside the selected action's reading pane, located by a JS
+/// expression (`card` is the `.read-wrap` in scope). `what` labels failures.
 async fn click_in_card(client: &fantoccini::Client, finder: &str, what: &str) -> Result<()> {
     let js = format!(
         r#"
-        const card = Array.from(document.querySelectorAll('.action'))
-            .find(a => a.textContent.includes('Review Q3 roadmap'));
-        if (!card) {{ return 'no-card'; }}
+        const card = document.querySelector('.read-wrap');
+        if (!card || !card.textContent.includes('Review Q3 roadmap')) {{ return 'no-card'; }}
         const el = {finder};
         if (!el) {{ return 'missing'; }}
         el.click();

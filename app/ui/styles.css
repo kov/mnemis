@@ -392,12 +392,31 @@ html, body {
   border-color: color-mix(in srgb, var(--medium) 50%, transparent);
 }
 
+/* Action list rows (master-detail list pane). */
+.arow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--hairline);
+  cursor: pointer;
+}
+.arow:hover { background: var(--bg-hover); }
+.arow.selected { background: var(--accent); }
+.arow.selected, .arow.selected * { color: var(--on-accent) !important; }
+.arow .a-main { min-width: 0; flex: 1; }
+.arow .a-title { font-weight: 600; font-size: var(--fs-13); }
+.arow .a-meta { color: var(--fg-muted); font-size: var(--fs-12); margin-top: 2px; }
+.arow .a-tags { margin-top: 5px; display: flex; gap: 6px; align-items: center; }
+
 /* ---- Reading pane ---- */
 .reading {
   overflow-y: auto;
   background: var(--bg-content);
   min-height: 0;
 }
+/* The action detail's tag row sits under the title like the message subject. */
+.read-wrap .action-detail-tags { margin: 0 0 16px; }
 .reading-empty {
   display: flex;
   align-items: center;
@@ -586,27 +605,10 @@ h1 {
 /* The old `.message-*` card list was replaced by the Inbox list/reading pane
    (`.row`/`.reading`); those rules are gone. */
 
-.action {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 14px;
-  margin-bottom: 8px;
-  background: var(--bg);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.action-head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.action-title {
-  font-weight: 500;
-  flex: 1;
-}
+/* The old `.action` card (`.action-head`/`.action-title`) was replaced by the
+   master-detail reading pane (`.read-wrap`); those rules are gone. The
+   `.action-meta`/`.action-details`/`.action-actions` rules below are still used
+   inside the reading pane. */
 
 .badge {
   font-size: 11px;

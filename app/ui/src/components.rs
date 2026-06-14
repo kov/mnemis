@@ -41,15 +41,33 @@ pub fn ActionsPage() -> impl IntoView {
         async move { fetch_actions(false).await }
     });
     let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || actions.refetch());
+    // Which action is open in the reading pane. Owned here so it survives list
+    // refetches (a mutation refetches the list but keeps your selection).
+    let selected = RwSignal::new(None::<i64>);
 
     view! {
-        <SuggestedResolutions />
-        <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+        <Suspense fallback=|| view! {
+            <div class="body">
+                <div class="list">
+                    <div class="list-head"><span class="h">"Open actions"</span></div>
+                </div>
+                <div class="reading"><div class="reading-empty">"Loading\u{2026}"</div></div>
+            </div>
+        }>
             {move || {
                 let refetch = refetch.clone();
                 actions.get().map(move |res| match res {
-                    Ok(rows) => view! { <ActionsList rows=rows refetch=refetch /> }.into_any(),
-                    Err(e) => view! { <div class="error">{format!("Error: {e}")}</div> }.into_any(),
+                    Ok(rows) => view! {
+                        <ActionsMasterDetail rows=rows selected=selected refetch=refetch />
+                    }.into_any(),
+                    Err(e) => view! {
+                        <div class="body">
+                            <div class="list"></div>
+                            <div class="reading">
+                                <div class="reading-empty">{format!("Error: {e}")}</div>
+                            </div>
+                        </div>
+                    }.into_any(),
                 })
             }}
         </Suspense>
@@ -166,61 +184,134 @@ fn SuggestionRow(row: PendingResolutionDto, refetch: Arc<dyn Fn() + Send + Sync>
 }
 
 #[component]
-fn ActionsList(rows: Vec<ActionDto>, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
-    if rows.is_empty() {
-        return view! { <div class="empty">"No active actions."</div> }.into_any();
-    }
-
+fn ActionsMasterDetail(
+    rows: Vec<ActionDto>,
+    selected: RwSignal<Option<i64>>,
+    refetch: Arc<dyn Fn() + Send + Sync>,
+) -> impl IntoView {
+    // High/medium-confidence actions show up front; low-confidence ones hide
+    // behind a revealer (they're noisier and usually not worth surfacing).
     let (low, rest): (Vec<_>, Vec<_>) = rows
-        .into_iter()
+        .iter()
+        .cloned()
         .partition(|a| matches!(a.confidence, Confidence::Low));
+
+    // Auto-select the first action on initial load so the reading pane isn't
+    // blank. Only fires when nothing is selected yet, so it doesn't fight the
+    // user's selection across list refetches.
+    let first_id = rest.first().or_else(|| low.first()).map(|a| a.id);
+    Effect::new(move |_| {
+        if selected.get_untracked().is_none()
+            && let Some(id) = first_id
+        {
+            selected.set(Some(id));
+        }
+    });
 
     let show_low = RwSignal::new(false);
     let low_count = low.len();
-    let low_for_view = StoredValue::new(low);
-    let refetch_for_rest = refetch.clone();
-    let refetch_for_low = refetch.clone();
+    let is_empty = rest.is_empty() && low.is_empty();
+    let rest_sv = StoredValue::new(rest);
+    let low_sv = StoredValue::new(low);
+    let rows_sv = StoredValue::new(rows);
+    let refetch_detail = refetch.clone();
 
     view! {
-        <div>
-            <For
-                each=move || rest.clone()
-                key=|a| a.id
-                children=move |a: ActionDto| view! {
-                    <ActionCard action=a refetch=refetch_for_rest.clone() />
-                }
-            />
-
-            {move || (low_count > 0).then(|| {
-                let refetch_for_low = refetch_for_low.clone();
-                view! {
-                    <div
-                        class="revealer"
-                        on:click=move |_| show_low.update(|v| *v = !*v)
-                    >
-                        {move || if show_low.get() {
-                            format!("▾ hide {} low-confidence", low_count)
-                        } else {
-                            format!("▸ show {} low-confidence", low_count)
-                        }}
-                    </div>
-                    <Show when=move || show_low.get() fallback=|| view! { <></> }>
+        <div class="body">
+            <div class="list">
+                <div class="list-head"><span class="h">"Open actions"</span></div>
+                <SuggestedResolutions />
+                {if is_empty {
+                    view! { <div class="list-empty">"No active actions."</div> }.into_any()
+                } else {
+                    view! {
                         <For
-                            each=move || low_for_view.get_value()
+                            each=move || rest_sv.get_value()
                             key=|a| a.id
-                            children={
-                                let refetch_for_low = refetch_for_low.clone();
-                                move |a: ActionDto| view! {
-                                    <ActionCard action=a refetch=refetch_for_low.clone() />
-                                }
+                            children=move |a: ActionDto| view! {
+                                <ActionListRow action=a selected=selected />
                             }
                         />
-                    </Show>
-                }
-            })}
+                        {(low_count > 0).then(|| view! {
+                            <div class="revealer" on:click=move |_| show_low.update(|v| *v = !*v)>
+                                {move || if show_low.get() {
+                                    format!("▾ hide {low_count} low-confidence")
+                                } else {
+                                    format!("▸ show {low_count} low-confidence")
+                                }}
+                            </div>
+                            <Show when=move || show_low.get() fallback=|| view! { <></> }>
+                                <For
+                                    each=move || low_sv.get_value()
+                                    key=|a| a.id
+                                    children=move |a: ActionDto| view! {
+                                        <ActionListRow action=a selected=selected />
+                                    }
+                                />
+                            </Show>
+                        })}
+                    }
+                    .into_any()
+                }}
+            </div>
+            <div class="reading">
+                {move || {
+                    let action = selected.get().and_then(|id| {
+                        rows_sv.with_value(|rows| rows.iter().find(|a| a.id == id).cloned())
+                    });
+                    match action {
+                        Some(a) => {
+                            let refetch = refetch_detail.clone();
+                            view! { <ActionDetail action=a refetch=refetch /> }.into_any()
+                        }
+                        None => view! {
+                            <div class="reading-empty">"Select an action to see its detail."</div>
+                        }
+                        .into_any(),
+                    }
+                }}
+            </div>
         </div>
     }
-    .into_any()
+}
+
+/// A compact, selectable row in the actions list.
+#[component]
+fn ActionListRow(action: ActionDto, selected: RwSignal<Option<i64>>) -> impl IntoView {
+    let id = action.id;
+    let conf_class = confidence_class(action.confidence);
+    let conf_label = match action.confidence {
+        Confidence::High => "high",
+        Confidence::Medium => "medium",
+        Confidence::Low => "low",
+    };
+    let source = action
+        .source_name
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let channel = action
+        .channel_name
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let evidence = action.evidence_count;
+    let due_label = action.due_at.map(unix_to_short_date);
+    let title = action.title.clone();
+
+    let is_selected = move || selected.get() == Some(id);
+    let on_click = move |_| selected.set(Some(id));
+
+    view! {
+        <div class="arow" class:selected=is_selected data-action-id=id.to_string() on:click=on_click>
+            <span class="a-main">
+                <div class="a-title">{title}</div>
+                <div class="a-meta">{format!("{source} · {channel} · {evidence} evidence")}</div>
+                <div class="a-tags">
+                    <span class=conf_class>{conf_label}</span>
+                    {due_label.map(|d| view! { <span class="pill">{format!("\u{23F0} {d}")}</span> })}
+                </div>
+            </span>
+        </div>
+    }
 }
 
 const MONTH_NAMES: [&str; 12] = [
@@ -400,7 +491,7 @@ fn ReminderDatePicker(
 }
 
 #[component]
-fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
+fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl IntoView {
     let conf_class = confidence_class(action.confidence);
     let conf_label = match action.confidence {
         Confidence::High => "high",
@@ -417,16 +508,16 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
         .channel_name
         .clone()
         .unwrap_or_else(|| "?".to_string());
+    let title = action.title.clone();
+    let details = action.details.clone();
     let id = action.id;
     let current_status = action.status;
 
     // None = no modal open. Some(kind) = feedback modal open with that kind.
-    // The status change has already been applied by the time the modal opens;
-    // we hold off refetching until the user picks Submit or Skip so the card
-    // stays on screen while they decide.
+    // The status change is already applied by the time the modal opens; we hold
+    // off refetching until the user picks Submit or Skip so the action stays on
+    // screen while they decide.
     let feedback_open: RwSignal<Option<FeedbackKind>> = RwSignal::new(None);
-    // Reveals the inline chat grounded in this action.
-    let chat_open = RwSignal::new(false);
 
     let refetch_for_status = refetch.clone();
     let trigger_status = move |target: ActionStatus, then_open: Option<FeedbackKind>| {
@@ -475,18 +566,16 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
     };
 
     view! {
-        <div class="action">
-            <div class="action-head">
-                <span class="action-title">{action.title.clone()}</span>
+        <div class="read-wrap">
+            <div class="read-subject">{title}</div>
+            <div class="a-tags action-detail-tags">
                 <span class=conf_class>{conf_label}</span>
                 <span class="badge">{status}</span>
                 {badge.map(|(label, warn)| view! {
                     <span class="reminder-badge" class:reminder-warn=warn>{label}</span>
                 })}
             </div>
-            {action.details.clone().map(|d| view! {
-                <div class="action-details">{d}</div>
-            })}
+            {details.map(|d| view! { <div class="action-details">{d}</div> })}
             <div class="action-meta">
                 {format!("{source} · {channel} · {evidence} evidence")}
             </div>
@@ -518,11 +607,7 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                         refetch=refetch.clone()
                     />
                 })}
-                <button class="btn btn-ghost" on:click=move |_| chat_open.update(|v| *v = !*v)>
-                    {move || if chat_open.get() { "\u{25C8} Hide chat" } else { "\u{25C8} Chat" }}
-                </button>
             </div>
-            {move || chat_open.get().then(|| view! { <ActionInlineChat action_id=id /> })}
             <Show when=move || feedback_open.get().is_some() fallback=|| view! { <></> }>
                 {
                     let refetch = refetch.clone();
@@ -541,6 +626,7 @@ fn ActionCard(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl I
                     }
                 }
             </Show>
+            <ActionInlineChat action_id=id />
         </div>
     }
 }
