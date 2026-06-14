@@ -1,13 +1,16 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Route, Router, Routes};
+use leptos_router::hooks::use_location;
 use leptos_router::path;
 use mnemis_types::{
-    ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
-    ChatDto, ChatEvent, ChatTurnDto, Confidence, FeedbackKind, LlmConfigDto, MessageDto,
-    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
+    ActionDto, ActionStatus, AppearanceDto, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto,
+    ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, ColorScheme, Confidence, FeedbackKind,
+    LlmConfigDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome,
+    UserProfileDto,
 };
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 mod components;
@@ -62,6 +65,58 @@ async fn fetch_status() -> Result<StatusSnapshot, String> {
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     serde_wasm_bindgen::from_value::<StatusSnapshot>(raw).map_err(|e| e.to_string())
+}
+
+/// Read the host desktop's accent + color scheme from the backend.
+pub async fn fetch_appearance() -> Result<AppearanceDto, String> {
+    let raw = invoke("get_appearance", JsValue::NULL)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    serde_wasm_bindgen::from_value::<AppearanceDto>(raw).map_err(|e| e.to_string())
+}
+
+/// Legible text color (dark vs white) for an accent fill, picked by relative
+/// luminance — so a light accent (e.g. yellow) gets dark text on selected rows
+/// and buttons rather than invisible white.
+fn on_accent_for(hex: &str) -> &'static str {
+    if hex.len() < 7 {
+        return "#ffffff";
+    }
+    let ch = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0) as f64 / 255.0;
+    let lum = 0.2126 * ch(1) + 0.7152 * ch(3) + 0.0722 * ch(5);
+    if lum > 0.6 { "#1a1a18" } else { "#ffffff" }
+}
+
+/// Apply the OS appearance to the document root: inject `--accent` (and the
+/// derived `--on-accent`), and drive the theme from the OS color scheme as an
+/// explicit `data-theme` override — cleared when the OS has no preference so we
+/// fall back to the `prefers-color-scheme` media query. webkit2gtk doesn't
+/// always track the GTK setting via that media query, so on Linux this explicit
+/// read is what actually makes the app open in the right theme.
+fn apply_appearance(a: &AppearanceDto) {
+    let Some(root) = leptos::web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .and_then(|e| e.dyn_into::<leptos::web_sys::HtmlElement>().ok())
+    else {
+        return;
+    };
+    let style = root.style();
+    if let Some(hex) = a.accent.as_deref() {
+        let _ = style.set_property("--accent", hex);
+        let _ = style.set_property("--on-accent", on_accent_for(hex));
+    }
+    match a.color_scheme {
+        ColorScheme::Dark => {
+            let _ = root.set_attribute("data-theme", "dark");
+        }
+        ColorScheme::Light => {
+            let _ = root.set_attribute("data-theme", "light");
+        }
+        ColorScheme::NoPreference => {
+            let _ = root.remove_attribute("data-theme");
+        }
+    }
 }
 
 pub async fn run_sync_now() -> Result<SyncOutcome, String> {
@@ -672,19 +727,23 @@ fn App() -> impl IntoView {
             show_reasoning.set(v);
         }
     });
+    // Theme the app from the OS: inject the system accent and color scheme on
+    // load. Best-effort — a failure leaves the CSS fallback in place.
+    spawn_local(async move {
+        if let Ok(appearance) = fetch_appearance().await {
+            apply_appearance(&appearance);
+        }
+    });
 
     view! {
         <Router>
             <div class="app">
-                <components::FirstRunBanner />
-                <components::StatusPanel />
-                <nav class="nav">
-                    <A href="/">"Actions"</A>
-                    <A href="/inbox">"Inbox"</A>
-                    <A href="/chats">"Chats"</A>
-                    <A href="/settings">"Settings"</A>
-                </nav>
-                <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
+                <Sidebar />
+                <main class="main">
+                    <Toolbar />
+                    <div class="content">
+                        <components::FirstRunBanner />
+                        <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
                     <Route path=path!("/") view=ActionsPage />
                     <Route path=path!("/inbox") view=InboxPage />
                     <Route path=path!("/chats") view=ChatsListPage />
@@ -694,9 +753,96 @@ fn App() -> impl IntoView {
                     <Route path=path!("/settings/llm") view=SettingsLlmPage />
                     <Route path=path!("/settings/sources") view=SettingsSourcesPage />
                     <Route path=path!("/settings/reminders") view=SettingsRemindersPage />
-                </Routes>
+                        </Routes>
+                    </div>
+                </main>
             </div>
         </Router>
+    }
+}
+
+/// The full-height translucent sidebar: brand, smart-view nav (keeps `nav.nav`
+/// for routing + tests), the per-account list, and the status/sync footer.
+#[component]
+fn Sidebar() -> impl IntoView {
+    view! {
+        <aside class="sidebar">
+            <div class="brand"><span class="glyph"></span>"mnemis"</div>
+            <div class="side-scroll">
+                <nav class="nav side-nav">
+                    <div class="side-label">"Smart views"</div>
+                    <A href="/" attr:class="side-item"><span class="ico">"\u{25CE}"</span>"Actions"</A>
+                    <A href="/inbox" attr:class="side-item"><span class="ico">"\u{2709}"</span>"Inbox"</A>
+                    <A href="/chats" attr:class="side-item"><span class="ico">"\u{25C8}"</span>"Chats"</A>
+                    <A href="/settings" attr:class="side-item"><span class="ico">"\u{2699}"</span>"Settings"</A>
+                </nav>
+                <AccountsNav />
+            </div>
+            <div class="side-footer-status">
+                <components::StatusPanel />
+            </div>
+        </aside>
+    }
+}
+
+/// Lists configured sources under an "Accounts" header. Reacts to `SyncTick` so
+/// a newly added source appears after a sync without a reload. Each entry links
+/// to the inbox for now (per-source filtering is a later step).
+#[component]
+fn AccountsNav() -> impl IntoView {
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
+    let sources = LocalResource::new(move || {
+        let _ = sync_tick.get();
+        async move { fetch_settings_sources().await }
+    });
+    view! {
+        <Suspense fallback=|| view! { <></> }>
+            {move || sources.get().and_then(|res| match res {
+                Ok(rows) if rows.is_empty() => None,
+                Ok(rows) => Some(view! {
+                    <div class="side-section">
+                        <div class="side-label">"Accounts"</div>
+                        <For
+                            each=move || rows.clone()
+                            key=|s| s.id
+                            children=move |s: SourceRowDto| view! {
+                                <A href="/inbox" attr:class="side-item account">
+                                    <span class="acc-dot"></span>{s.name.clone()}
+                                </A>
+                            }
+                        />
+                    </div>
+                }.into_any()),
+                Err(_) => None,
+            })}
+        </Suspense>
+    }
+}
+
+/// The main-pane toolbar. Derives its title from the current route so the shell
+/// reads like a native window title bar above the content.
+#[component]
+fn Toolbar() -> impl IntoView {
+    let location = use_location();
+    let title = move || {
+        let p = location.pathname.get();
+        if p == "/" {
+            "Actions"
+        } else if p.starts_with("/inbox") {
+            "Inbox"
+        } else if p.starts_with("/chats") {
+            "Chats"
+        } else if p.starts_with("/settings") {
+            "Settings"
+        } else {
+            "mnemis"
+        }
+    };
+    view! {
+        <header class="toolbar">
+            <span class="title">{title}</span>
+            <span class="spacer"></span>
+        </header>
     }
 }
 
@@ -750,7 +896,6 @@ fn InboxPage() -> impl IntoView {
         async move { fetch_messages(None).await }
     });
     view! {
-        <h1>"Inbox"</h1>
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
             {move || messages.get().map(|res| match res {
                 Ok(rows) => view! { <components::InboxList rows=rows /> }.into_any(),

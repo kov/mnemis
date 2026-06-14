@@ -43,7 +43,6 @@ pub fn ActionsPage() -> impl IntoView {
     let refetch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || actions.refetch());
 
     view! {
-        <h1>"Actions"</h1>
         <SuggestedResolutions />
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
             {move || {
@@ -862,7 +861,6 @@ pub fn FirstRunBanner() -> impl IntoView {
 #[component]
 pub fn SettingsHome() -> impl IntoView {
     view! {
-        <h1>"Settings"</h1>
         <ul class="settings-home">
             <li><A href="/settings/profile">"Profile"</A>
                 <span class="settings-desc">" — display name + identifiers + extraction context"</span></li>
@@ -1805,7 +1803,6 @@ pub fn ChatsPage() -> impl IntoView {
 
     view! {
         <div class="chats-head">
-            <h1>"Chats"</h1>
             <div class="chats-head-actions">
                 <label class="chat-show-archived">
                     <input

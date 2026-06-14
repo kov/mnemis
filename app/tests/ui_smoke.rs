@@ -738,12 +738,14 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
         .await?;
     assert_eq!(count.as_str(), Some("60"), "expected 60 folder rows");
 
-    // Scroll to the bottom and record where it landed. If the content doesn't
-    // overflow the viewport this guard is meaningless, so require a real offset.
+    // Scroll the content pane to the bottom and record where it landed. The
+    // three-pane shell makes `.content` (not the page/window) the scroll
+    // container, so this is what holds the channel list's offset. If it doesn't
+    // overflow this guard is meaningless, so require a real offset.
     let before = client
         .execute(
             r#"
-            const se = document.scrollingElement;
+            const se = document.querySelector('.content');
             se.scrollTop = se.scrollHeight;
             return String(se.scrollTop);
             "#,
@@ -753,7 +755,7 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
     let before_px: f64 = before.as_str().unwrap_or("0").parse().unwrap_or(0.0);
     assert!(
         before_px > 50.0,
-        "page should be scrollable; scrollTop was {before_px}"
+        "content pane should be scrollable; scrollTop was {before_px}"
     );
 
     // Toggle a checkbox while scrolled down. Programmatic .click() never moves
@@ -803,7 +805,7 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
 
     let after = client
         .execute(
-            r#"return String(document.scrollingElement.scrollTop);"#,
+            r#"return String(document.querySelector('.content').scrollTop);"#,
             vec![],
         )
         .await?;

@@ -25,6 +25,28 @@ impl Confidence {
     }
 }
 
+/// The OS-preferred color scheme, mirrored from the platform appearance source
+/// (XDG portal `org.freedesktop.appearance/color-scheme` on Linux,
+/// `AppleInterfaceStyle` on macOS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScheme {
+    /// No preference — the frontend should fall back to `prefers-color-scheme`.
+    #[default]
+    NoPreference,
+    Light,
+    Dark,
+}
+
+/// System appearance read from the host desktop: the accent color (as
+/// `"#rrggbb"`, or `None` when the OS exposes none) and the preferred color
+/// scheme. The frontend injects `--accent` from this and drives the theme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AppearanceDto {
+    pub accent: Option<String>,
+    pub color_scheme: ColorScheme,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionStatus {

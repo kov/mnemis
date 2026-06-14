@@ -11,8 +11,8 @@
       {
         "label": "main",
         "title": "mnemis",
-        "width": 1100,
-        "height": 750,
+        "width": 1556,
+        "height": 1061,
         "minWidth": 720,
         "minHeight": 480,
         "resizable": true,

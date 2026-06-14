@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod appearance;
+
 #[cfg(target_os = "macos")]
 mod tray;
 
@@ -733,7 +735,8 @@ fn main() {
             send_chat_message,
             cancel_chat_message,
             get_chat_show_reasoning,
-            set_chat_show_reasoning
+            set_chat_show_reasoning,
+            appearance::get_appearance
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
