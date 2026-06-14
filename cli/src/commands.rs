@@ -342,7 +342,8 @@ pub async fn embed_once(cfg: &Config) -> Result<()> {
 
 fn build_llm(cfg: &Config) -> LlmClient {
     let llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone())
-        .with_timeout(cfg.llm.resolved_request_timeout_secs());
+        .with_timeout(cfg.llm.resolved_request_timeout_secs())
+        .with_thinking_budget(cfg.llm.resolved_thinking_budget());
     match &cfg.llm.bearer_token {
         Some(t) => llm.with_bearer_token(t.clone()),
         None => llm,

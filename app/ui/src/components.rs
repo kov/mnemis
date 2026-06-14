@@ -11,7 +11,8 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavCollectionDto, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto,
     Confidence, FeedbackKind, LlmConfigDto, MessageDto, PendingResolutionDto, ProfileIdentifier,
-    SourceHealth, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto, summarize_sync_error,
+    SourceHealth, SourceRowDto, StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
+    summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
@@ -1065,10 +1066,13 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
     let config_path = initial.config_path.clone();
     let toast: RwSignal<Option<String>> = RwSignal::new(None);
 
+    let initial_level = initial.thinking_level;
+
     let base_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let chat_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let embed_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let token_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let level_ref: NodeRef<leptos::html::Select> = NodeRef::new();
 
     let on_save = move |_| {
         let pull = |r: NodeRef<leptos::html::Input>, default: String| -> String {
@@ -1081,6 +1085,10 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
                 })
                 .unwrap_or(default)
         };
+        let thinking_level = level_ref
+            .get()
+            .map(|el| ThinkingLevel::from_wire(&el.unchecked_ref::<HtmlSelectElement>().value()))
+            .unwrap_or(initial_level);
         let cfg = LlmConfigDto {
             base_url: pull(base_ref, base_url.get()),
             chat_model: pull(chat_ref, chat.get()),
@@ -1089,6 +1097,7 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
                 let v = pull(token_ref, token.get());
                 if v.is_empty() { None } else { Some(v) }
             },
+            thinking_level,
             config_path: String::new(),
         };
         spawn_local(async move {
@@ -1110,6 +1119,19 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
             <input class="settings-input" node_ref=embed_ref prop:value=move || embed.get() />
             <label>"Bearer token (optional)"</label>
             <input class="settings-input" node_ref=token_ref prop:value=move || token.get() />
+            <label>"Thinking budget"</label>
+            <select class="settings-select" node_ref=level_ref>
+                {ThinkingLevel::ALL.into_iter().map(|lvl| view! {
+                    <option value=lvl.as_str() selected=lvl == initial_level>
+                        {lvl.label()}
+                    </option>
+                }).collect_view()}
+            </select>
+            <div class="settings-hint">
+                "How much the model is allowed to think before answering. \
+                 Higher reasons more thoroughly but is slower; sent on every \
+                 call so models that don't think by default still get to."
+            </div>
             <div class="settings-actions">
                 <button class="btn btn-primary" on:click=on_save>"Save LLM config"</button>
             </div>
@@ -1936,21 +1958,6 @@ pub fn ChatDetail() -> impl IntoView {
     let is_active =
         Memo::new(move |_| active_id.get().is_some() && active_id.get() == chat_id.get());
 
-    // Only offer the reasoning toggle when there's actually reasoning to show —
-    // the local model usually inlines its working into the answer and emits no
-    // separate reasoning, so a permanently-inert checkbox would just read as
-    // broken. It lights up for a thinking-capable model.
-    let has_reasoning = Memo::new(move |_| {
-        turns
-            .get()
-            .and_then(|res| res.ok())
-            .map(|rows| {
-                rows.iter()
-                    .any(|t| t.reasoning.as_deref().is_some_and(|r| !r.trim().is_empty()))
-            })
-            .unwrap_or(false)
-    });
-
     let input_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
 
     // Set while the engine streams `Compacting` (condensing the conversation to
@@ -2060,23 +2067,24 @@ pub fn ChatDetail() -> impl IntoView {
         <div class="chat-detail">
             <div class="chat-toolbar">
                 <A href="/chats" attr:class="btn btn-ghost">"\u{2190} Chats"</A>
-                {move || has_reasoning.get().then(|| view! {
-                    <label class="chat-reasoning-toggle">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || show_reasoning.get()
-                            on:change=move |_| {
-                                let next = !show_reasoning.get();
-                                show_reasoning.set(next);
-                                // Persist so it's remembered across runs.
-                                spawn_local(async move {
-                                    let _ = set_chat_show_reasoning(next).await;
-                                });
-                            }
-                        />
-                        " Show reasoning"
-                    </label>
-                })}
+                // Always shown, even before a reply lands: it's a setting the
+                // user wants to flip *before* sending, and it's harmless when a
+                // turn has no reasoning (the reasoning block simply isn't there).
+                <label class="chat-reasoning-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || show_reasoning.get()
+                        on:change=move |_| {
+                            let next = !show_reasoning.get();
+                            show_reasoning.set(next);
+                            // Persist so it's remembered across runs.
+                            spawn_local(async move {
+                                let _ = set_chat_show_reasoning(next).await;
+                            });
+                        }
+                    />
+                    " Show reasoning"
+                </label>
             </div>
             {move || seed.get().flatten().map(|label| view! {
                 <div class="chat-seed-banner">"About "<b>{label}</b></div>

@@ -228,6 +228,80 @@ pub struct ProfileIdentifier {
     pub value: String,
 }
 
+/// How much chain-of-thought budget the model gets on every LLM call,
+/// exposed as a coarse level rather than a raw token count — the right number
+/// is model- and box-dependent, so the labels map to budgets the server
+/// enforces. A budget is **always** sent so models that default to
+/// thinking-off (e.g. Gemma) still get a chance to reason. See the
+/// `omlx-server` memory for the sizing rationale (generous-enough-to-rarely-
+/// truncate; hitting the cap spills reasoning into the answer and lengthens
+/// generation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    /// 512 tokens — fastest; may truncate reasoning on harder prompts.
+    Low,
+    /// 1024 tokens — the default: generous for extraction, adequate for chat.
+    #[default]
+    Medium,
+    /// 2048 tokens — headroom for multi-step chat reasoning.
+    High,
+    /// 4096 tokens — matches omlx's own upper default; rarely truncates.
+    ExtraHigh,
+}
+
+impl ThinkingLevel {
+    /// Every level in ascending order — for rendering the settings dropdown.
+    pub const ALL: [ThinkingLevel; 4] = [
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+        ThinkingLevel::ExtraHigh,
+    ];
+
+    /// The thinking-token budget this level maps to — the hard cap omlx's
+    /// `ThinkingBudgetProcessor` enforces on the thinking phase.
+    pub fn budget_tokens(self) -> u32 {
+        match self {
+            ThinkingLevel::Low => 512,
+            ThinkingLevel::Medium => 1024,
+            ThinkingLevel::High => 2048,
+            ThinkingLevel::ExtraHigh => 4096,
+        }
+    }
+
+    /// Stable wire/config token (`snake_case`), matching the serde encoding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::ExtraHigh => "extra_high",
+        }
+    }
+
+    /// Human label for the settings dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingLevel::Low => "Low",
+            ThinkingLevel::Medium => "Medium",
+            ThinkingLevel::High => "High",
+            ThinkingLevel::ExtraHigh => "Extra high",
+        }
+    }
+
+    /// Parse a wire/config token back to a level, falling back to the default
+    /// for anything unrecognized (forward-compatible with config typos).
+    pub fn from_wire(s: &str) -> ThinkingLevel {
+        match s {
+            "low" => ThinkingLevel::Low,
+            "high" => ThinkingLevel::High,
+            "extra_high" => ThinkingLevel::ExtraHigh,
+            _ => ThinkingLevel::Medium,
+        }
+    }
+}
+
 /// LLM config view/edit shape. Matches `engine::config::LlmSection` plus a
 /// `config_path` so the UI can tell the user where edits land. The bearer
 /// token is sent both ways — the form omits it when blank.
@@ -237,6 +311,10 @@ pub struct LlmConfigDto {
     pub chat_model: String,
     pub embedding_model: String,
     pub bearer_token: Option<String>,
+    /// Coarse chain-of-thought budget knob; always applied (defaults to
+    /// [`ThinkingLevel::Medium`] when absent from an older config).
+    #[serde(default)]
+    pub thinking_level: ThinkingLevel,
     pub config_path: String,
 }
 
@@ -571,5 +649,49 @@ mod summarize_tests {
         ));
         assert!(!is_model_not_found("connection refused"));
         assert!(!is_model_not_found("Prompt too long: 9 exceeds"));
+    }
+}
+
+#[cfg(test)]
+mod thinking_level_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_medium_and_budgets_ascend() {
+        assert_eq!(ThinkingLevel::default(), ThinkingLevel::Medium);
+        let budgets: Vec<u32> = ThinkingLevel::ALL
+            .iter()
+            .map(|l| l.budget_tokens())
+            .collect();
+        assert_eq!(budgets, vec![512, 1024, 2048, 4096]);
+        assert!(
+            budgets.windows(2).all(|w| w[0] < w[1]),
+            "must be strictly ascending"
+        );
+    }
+
+    #[test]
+    fn wire_token_round_trips_through_serde_and_from_wire() {
+        for level in ThinkingLevel::ALL {
+            // as_str matches the serde encoding ...
+            let json = serde_json::to_string(&level).unwrap();
+            assert_eq!(json, format!("\"{}\"", level.as_str()));
+            // ... and from_wire is its inverse.
+            assert_eq!(ThinkingLevel::from_wire(level.as_str()), level);
+        }
+        // Unknown tokens degrade to the default rather than erroring — keeps a
+        // hand-edited or future-written config from bricking the form.
+        assert_eq!(ThinkingLevel::from_wire("bogus"), ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn dto_defaults_thinking_level_when_absent() {
+        // An older config payload without `thinking_level` still deserializes,
+        // landing on the default so a budget is always resolvable.
+        let dto: LlmConfigDto = serde_json::from_str(
+            r#"{"base_url":"u","chat_model":"c","embedding_model":"e","config_path":"p"}"#,
+        )
+        .unwrap();
+        assert_eq!(dto.thinking_level, ThinkingLevel::Medium);
     }
 }

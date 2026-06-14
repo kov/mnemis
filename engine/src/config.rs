@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use mnemis_types::ThinkingLevel;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,13 @@ pub struct LlmSection {
     /// config back-compat; it now governs both paths.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_idle_timeout_secs: Option<u64>,
+    /// Chain-of-thought budget granted to the chat/extraction model, as a
+    /// coarse level (see [`ThinkingLevel`]). A budget is *always* sent on
+    /// `/responses` so models that default to thinking-off (e.g. Gemma) still
+    /// reason; omlx enforces it as a hard cap on the thinking phase. `None`
+    /// falls back to [`ThinkingLevel::default`] (Medium).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 impl LlmSection {
@@ -62,6 +70,17 @@ impl LlmSection {
     pub fn resolved_chat_idle_timeout_secs(&self) -> u64 {
         self.chat_idle_timeout_secs
             .unwrap_or(crate::llm::DEFAULT_CHAT_IDLE_TIMEOUT_SECS)
+    }
+
+    /// Resolve the configured thinking level, falling back to the default
+    /// (Medium) when unset.
+    pub fn resolved_thinking_level(&self) -> ThinkingLevel {
+        self.thinking_level.unwrap_or_default()
+    }
+
+    /// Resolve the thinking-token budget sent on every `/responses` call.
+    pub fn resolved_thinking_budget(&self) -> u32 {
+        self.resolved_thinking_level().budget_tokens()
     }
 }
 
@@ -111,7 +130,7 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
     // max_context_tokens, both of which are config-file-only knobs the LLM
     // settings form never touches. Without this, saving from the UI would
     // silently wipe a hand-edited max_context_tokens.
-    let (paths, existing_max_ctx, existing_timeout, existing_idle) =
+    let (paths, existing_max_ctx, existing_timeout, existing_idle, existing_thinking) =
         match std::fs::read_to_string(&path) {
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(c) => (
@@ -119,10 +138,11 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
                     c.llm.max_context_tokens,
                     c.llm.request_timeout_secs,
                     c.llm.chat_idle_timeout_secs,
+                    c.llm.thinking_level,
                 ),
-                Err(_) => (PathsSection::default(), None, None, None),
+                Err(_) => (PathsSection::default(), None, None, None, None),
             },
-            Err(_) => (PathsSection::default(), None, None, None),
+            Err(_) => (PathsSection::default(), None, None, None, None),
         };
     let cfg = Config {
         llm: LlmSection {
@@ -133,6 +153,10 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
             max_context_tokens: llm.max_context_tokens.or(existing_max_ctx),
             request_timeout_secs: llm.request_timeout_secs.or(existing_timeout),
             chat_idle_timeout_secs: llm.chat_idle_timeout_secs.or(existing_idle),
+            // The LLM settings form *does* edit this (unlike the timeouts),
+            // so a supplied value wins; fall back to the existing one only
+            // when the caller left it unset.
+            thinking_level: llm.thinking_level.or(existing_thinking),
         },
         paths,
     };

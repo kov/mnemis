@@ -295,6 +295,16 @@ async fn run_inner(
 
         // Walk the output in order, persisting then emitting. Reasoning rides on
         // the first assistant turn (message or tool call) it precedes.
+        //
+        // A response that also makes a tool call may carry a `message` item: that
+        // text is a *preamble* — the model narrating its plan before acting, not
+        // an answer to the user. We fold it into the reasoning so it renders in
+        // the reasoning block (before the tool call) and is never replayed,
+        // rather than surfacing as a standalone assistant bubble.
+        let has_tool_call = response
+            .output
+            .iter()
+            .any(|i| matches!(i, OutputItem::FunctionCall { .. }));
         let mut function_calls = Vec::new();
         let mut pending_reasoning: Option<String> = None;
         let mut reasoning_attached = false;
@@ -322,7 +332,16 @@ async fn run_inner(
                             text.push_str(&t);
                         }
                     }
-                    if !text.is_empty() {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if has_tool_call {
+                        // Preamble alongside a tool call → fold into reasoning.
+                        pending_reasoning = Some(match pending_reasoning.take() {
+                            Some(prev) => format!("{prev}\n{text}"),
+                            None => text,
+                        });
+                    } else {
                         let turn_id = store::append_turn(
                             pool,
                             chat_id,
@@ -647,6 +666,115 @@ mod tests {
         assert!(history.iter().any(
             |i| matches!(i, crate::llm::InputItem::Message { role: Role::User, content } if content.contains("Ana"))
         ));
+    }
+
+    #[tokio::test]
+    async fn folds_a_preamble_message_into_reasoning_before_the_tool_call() {
+        // A model that emits a *message* alongside a tool call is narrating its
+        // plan, not answering. That preamble must render as reasoning (before the
+        // tool call), persist on the tool-call turn, and never be replayed — not
+        // surface as a standalone assistant bubble.
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let ctx = seed_minimal(&pool).await.unwrap();
+        seed_messages(
+            &pool,
+            ctx.source_id,
+            ctx.channel_id,
+            &[SeedMessage {
+                external_id: "m1",
+                author_email: "ana@example.com",
+                author_name: "Ana",
+                subject: "Renewal",
+                body: "Please renew the cert before Friday.",
+                recipients: &[],
+            }],
+        )
+        .await
+        .unwrap();
+
+        // Turn 0: a preamble message + a tool call (no separate reasoning item).
+        // Turn 1: the final answer.
+        let llm = crate::test_util::MockLlm::new(vec![
+            mock::turn(vec![
+                OutputItem::Message {
+                    content: vec![ContentItem::OutputText {
+                        text: "Let me check m1 first.".to_string(),
+                    }],
+                },
+                OutputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "fetch_messages".to_string(),
+                    arguments: serde_json::json!({ "external_ids": ["m1"] }).to_string(),
+                },
+            ]),
+            mock::no_tools("Ana asked you to renew the cert before Friday."),
+        ]);
+
+        let chat = store::create_chat(&pool, None, None).await.unwrap();
+        let (events, sink) = collector();
+        run_chat_turn(
+            &pool,
+            &llm,
+            "system",
+            chat,
+            "what does Ana need?",
+            100_000,
+            1_000_000,
+            Duration::from_secs(60),
+            None,
+            &sink,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The preamble is emitted as reasoning, before the tool call — no
+        // standalone assistant message for it.
+        let kinds: Vec<&str> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                ChatEvent::Delta { .. } => "delta",
+                ChatEvent::Reasoning { .. } => "reasoning",
+                ChatEvent::AssistantMessage { .. } => "assistant",
+                ChatEvent::ToolCall { .. } => "tool_call",
+                ChatEvent::ToolResult { .. } => "tool_result",
+                ChatEvent::Compacting => "compacting",
+                ChatEvent::Done => "done",
+                ChatEvent::Error { .. } => "error",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["reasoning", "tool_call", "tool_result", "assistant", "done"],
+            "events: {kinds:?}"
+        );
+
+        // Only one assistant *message* turn (the final answer); the preamble did
+        // not become its own bubble.
+        let turns = store::load_turns(&pool, chat).await.unwrap();
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+        // The preamble landed as reasoning on the tool-call turn.
+        let call = turns.iter().find(|t| t.tool_name.is_some()).unwrap();
+        assert_eq!(call.reasoning.as_deref(), Some("Let me check m1 first."));
+
+        // And it never leaks into the history the model is re-sent.
+        let history = store::build_history(&pool, chat).await.unwrap();
+        let dump = serde_json::to_string(
+            &history
+                .iter()
+                .map(|i| serde_json::to_value(i).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            !dump.contains("Let me check m1 first."),
+            "preamble leaked into history: {dump}"
+        );
     }
 
     #[tokio::test]

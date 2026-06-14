@@ -338,6 +338,8 @@ async fn get_llm_config(_state: State<'_, AppState>) -> Result<LlmConfigDto, Str
     let cfg_path = config::default_config_path();
     match config::load(None) {
         Ok(cfg) => Ok(LlmConfigDto {
+            // Resolve before moving fields out of `cfg.llm` below.
+            thinking_level: cfg.llm.resolved_thinking_level(),
             base_url: cfg.llm.base_url,
             chat_model: cfg.llm.chat_model,
             embedding_model: cfg.llm.embedding_model,
@@ -364,6 +366,8 @@ async fn save_llm_config(state: State<'_, AppState>, cfg: LlmConfigDto) -> Resul
         max_context_tokens: None,
         request_timeout_secs: None,
         chat_idle_timeout_secs: None,
+        // The form *does* expose this, so persist the chosen level.
+        thinking_level: Some(cfg.thinking_level),
     })
     .map_err(|e| format!("{e:#}"))?;
 
@@ -737,7 +741,8 @@ fn main() {
 
 fn build_llm_stack(cfg: &Config) -> LlmStack {
     let mut llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone())
-        .with_timeout(cfg.llm.resolved_request_timeout_secs());
+        .with_timeout(cfg.llm.resolved_request_timeout_secs())
+        .with_thinking_budget(cfg.llm.resolved_thinking_budget());
     if let Some(t) = &cfg.llm.bearer_token {
         llm = llm.with_bearer_token(t.clone());
     }

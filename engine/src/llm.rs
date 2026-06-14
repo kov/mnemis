@@ -158,6 +158,11 @@ struct ResponsesRequest<'a> {
     tools: &'a [ToolDef],
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
+    /// Chain-of-thought token budget. **Always** sent (never skipped) so a
+    /// model that defaults to thinking-off — Gemma — still reasons; omlx reads
+    /// it as a top-level int and enforces it as a hard cap on the thinking
+    /// phase. See the `omlx-server` memory for sizing.
+    thinking_budget: u32,
     /// Ask the server for an SSE event stream. Omitted (not `false`) for the
     /// non-streaming path so that request is byte-for-byte what it was before.
     #[serde(skip_serializing_if = "is_false")]
@@ -262,6 +267,10 @@ pub struct LlmClient {
     model: String,
     bearer_token: Option<String>,
     timeout_secs: u64,
+    /// Thinking-token budget sent on every `/responses` call. Defaults to
+    /// [`ThinkingLevel::default`]'s budget; overridden from config via
+    /// [`Self::with_thinking_budget`].
+    thinking_budget: u32,
 }
 
 impl LlmClient {
@@ -273,6 +282,7 @@ impl LlmClient {
             model: model.into(),
             bearer_token: None,
             timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            thinking_budget: mnemis_types::ThinkingLevel::default().budget_tokens(),
         }
     }
 
@@ -287,6 +297,13 @@ impl LlmClient {
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.bearer_token = Some(token.into());
+        self
+    }
+
+    /// Set the chain-of-thought token budget sent on every `/responses` call.
+    /// Typically wired from `config::LlmSection::resolved_thinking_budget`.
+    pub fn with_thinking_budget(mut self, budget: u32) -> Self {
+        self.thinking_budget = budget;
         self
     }
 }
@@ -308,6 +325,7 @@ impl LlmTransport for LlmClient {
             input,
             tools,
             previous_response_id,
+            thinking_budget: self.thinking_budget,
             stream: false,
         };
 
@@ -377,6 +395,7 @@ impl LlmTransport for LlmClient {
             input,
             tools,
             previous_response_id,
+            thinking_budget: self.thinking_budget,
             stream: true,
         };
         let mut req = self.stream_http.post(&url).json(&body);
@@ -508,6 +527,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_always_serializes_thinking_budget() {
+        // The budget must be present on *every* request (no skip) — that's how
+        // a thinking-off-by-default model like Gemma gets told to reason. Both
+        // the streaming and non-streaming bodies carry it.
+        let body = ResponsesRequest {
+            model: "m",
+            instructions: "sys",
+            input: vec![],
+            tools: &[],
+            previous_response_id: None,
+            thinking_budget: 1536,
+            stream: false,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["thinking_budget"], 1536);
+        // The non-streaming request still omits `stream` (byte-for-byte
+        // unchanged apart from the new always-on field).
+        assert!(v.get("stream").is_none());
+    }
+
+    #[test]
+    fn client_default_budget_is_medium_level() {
+        // A freshly-built client carries the default level's budget so callers
+        // that never set one still enable thinking.
+        let client = LlmClient::new("http://x", "m");
+        assert_eq!(
+            client.thinking_budget,
+            mnemis_types::ThinkingLevel::Medium.budget_tokens()
+        );
+        let bumped = client.with_thinking_budget(4096);
+        assert_eq!(bumped.thinking_budget, 4096);
+    }
 
     #[test]
     fn parses_omlx_response_with_null_valued_fields() {
