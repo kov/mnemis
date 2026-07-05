@@ -52,6 +52,7 @@ optional = true
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13.11", default-features = false, features = ["tokio", "settings"] }
 futures-util = "0.3.31"
+khronos-egl = { version = "6", features = ["dynamic"] }
 
 # macOS system appearance via NSUserDefaults (AppleInterfaceStyle for dark mode,
 # AppleAccentColor for the accent). Same objc2 family the keychain backend uses.

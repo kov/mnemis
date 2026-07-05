@@ -2,6 +2,9 @@
 
 mod appearance;
 
+#[cfg(target_os = "linux")]
+mod glcheck;
+
 #[cfg(target_os = "macos")]
 mod tray;
 
@@ -625,6 +628,14 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mnemis_engine=info")),
         )
         .init();
+
+    // On limited/software GL stacks (some VMs cap at OpenGL 3.2) WebKit's
+    // compositor can't compile its GLSL 3.30 shaders and the webview stays
+    // blank. Probe the driver and, only if it's too old, fall back to software
+    // compositing. Must happen before GTK/WebKit init and before the tokio
+    // runtime spawns threads. See `glcheck`.
+    #[cfg(target_os = "linux")]
+    glcheck::apply_webkit_compositing_workaround();
 
     // Tauri 2's async_runtime wraps tokio but doesn't bootstrap one by
     // default. Install a multi-threaded tokio runtime so engine code (sqlx,
