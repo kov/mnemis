@@ -1,6 +1,8 @@
 //! Workspace dev tasks. Run via `cargo xtask <subcommand>`.
 //!
 //! Subcommands:
+//! - `install` — Linux: build a release binary and install it, the icon set and
+//!   a `.desktop` entry under the `~/.local` prefix (override with `--prefix`).
 //! - `build-macos` — build the UI bundle and a signed macOS `.app` using the
 //!   developer's Apple Team ID and signing identity. Reads from `git config`
 //!   (`mnemis.appleTeamId`, `mnemis.appleSigningIdentity`) first, falling back
@@ -19,6 +21,7 @@ use std::process::{Command, Stdio};
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("install") => install(&args[1..]),
         Some("build-macos") => build_macos(&args[1..]),
         Some("run-macos") => run_macos(&args[1..]),
         Some(cmd) => {
@@ -37,9 +40,142 @@ fn print_help() {
     eprintln!(
         "cargo xtask <subcommand>\n\n\
          Subcommands:\n  \
+         install [--prefix P]  Linux: build + install binary, icons and .desktop\n  \
          build-macos          Bundle a signed mnemis.app for macOS\n  \
          run-macos            build-macos then `open` the resulting .app\n"
     );
+}
+
+/// Icon sizes shipped in `app/icons/<N>x<N>.png` and installed into the
+/// hicolor theme.
+const ICON_SIZES: [u32; 5] = [32, 64, 128, 256, 512];
+
+/// Linux install into a `~/.local`-style prefix: the release binary as
+/// `bin/mnemis`, the icon set into the hicolor theme, and a generated
+/// `.desktop` entry.
+///
+/// No Tauri bundling involved — `generate_context!` embeds `ui/dist` into the
+/// executable at compile time, so a plain `cargo build --release` produces a
+/// self-contained binary.
+fn install(args: &[String]) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("install only runs on Linux; use build-macos on macOS");
+    }
+
+    let prefix = match args.iter().position(|a| a == "--prefix") {
+        Some(i) => PathBuf::from(
+            args.get(i + 1)
+                .context("--prefix needs a directory argument")?,
+        ),
+        None => home()?.join(".local"),
+    };
+    let root = workspace_root()?;
+
+    println!("==> trunk build --release (UI)");
+    run(Command::new("trunk")
+        .args(["build", "--release"])
+        .current_dir(root.join("app/ui")))
+    .context("trunk build failed — is `trunk` on PATH?")?;
+
+    println!("==> cargo build --release -p mnemis-app");
+    run(Command::new("cargo")
+        .args(["build", "--release", "-p", "mnemis-app"])
+        .current_dir(&root))
+    .context("cargo build failed")?;
+
+    // Binary. Installed as `mnemis` (not `mnemis-app`) so the command reads
+    // well and GTK derives WM_CLASS=mnemis from argv[0] — which is what
+    // StartupWMClass below matches on.
+    let bin_dir = prefix.join("bin");
+    let bin_dest = bin_dir.join("mnemis");
+    std::fs::create_dir_all(&bin_dir)?;
+    copy(&root.join("target/release/mnemis-app"), &bin_dest)?;
+
+    // Icons, by theme size. `Icon=mnemis` resolves through the theme rather
+    // than pointing at an absolute path.
+    for size in ICON_SIZES {
+        let dir = prefix.join(format!("share/icons/hicolor/{size}x{size}/apps"));
+        std::fs::create_dir_all(&dir)?;
+        copy(
+            &root.join(format!("app/icons/{size}x{size}.png")),
+            &dir.join("mnemis.png"),
+        )?;
+    }
+
+    // Desktop entry. Exec is the resolved absolute path: `~/.local/bin` is not
+    // guaranteed to be on the PATH the desktop shell launches applications
+    // with.
+    let apps_dir = prefix.join("share/applications");
+    std::fs::create_dir_all(&apps_dir)?;
+    let desktop = apps_dir.join("mnemis.desktop");
+    let contents = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=mnemis\n\
+         GenericName=Action Tracker\n\
+         Comment=Extract and track action items from your email and chat\n\
+         Exec={} %U\n\
+         Icon=mnemis\n\
+         Terminal=false\n\
+         Categories=Office;ProjectManagement;Email;\n\
+         Keywords=tasks;actions;todo;inbox;email;\n\
+         StartupNotify=true\n\
+         StartupWMClass=mnemis\n",
+        bin_dest.display()
+    );
+    std::fs::write(&desktop, contents).with_context(|| format!("writing {}", desktop.display()))?;
+    println!("    {}", desktop.display());
+
+    refresh_caches(&prefix);
+
+    println!("\ninstalled to {}", prefix.display());
+    if !path_contains(&bin_dir) {
+        println!(
+            "note: {} is not on your PATH — the desktop entry works regardless \
+             (it uses the absolute path), but `mnemis` won't run from a shell.",
+            bin_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort desktop/icon cache refresh. Both tools are optional and a stale
+/// cache only delays the entry showing up, so failures are not fatal.
+fn refresh_caches(prefix: &std::path::Path) {
+    let _ = Command::new("update-desktop-database")
+        .arg(prefix.join("share/applications"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("gtk-update-icon-cache")
+        .arg("-t")
+        .arg("-f")
+        .arg(prefix.join("share/icons/hicolor"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn copy(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    // Remove first: overwriting a running executable in place gives ETXTBSY,
+    // while unlinking leaves the running process on its old inode.
+    let _ = std::fs::remove_file(to);
+    std::fs::copy(from, to)
+        .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+    println!("    {}", to.display());
+    Ok(())
+}
+
+fn path_contains(dir: &std::path::Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|entry| entry == dir))
+        .unwrap_or(false)
+}
+
+fn home() -> Result<PathBuf> {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("HOME unset")
 }
 
 fn build_macos(_args: &[String]) -> Result<()> {
@@ -120,10 +256,7 @@ fn read_bundle_identifier(root: &std::path::Path) -> Result<String> {
 /// authorize `bundle_id`, and copy it into the bundle as
 /// `Contents/embedded.provisionprofile`.
 fn embed_provisioning_profile(bundle_path: &std::path::Path, bundle_id: &str) -> Result<()> {
-    let dir = std::env::var("HOME")
-        .map(PathBuf::from)
-        .context("HOME unset")?
-        .join("Library/Developer/Xcode/UserData/Provisioning Profiles");
+    let dir = home()?.join("Library/Developer/Xcode/UserData/Provisioning Profiles");
     if !dir.exists() {
         bail!(
             "no provisioning profiles dir at {} — open the Xcode stub project and \

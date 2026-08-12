@@ -1711,7 +1711,7 @@ fn build_tree(rows: Vec<ChannelRowDto>) -> Vec<ChannelNode> {
         }
     }
     fn sort_in_place(nodes: &mut [ChannelNode]) {
-        nodes.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        nodes.sort_by_key(|n| n.label.to_lowercase());
         for n in nodes {
             sort_in_place(&mut n.children);
         }

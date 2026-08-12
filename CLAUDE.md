@@ -47,6 +47,19 @@ MNEMIS_DB_PATH=/path/to/mnemis.db ./target/debug/mnemis-app
 # config file (otherwise defaults to ~/.config/mnemis/config.toml).
 ```
 
+### Linux: install to `~/.local`
+
+```
+cargo xtask install [--prefix /some/other/prefix]
+```
+
+Builds the UI with `trunk build --release` and `cargo build --release -p
+mnemis-app` (no Tauri bundling — `generate_context!` embeds `ui/dist` into the
+binary), then installs `bin/mnemis`, the hicolor icons
+(`share/icons/hicolor/<N>x<N>/apps/mnemis.png`) and a generated
+`share/applications/mnemis.desktop`. Icon masters live in `app/icons/` (cut
+from `design/icon-master.png`).
+
 ### macOS: signed bundle (required for the keychain)
 
 The keychain backend uses the **data-protection keychain** with the
