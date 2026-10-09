@@ -359,11 +359,51 @@ impl ThinkingLevel {
     }
 }
 
+/// Which LLM API mnemis talks to for chat and extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlmProvider {
+    /// An OpenAI *Responses*-API server (`/v1/responses`), e.g. omlx.
+    #[default]
+    OpenaiResponses,
+    /// Claude via the Anthropic Messages API.
+    Anthropic,
+}
+
+impl LlmProvider {
+    pub const ALL: [LlmProvider; 2] = [LlmProvider::OpenaiResponses, LlmProvider::Anthropic];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmProvider::OpenaiResponses => "openai-responses",
+            LlmProvider::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LlmProvider::OpenaiResponses => "OpenAI Responses API (omlx, …)",
+            LlmProvider::Anthropic => "Claude (Anthropic API)",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> LlmProvider {
+        match s {
+            "anthropic" => LlmProvider::Anthropic,
+            _ => LlmProvider::OpenaiResponses,
+        }
+    }
+}
+
 /// LLM config view/edit shape. Matches `engine::config::LlmSection` plus a
 /// `config_path` so the UI can tell the user where edits land. The bearer
 /// token is sent both ways — the form omits it when blank.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmConfigDto {
+    #[serde(default)]
+    pub provider: LlmProvider,
+    /// Empty for the Anthropic provider means the public API endpoint.
+    #[serde(default)]
     pub base_url: String,
     pub chat_model: String,
     pub bearer_token: Option<String>,
@@ -371,6 +411,14 @@ pub struct LlmConfigDto {
     /// [`ThinkingLevel::Medium`] when absent from an older config).
     #[serde(default)]
     pub thinking_level: ThinkingLevel,
+    /// Write-only: a new Claude API key to store in the OS keychain. Never
+    /// sent back to the UI; `None`/blank leaves the stored key alone.
+    #[serde(default)]
+    pub anthropic_api_key: Option<String>,
+    /// Read-only: whether a Claude API key is available (keychain or the
+    /// `ANTHROPIC_API_KEY` env var).
+    #[serde(default)]
+    pub anthropic_api_key_set: bool,
     pub config_path: String,
 }
 

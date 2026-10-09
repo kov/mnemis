@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::Context;
 use mnemis_engine::config::Config;
 use mnemis_engine::embed::{Embedder, LocalEmbedder};
-use mnemis_engine::llm::LlmClient;
+use mnemis_engine::llm::LlmBackend;
 use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
@@ -49,7 +49,7 @@ pub(crate) struct AppState {
 }
 
 pub(crate) struct LlmStack {
-    pub llm: LlmClient,
+    pub llm: LlmBackend,
     pub embedder: Arc<dyn Embedder>,
     pub chat_model: String,
     pub window_char_budget: usize,
@@ -355,12 +355,16 @@ async fn get_llm_config(_state: State<'_, AppState>) -> Result<LlmConfigDto, Str
         Ok(cfg) => Ok(LlmConfigDto {
             // Resolve before moving fields out of `cfg.llm` below.
             thinking_level: cfg.llm.resolved_thinking_level(),
+            provider: cfg.llm.provider,
+            anthropic_api_key: None,
+            anthropic_api_key_set: mnemis_engine::llm::anthropic_api_key().await.is_some(),
             base_url: cfg.llm.base_url,
             chat_model: cfg.llm.chat_model,
             bearer_token: cfg.llm.bearer_token,
             config_path: cfg_path.display().to_string(),
         }),
         Err(_) => Ok(LlmConfigDto {
+            anthropic_api_key_set: mnemis_engine::llm::anthropic_api_key().await.is_some(),
             config_path: cfg_path.display().to_string(),
             ..Default::default()
         }),
@@ -369,7 +373,15 @@ async fn get_llm_config(_state: State<'_, AppState>) -> Result<LlmConfigDto, Str
 
 #[tauri::command(rename_all = "snake_case")]
 async fn save_llm_config(state: State<'_, AppState>, cfg: LlmConfigDto) -> Result<(), String> {
+    if let Some(key) = cfg.anthropic_api_key.as_deref().map(str::trim)
+        && !key.is_empty()
+    {
+        mnemis_engine::secrets::store(mnemis_engine::anthropic::API_KEY_REF, key)
+            .await
+            .map_err(|e| format!("storing the Claude API key: {e:#}"))?;
+    }
     config::save_llm(&config::LlmSection {
+        provider: cfg.provider,
         base_url: cfg.base_url,
         chat_model: cfg.chat_model,
         bearer_token: cfg.bearer_token.filter(|s| !s.trim().is_empty()),
@@ -388,7 +400,13 @@ async fn save_llm_config(state: State<'_, AppState>, cfg: LlmConfigDto) -> Resul
     // chat work immediately, without an app restart. If the reload fails, keep
     // whatever stack we had and let the user retry.
     match config::load(None) {
-        Ok(cfg) => state.set_llm(Some(Arc::new(build_llm_stack(&cfg)))),
+        Ok(cfg) => match build_llm_stack(&cfg).await {
+            Ok(stack) => state.set_llm(Some(Arc::new(stack))),
+            Err(e) => {
+                state.set_llm(None);
+                return Err(format!("saved, but the LLM isn't usable yet: {e:#}"));
+            }
+        },
         Err(e) => warn!(error = %e, "saved LLM config but could not reload it"),
     }
     Ok(())
@@ -689,7 +707,13 @@ fn main() {
                 None
             } else {
                 match config::load(None) {
-                    Ok(cfg) => Some(Arc::new(build_llm_stack(&cfg))),
+                    Ok(cfg) => match tauri::async_runtime::block_on(build_llm_stack(&cfg)) {
+                        Ok(stack) => Some(Arc::new(stack)),
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), "LLM not usable; sync_now disabled");
+                            None
+                        }
+                    },
                     Err(e) => {
                         warn!(error = %e, "no mnemis config; sync_now disabled");
                         None
@@ -777,15 +801,9 @@ fn main() {
         .expect("error while running tauri application");
 }
 
-fn build_llm_stack(cfg: &Config) -> LlmStack {
-    let mut llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone())
-        .with_timeout(cfg.llm.resolved_request_timeout_secs())
-        .with_thinking_budget(cfg.llm.resolved_thinking_budget());
-    if let Some(t) = &cfg.llm.bearer_token {
-        llm = llm.with_bearer_token(t.clone());
-    }
-    LlmStack {
-        llm,
+async fn build_llm_stack(cfg: &Config) -> anyhow::Result<LlmStack> {
+    Ok(LlmStack {
+        llm: LlmBackend::from_config(&cfg.llm).await?,
         embedder: LocalEmbedder::shared(),
         chat_model: cfg.llm.chat_model.clone(),
         window_char_budget: mnemis_engine::extract::window_char_budget_for(
@@ -793,7 +811,7 @@ fn build_llm_stack(cfg: &Config) -> LlmStack {
         ),
         max_context_tokens: cfg.llm.resolved_max_context_tokens(),
         chat_idle_timeout_secs: cfg.llm.resolved_chat_idle_timeout_secs(),
-    }
+    })
 }
 
 /// Resolve the SQLite path.

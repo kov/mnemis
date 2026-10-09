@@ -123,6 +123,9 @@ fn item_chars(item: &InputItem) -> usize {
             name, arguments, ..
         } => name.len() + arguments.len() + 32,
         InputItem::FunctionCallOutput { output, .. } => output.len() + 32,
+        // The signature carries the encrypted reasoning, which the provider
+        // bills as input; its length is a fair stand-in.
+        InputItem::Thinking { block } => block.to_string().len(),
     }
 }
 

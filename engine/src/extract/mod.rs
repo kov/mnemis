@@ -675,8 +675,10 @@ async fn run_agent_loop(
         );
 
         // Append the assistant's turn to `history` in output order — its text
-        // message and tool calls, but NOT its reasoning — then dispatch the
-        // calls. The `FunctionCallOutput`s pushed afterwards carry the same
+        // message and tool calls, but NOT its reasoning text — then dispatch
+        // the calls. A provider-signed thinking block (Claude) *is* replayed:
+        // Claude requires it back with the round's tool results, and this
+        // history only lives for one extraction run. The `FunctionCallOutput`s pushed afterwards carry the same
         // `call_id`s, so the next turn replays a well-formed exchange.
         let mut function_calls = Vec::new();
         let mut text_parts = Vec::new();
@@ -709,6 +711,7 @@ async fn run_agent_loop(
                         text_parts.push(msg);
                     }
                 }
+                OutputItem::Thinking { block } => history.push(InputItem::Thinking { block }),
                 OutputItem::Reasoning { .. } | OutputItem::Unknown => {}
             }
         }

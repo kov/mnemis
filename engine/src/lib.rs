@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod anthropic;
 pub mod chat;
 pub mod config;
 pub mod db;

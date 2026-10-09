@@ -4,7 +4,7 @@ use mnemis_engine::config::Config;
 use mnemis_engine::db;
 use mnemis_engine::embed::{Embedder, LocalEmbedder, drain_once};
 use mnemis_engine::extract::{extract_for_channel, prompt};
-use mnemis_engine::llm::LlmClient;
+use mnemis_engine::llm::LlmBackend;
 use mnemis_engine::maintenance;
 use mnemis_engine::orchestrator::{self, build_imap_source};
 use mnemis_engine::secrets;
@@ -125,7 +125,7 @@ pub async fn add_source_imap(
 
 pub async fn sync(cfg: &Config) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
-    let llm = build_llm(cfg);
+    let llm = build_llm(cfg).await?;
     let embedder: Arc<dyn Embedder> = LocalEmbedder::shared();
 
     let count_sources: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sources")
@@ -231,7 +231,7 @@ pub async fn list_actions(cfg: &Config, status_filter: Option<&str>, json: bool)
 
 pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
-    let llm = build_llm(cfg);
+    let llm = build_llm(cfg).await?;
     let traces = cfg.traces_dir();
     let outcome = extract_for_channel(
         &pool,
@@ -265,7 +265,7 @@ pub async fn chat(
     use mnemis_engine::types::ChatEvent;
 
     let pool = db::open(&cfg.db_path()).await?;
-    let llm = build_llm(cfg);
+    let llm = build_llm(cfg).await?;
 
     // Resolve (or create) the chat.
     let chat_id = match chat_id {
@@ -340,14 +340,8 @@ pub async fn embed_once(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn build_llm(cfg: &Config) -> LlmClient {
-    let llm = LlmClient::new(cfg.llm.base_url.clone(), cfg.llm.chat_model.clone())
-        .with_timeout(cfg.llm.resolved_request_timeout_secs())
-        .with_thinking_budget(cfg.llm.resolved_thinking_budget());
-    match &cfg.llm.bearer_token {
-        Some(t) => llm.with_bearer_token(t.clone()),
-        None => llm,
-    }
+async fn build_llm(cfg: &Config) -> Result<LlmBackend> {
+    LlmBackend::from_config(&cfg.llm).await
 }
 
 pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {

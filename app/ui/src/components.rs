@@ -10,9 +10,9 @@ use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavCollectionDto, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto,
-    Confidence, FeedbackKind, LlmConfigDto, MessageActionRef, MessageDetailDto, MessageDto,
-    PendingResolutionDto, ProfileIdentifier, SourceHealth, SourceRowDto, StatusSnapshot,
-    SyncOutcome, ThinkingLevel, UserProfileDto, summarize_sync_error,
+    Confidence, FeedbackKind, LlmConfigDto, LlmProvider, MessageActionRef, MessageDetailDto,
+    MessageDto, PendingResolutionDto, ProfileIdentifier, SourceHealth, SourceRowDto,
+    StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto, summarize_sync_error,
 };
 use wasm_bindgen::JsCast;
 
@@ -1333,9 +1333,8 @@ fn ProfileForm(initial: UserProfileDto) -> impl IntoView {
     }
 }
 
-/// LLM config editor. Writes to `config.toml`; the user is told the change
-/// takes effect on next app restart since `LlmStack` is built once at
-/// startup. (Deferring hot-reload is fine for now — settings is rare.)
+/// LLM config editor. Writes to `config.toml` (the Claude API key goes to the
+/// OS keychain instead); the backend hot-reloads the LLM stack on save.
 #[component]
 pub fn SettingsLlm() -> impl IntoView {
     let cfg = LocalResource::new(|| async move { fetch_llm_config().await });
@@ -1359,11 +1358,14 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
     let toast: RwSignal<Option<String>> = RwSignal::new(None);
 
     let initial_level = initial.thinking_level;
+    let provider = RwSignal::new(initial.provider);
+    let key_set = initial.anthropic_api_key_set;
 
     let base_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let chat_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let token_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let level_ref: NodeRef<leptos::html::Select> = NodeRef::new();
+    let key_ref: NodeRef<leptos::html::Input> = NodeRef::new();
 
     let on_save = move |_| {
         let pull = |r: NodeRef<leptos::html::Input>, default: String| -> String {
@@ -1380,7 +1382,11 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
             .get()
             .map(|el| ThinkingLevel::from_wire(&el.unchecked_ref::<HtmlSelectElement>().value()))
             .unwrap_or(initial_level);
+        let api_key = pull(key_ref, String::new());
         let cfg = LlmConfigDto {
+            provider: provider.get_untracked(),
+            anthropic_api_key: (!api_key.is_empty()).then_some(api_key),
+            anthropic_api_key_set: false,
             base_url: pull(base_ref, base_url.get()),
             chat_model: pull(chat_ref, chat.get()),
             bearer_token: {
@@ -1392,8 +1398,8 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
         };
         spawn_local(async move {
             match save_llm_config(cfg).await {
-                Ok(_) => toast.set(Some("Saved. Restart the app to apply.".to_string())),
-                Err(e) => toast.set(Some(format!("Save failed: {e}"))),
+                Ok(_) => toast.set(Some("Saved.".to_string())),
+                Err(e) => toast.set(Some(e.to_string())),
             }
         });
     };
@@ -1401,13 +1407,56 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
     view! {
         <div class="settings-form" data-form="llm">
             <div class="settings-hint">{format!("Writes to {config_path}")}</div>
+            <label>"Provider"</label>
+            <select
+                class="settings-select"
+                data-field="provider"
+                on:change=move |ev| provider.set(LlmProvider::from_wire(&event_target_value(&ev)))
+            >
+                {LlmProvider::ALL.into_iter().map(|p| view! {
+                    <option value=p.as_str() selected=p == initial.provider>{p.label()}</option>
+                }).collect_view()}
+            </select>
             <label>"Base URL"</label>
-            <input class="settings-input" node_ref=base_ref prop:value=move || base_url.get() />
+            <input
+                class="settings-input"
+                node_ref=base_ref
+                prop:value=move || base_url.get()
+                placeholder=move || match provider.get() {
+                    LlmProvider::Anthropic => "https://api.anthropic.com/v1 (default)",
+                    LlmProvider::OpenaiResponses => "http://localhost:1234/v1",
+                }
+            />
             <label>"Chat model"</label>
-            <input class="settings-input" node_ref=chat_ref prop:value=move || chat.get() />
-            <label>"Bearer token (optional)"</label>
-            <input class="settings-input" node_ref=token_ref prop:value=move || token.get() />
-            <label>"Thinking budget"</label>
+            <input
+                class="settings-input"
+                node_ref=chat_ref
+                prop:value=move || chat.get()
+                placeholder=move || match provider.get() {
+                    LlmProvider::Anthropic => "claude-sonnet-5-5",
+                    LlmProvider::OpenaiResponses => "",
+                }
+            />
+            <div style:display=move || {
+                if provider.get() == LlmProvider::OpenaiResponses { "contents" } else { "none" }
+            }>
+                <label>"Bearer token (optional)"</label>
+                <input class="settings-input" node_ref=token_ref prop:value=move || token.get() />
+            </div>
+            <div style:display=move || {
+                if provider.get() == LlmProvider::Anthropic { "contents" } else { "none" }
+            }>
+                <label>"Claude API key"</label>
+                <input
+                    class="settings-input"
+                    data-field="anthropic-api-key"
+                    node_ref=key_ref
+                    type="password"
+                    placeholder=if key_set { "A key is stored — leave blank to keep it" } else { "sk-ant-…" }
+                />
+                <div class="settings-hint">"Stored in the OS keychain, never in the config file."</div>
+            </div>
+            <label>"Thinking effort"</label>
             <select class="settings-select" node_ref=level_ref>
                 {ThinkingLevel::ALL.into_iter().map(|lvl| view! {
                     <option value=lvl.as_str() selected=lvl == initial_level>
@@ -1417,8 +1466,9 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
             </select>
             <div class="settings-hint">
                 "How much the model is allowed to think before answering. \
-                 Higher reasons more thoroughly but is slower; sent on every \
-                 call so models that don't think by default still get to."
+                 Higher reasons more thoroughly but is slower (and, for Claude, \
+                 costs more); sent on every call so models that don't think by \
+                 default still get to."
             </div>
             <div class="settings-actions">
                 <button class="btn btn-primary" on:click=on_save>"Save LLM config"</button>

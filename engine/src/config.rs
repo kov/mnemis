@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use mnemis_types::ThinkingLevel;
+use mnemis_types::{LlmProvider, ThinkingLevel};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,13 @@ pub struct Config {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LlmSection {
+    /// Which API to talk to. Absent in configs that predate the switch, which
+    /// all target a Responses server.
+    #[serde(default)]
+    pub provider: LlmProvider,
+    /// Server root (include `/v1`). Optional for `anthropic`, where empty means
+    /// [`crate::anthropic::DEFAULT_BASE_URL`].
+    #[serde(default)]
     pub base_url: String,
     pub chat_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,12 +56,19 @@ pub struct LlmSection {
     pub thinking_level: Option<ThinkingLevel>,
 }
 
+/// Default working-context cap for Claude (see `resolved_max_context_tokens`).
+pub const DEFAULT_ANTHROPIC_CONTEXT_TOKENS: usize = 200_000;
+
 impl LlmSection {
     /// Resolve the configured server context window, falling back to the
     /// engine default when unset.
     pub fn resolved_max_context_tokens(&self) -> usize {
-        self.max_context_tokens
-            .unwrap_or(crate::extract::DEFAULT_MAX_CONTEXT_TOKENS)
+        self.max_context_tokens.unwrap_or(match self.provider {
+            LlmProvider::OpenaiResponses => crate::extract::DEFAULT_MAX_CONTEXT_TOKENS,
+            // Claude's window is far larger; this is a cost cap — every agent
+            // step resends the conversation — not the model's limit.
+            LlmProvider::Anthropic => DEFAULT_ANTHROPIC_CONTEXT_TOKENS,
+        })
     }
 
     /// Resolve the configured request timeout, falling back to the engine
@@ -145,6 +159,7 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
         };
     let cfg = Config {
         llm: LlmSection {
+            provider: llm.provider,
             base_url: llm.base_url.clone(),
             chat_model: llm.chat_model.clone(),
             bearer_token: llm.bearer_token.clone(),
@@ -202,4 +217,38 @@ pub fn expand_tilde(s: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configs_without_a_provider_stay_on_the_responses_api() {
+        // Pre-provider configs (with the since-removed `embedding_model`) parse
+        // unchanged and keep their old context default.
+        let cfg: Config = toml::from_str(
+            "[llm]\nbase_url = \"http://alface:1234/v1\"\nchat_model = \"qwen\"\n\
+             embedding_model = \"nomic\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.llm.provider, LlmProvider::OpenaiResponses);
+        assert_eq!(
+            cfg.llm.resolved_max_context_tokens(),
+            crate::extract::DEFAULT_MAX_CONTEXT_TOKENS
+        );
+    }
+
+    #[test]
+    fn anthropic_needs_no_base_url_and_gets_a_larger_context_cap() {
+        let cfg: Config =
+            toml::from_str("[llm]\nprovider = \"anthropic\"\nchat_model = \"claude-sonnet-5-5\"\n")
+                .unwrap();
+        assert_eq!(cfg.llm.provider, LlmProvider::Anthropic);
+        assert!(cfg.llm.base_url.is_empty());
+        assert_eq!(
+            cfg.llm.resolved_max_context_tokens(),
+            DEFAULT_ANTHROPIC_CONTEXT_TOKENS
+        );
+    }
 }

@@ -55,14 +55,28 @@ chat_model = "qwen3-30b-a3b"
 # db = "~/.local/share/mnemis/mnemis.db"   # optional; this is the default
 ```
 
+To use Claude instead of a local server:
+
+```toml
+[llm]
+provider = "anthropic"
+chat_model = "claude-sonnet-5-5"
+```
+
+The API key goes in the OS keychain via Settings → LLM, or in the
+`ANTHROPIC_API_KEY` env var (which wins when set; the only option for the CLI
+on macOS, which can't read the app's keychain items).
+
 ### `[llm]`
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `base_url` | yes | | Base URL of the Responses API server (include `/v1` if your server expects it) |
-| `chat_model` | yes | | Model used for extraction. Must match a model loaded on the server |
-| `bearer_token` | no | | Bearer token for API authentication |
-| `max_context_tokens` | no | `32768` | The server's context window. mnemis sizes its message-window batches from this so a single call doesn't overflow the server |
+| `provider` | no | `openai-responses` | `openai-responses` (an OpenAI Responses-API server such as omlx) or `anthropic` (Claude) |
+| `base_url` | for `openai-responses` | `https://api.anthropic.com/v1` for `anthropic` | Base URL of the server (include `/v1` if your server expects it) |
+| `chat_model` | yes | | Model used for chat and extraction. Must match a model the server offers |
+| `bearer_token` | no | | Bearer token for `openai-responses` servers |
+| `thinking_level` | no | `medium` | `low` / `medium` / `high` / `extra_high`. A thinking-token budget for `openai-responses`; Claude's `effort` for `anthropic` |
+| `max_context_tokens` | no | `32768` (`200000` for `anthropic`) | The context window mnemis keeps conversations and extraction batches within. For Claude it's a cost cap: every agent step resends the conversation |
 | `request_timeout_secs` | no | `300` | Total per-request timeout for chat calls. Bounds a hang if the server accepts a request and never answers |
 
 Embeddings are computed in-process (EmbeddingGemma-300M via fastembed); the

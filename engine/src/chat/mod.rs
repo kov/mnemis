@@ -174,6 +174,15 @@ async fn run_inner(
     let mut seen_tool_calls: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
+    // Provider-signed thinking blocks (Claude) from this turn's tool rounds,
+    // keyed by the first tool call of the response that produced them. History
+    // is rebuilt from the DB every step and never contains reasoning, so these
+    // are spliced back in front of their calls before each send — Claude
+    // requires a round's thinking alongside its tool results. In memory only:
+    // they expire with the turn, which keeps the reasoning-replay rule intact
+    // across user turns.
+    let mut round_thinking: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+
     for step in 0..MAX_CHAT_TURNS {
         // A Stop pressed between sends (e.g. during a tool dispatch) ends the
         // turn cleanly here rather than firing one more model call.
@@ -215,6 +224,7 @@ async fn run_inner(
         }
         let mut history =
             compact::history_for_send(pool, chat_id, system_prompt, &tool_defs, budgets).await?;
+        splice_thinking(&mut history, &round_thinking);
 
         trace!(step, chat_id, "chat LLM: send");
         let started = std::time::Instant::now();
@@ -287,6 +297,10 @@ async fn run_inner(
                         .await?
                         {
                             compact::Compacted::Folded => {
+                                // The fold changed everything before this
+                                // round's blocks, which Claude binds them to —
+                                // replaying them now would be rejected.
+                                round_thinking.clear();
                                 history = compact::history_for_send(
                                     pool,
                                     chat_id,
@@ -333,6 +347,7 @@ async fn run_inner(
             .iter()
             .any(|i| matches!(i, OutputItem::FunctionCall { .. }));
         let mut function_calls = Vec::new();
+        let mut response_thinking = Vec::new();
         let mut pending_reasoning: Option<String> = None;
         let mut reasoning_attached = false;
         let mut emitted_message = false;
@@ -421,8 +436,14 @@ async fn run_inner(
                     });
                     function_calls.push((call_id, name, arguments));
                 }
+                OutputItem::Thinking { block } => response_thinking.push(block),
                 OutputItem::Unknown => {}
             }
+        }
+        if let Some((first_call_id, _, _)) = function_calls.first()
+            && !response_thinking.is_empty()
+        {
+            round_thinking.push((first_call_id.clone(), response_thinking));
         }
 
         // No tool calls → the model has finished this turn.
@@ -506,6 +527,25 @@ async fn run_inner(
     }
 
     anyhow::bail!("chat agent exceeded {MAX_CHAT_TURNS} turns")
+}
+
+/// Re-insert each response's signed thinking blocks right before its first
+/// tool call. A call that's no longer in `history` (folded away) is skipped.
+fn splice_thinking(history: &mut Vec<InputItem>, rounds: &[(String, Vec<serde_json::Value>)]) {
+    for (call_id, blocks) in rounds {
+        let Some(at) = history
+            .iter()
+            .position(|i| matches!(i, InputItem::FunctionCall { call_id: c, .. } if c == call_id))
+        else {
+            continue;
+        };
+        history.splice(
+            at..at,
+            blocks
+                .iter()
+                .map(|b| InputItem::Thinking { block: b.clone() }),
+        );
+    }
 }
 
 /// Persist any pending reasoning onto `turn_id` (once per model response) and
@@ -728,6 +768,104 @@ mod tests {
         assert!(history.iter().any(
             |i| matches!(i, crate::llm::InputItem::Message { role: Role::User, content } if content.contains("Ana"))
         ));
+    }
+
+    /// Replays scripted replies and records every send's input.
+    struct CapturingLlm {
+        replies: Mutex<std::collections::VecDeque<crate::llm::ResponsesResponse>>,
+        seen: Mutex<Vec<Vec<InputItem>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmTransport for CapturingLlm {
+        async fn send(
+            &self,
+            _instructions: &str,
+            input: Vec<InputItem>,
+            _tools: &[crate::llm::ToolDef],
+            _previous_response_id: Option<&str>,
+        ) -> Result<crate::llm::ResponsesResponse> {
+            self.seen.lock().unwrap().push(input);
+            Ok(self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unscripted send"))
+        }
+    }
+
+    #[tokio::test]
+    async fn replays_signed_thinking_within_the_tool_round_only() {
+        // Claude needs a round's signed thinking block back with its tool
+        // results, but mnemis never replays reasoning across user turns.
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let block = serde_json::json!({"type": "thinking", "thinking": "", "signature": "SIG"});
+        let llm = CapturingLlm {
+            replies: Mutex::new(
+                vec![
+                    mock::turn(vec![
+                        OutputItem::Thinking {
+                            block: block.clone(),
+                        },
+                        OutputItem::FunctionCall {
+                            call_id: "c1".to_string(),
+                            name: "list_actions".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    ]),
+                    mock::no_tools("Nothing open."),
+                    mock::no_tools("Still nothing."),
+                ]
+                .into(),
+            ),
+            seen: Mutex::new(Vec::new()),
+        };
+        let chat = store::create_chat(&pool, None, None).await.unwrap();
+        let (_events, sink) = collector();
+        for text in ["anything open?", "and now?"] {
+            run_chat_turn(
+                &pool,
+                &llm,
+                "system",
+                chat,
+                text,
+                100_000,
+                1_000_000,
+                Duration::from_secs(60),
+                None,
+                &sink,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let seen = llm.seen.lock().unwrap();
+        let has_thinking = |input: &[InputItem]| {
+            input
+                .iter()
+                .any(|i| matches!(i, InputItem::Thinking { .. }))
+        };
+        assert!(
+            !has_thinking(&seen[0]),
+            "nothing to replay on the first send"
+        );
+        let at = seen[1]
+            .iter()
+            .position(|i| matches!(i, InputItem::FunctionCall { call_id, .. } if call_id == "c1"))
+            .expect("tool call replayed");
+        assert!(
+            matches!(&seen[1][at - 1], InputItem::Thinking { block: b } if *b == block),
+            "the round's thinking must sit right before its tool call: {:?}",
+            seen[1]
+        );
+        assert!(
+            !has_thinking(&seen[2]),
+            "thinking must not carry into the next user turn"
+        );
     }
 
     #[tokio::test]

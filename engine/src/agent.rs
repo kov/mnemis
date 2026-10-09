@@ -41,6 +41,8 @@ pub(crate) fn is_transient_stall(err_chain: &str) -> bool {
     err_chain.contains("empty response body")
         || err_chain.contains("stalled")
         || err_chain.contains("timed out")
+        // Claude rate limits / overload / server errors.
+        || err_chain.contains(crate::anthropic::TEMPORARILY_UNAVAILABLE)
 }
 
 /// True when an error chain is the server rejecting a prompt that's too big to
@@ -60,6 +62,8 @@ pub(crate) fn is_transient_stall(err_chain: &str) -> bool {
 pub(crate) fn is_context_overflow(err_chain: &str) -> bool {
     err_chain.contains("max context window")
         || err_chain.contains("Prompt too long")
+        // Claude: `prompt is too long: N tokens > M maximum`.
+        || err_chain.contains("prompt is too long")
         || err_chain.contains("Memory limit exceeded")
         || err_chain.contains("memory ceiling")
 }

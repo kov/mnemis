@@ -175,9 +175,24 @@ pub mod mock {
 /// Returns a mock LLM driven by `mock_script` by default. When the env var
 /// `MNEMIS_TEST_LLM=live` is set (along with `MNEMIS_TEST_LLM_URL` and
 /// `MNEMIS_TEST_LLM_MODEL`), returns a real `LlmClient` pointed at omlx and
-/// the script is dropped.
+/// the script is dropped. With `MNEMIS_TEST_LLM_PROVIDER=anthropic` it is a
+/// Claude client instead (`MNEMIS_TEST_LLM_URL` optional, key from
+/// `ANTHROPIC_API_KEY`) — note that live Claude runs are billed.
 pub fn make_test_llm(mock_script: Vec<ResponsesResponse>) -> Box<dyn LlmTransport> {
-    if std::env::var("MNEMIS_TEST_LLM").as_deref() == Ok("live") {
+    if std::env::var("MNEMIS_TEST_LLM").as_deref() == Ok("live")
+        && std::env::var("MNEMIS_TEST_LLM_PROVIDER").as_deref() == Ok("anthropic")
+    {
+        let model = std::env::var("MNEMIS_TEST_LLM_MODEL")
+            .expect("MNEMIS_TEST_LLM=live requires MNEMIS_TEST_LLM_MODEL");
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .expect("MNEMIS_TEST_LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY");
+        let url = std::env::var("MNEMIS_TEST_LLM_URL").ok();
+        Box::new(crate::anthropic::AnthropicClient::new(
+            url.as_deref(),
+            model,
+            key,
+        ))
+    } else if std::env::var("MNEMIS_TEST_LLM").as_deref() == Ok("live") {
         let url = std::env::var("MNEMIS_TEST_LLM_URL")
             .expect("MNEMIS_TEST_LLM=live requires MNEMIS_TEST_LLM_URL");
         let model = std::env::var("MNEMIS_TEST_LLM_MODEL")

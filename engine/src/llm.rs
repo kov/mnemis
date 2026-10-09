@@ -122,6 +122,14 @@ pub enum InputItem {
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
+    /// A provider-native signed reasoning block (Anthropic `thinking` /
+    /// `redacted_thinking`), replayed verbatim ahead of the tool calls of the
+    /// same model response. Claude requires these back, unmodified, while a
+    /// tool round is in progress. Only meaningful within one user turn: the
+    /// loops never carry them across user turns (see the reasoning-replay rule
+    /// in the `v1-gotchas` memory). The Responses transport drops them.
+    #[serde(rename = "provider_thinking")]
+    Thinking { block: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,6 +237,11 @@ pub enum OutputItem {
         #[serde(default, deserialize_with = "null_as_default")]
         summary: Vec<ReasoningSummary>,
     },
+    /// The opaque signed block behind a [`Self::Reasoning`] (Anthropic only),
+    /// to be echoed back as [`InputItem::Thinking`] within the tool round.
+    /// Display text, if any, arrives separately as a `Reasoning` item.
+    #[serde(rename = "provider_thinking")]
+    Thinking { block: serde_json::Value },
     #[serde(other)]
     Unknown,
 }
@@ -322,7 +335,7 @@ impl LlmTransport for LlmClient {
         let body = ResponsesRequest {
             model: &self.model,
             instructions,
-            input,
+            input: without_provider_thinking(input),
             tools,
             previous_response_id,
             thinking_budget: self.thinking_budget,
@@ -392,7 +405,7 @@ impl LlmTransport for LlmClient {
         let body = ResponsesRequest {
             model: &self.model,
             instructions,
-            input,
+            input: without_provider_thinking(input),
             tools,
             previous_response_id,
             thinking_budget: self.thinking_budget,
@@ -425,11 +438,19 @@ impl LlmTransport for LlmClient {
     }
 }
 
+/// Another provider's signed reasoning means nothing to a Responses server.
+fn without_provider_thinking(input: Vec<InputItem>) -> Vec<InputItem> {
+    input
+        .into_iter()
+        .filter(|i| !matches!(i, InputItem::Thinking { .. }))
+        .collect()
+}
+
 /// A synthetic response carrying whatever assistant text had streamed when the
 /// user pressed Stop. Status `cancelled`; empty output when nothing had been
 /// produced yet. The chat loop persists the partial (if any) and ends the turn
 /// cleanly — no error, no retry.
-fn cancelled_response(text: String) -> ResponsesResponse {
+pub(crate) fn cancelled_response(text: String) -> ResponsesResponse {
     ResponsesResponse {
         id: String::new(),
         status: "cancelled".to_string(),
@@ -521,6 +542,112 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+/// The configured LLM transport. An enum rather than a trait object so callers
+/// keep a cheap `Clone` (the app hot-swaps it on settings saves).
+#[derive(Clone)]
+pub enum LlmBackend {
+    Responses(LlmClient),
+    Anthropic(crate::anthropic::AnthropicClient),
+}
+
+impl LlmBackend {
+    /// Build the transport `cfg` describes. For Claude the API key comes from
+    /// `ANTHROPIC_API_KEY` when set, otherwise the OS keychain.
+    pub async fn from_config(cfg: &crate::config::LlmSection) -> Result<Self> {
+        use mnemis_types::LlmProvider;
+        Ok(match cfg.provider {
+            LlmProvider::OpenaiResponses => {
+                let mut llm = LlmClient::new(cfg.base_url.clone(), cfg.chat_model.clone())
+                    .with_timeout(cfg.resolved_request_timeout_secs())
+                    .with_thinking_budget(cfg.resolved_thinking_budget());
+                if let Some(t) = &cfg.bearer_token {
+                    llm = llm.with_bearer_token(t.clone());
+                }
+                LlmBackend::Responses(llm)
+            }
+            LlmProvider::Anthropic => {
+                let key = anthropic_api_key().await.context(
+                    "no Claude API key: add one in Settings → LLM or set ANTHROPIC_API_KEY",
+                )?;
+                LlmBackend::Anthropic(
+                    crate::anthropic::AnthropicClient::new(
+                        Some(cfg.base_url.as_str()),
+                        cfg.chat_model.clone(),
+                        key,
+                    )
+                    .with_thinking_level(cfg.resolved_thinking_level())
+                    .with_idle_timeout(cfg.resolved_chat_idle_timeout_secs()),
+                )
+            }
+        })
+    }
+
+    fn inner(&self) -> &dyn LlmTransport {
+        match self {
+            LlmBackend::Responses(c) => c,
+            LlmBackend::Anthropic(c) => c,
+        }
+    }
+}
+
+/// The Claude API key, if one is available: `ANTHROPIC_API_KEY` (non-empty)
+/// wins, else the keychain entry.
+pub async fn anthropic_api_key() -> Option<String> {
+    if let Ok(k) = std::env::var("ANTHROPIC_API_KEY")
+        && !k.trim().is_empty()
+    {
+        return Some(k);
+    }
+    match crate::secrets::fetch(crate::anthropic::API_KEY_REF).await {
+        Ok(k) if !k.trim().is_empty() => Some(k),
+        Ok(_) => None,
+        // A missing entry is the normal "not configured yet" case, and the
+        // keychain backends don't tell it apart from other lookup failures.
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "no Claude API key in the keychain");
+            None
+        }
+    }
+}
+
+#[async_trait]
+impl LlmTransport for LlmBackend {
+    async fn send(
+        &self,
+        instructions: &str,
+        input: Vec<InputItem>,
+        tools: &[ToolDef],
+        previous_response_id: Option<&str>,
+    ) -> Result<ResponsesResponse> {
+        self.inner()
+            .send(instructions, input, tools, previous_response_id)
+            .await
+    }
+
+    async fn send_stream(
+        &self,
+        instructions: &str,
+        input: Vec<InputItem>,
+        tools: &[ToolDef],
+        previous_response_id: Option<&str>,
+        idle_timeout: Duration,
+        cancel: CancellationToken,
+        deltas: Option<UnboundedSender<String>>,
+    ) -> Result<ResponsesResponse> {
+        self.inner()
+            .send_stream(
+                instructions,
+                input,
+                tools,
+                previous_response_id,
+                idle_timeout,
+                cancel,
+                deltas,
+            )
+            .await
     }
 }
 
