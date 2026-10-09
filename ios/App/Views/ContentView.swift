@@ -5,15 +5,20 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var model = model
+        // Icon-only tabs: the switcher stays small, and the labels remain
+        // for VoiceOver.
         TabView(selection: $model.selectedTab) {
-            Tab("Actions", systemImage: "checklist", value: AppTab.actions) {
+            Tab(value: AppTab.actions) {
                 ActionsView()
+            } label: {
+                Image(systemName: "checklist").accessibilityLabel("Actions")
             }
-            Tab("Chat", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
+            Tab(value: AppTab.chat) {
                 ChatsView()
+            } label: {
+                Image(systemName: "bubble.left.and.text.bubble.right").accessibilityLabel("Chat")
             }
         }
-        .tabViewStyle(.sidebarAdaptable)
         .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
             SettingsView()
         }
