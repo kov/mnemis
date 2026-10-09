@@ -1336,6 +1336,76 @@ async fn first_run_banner_appears_on_empty_db() -> Result<()> {
     Ok(())
 }
 
+/// The embed queue drains in the background between syncs, so the status
+/// panel's counter must follow the queue without a sync or navigation.
+#[tokio::test(flavor = "current_thread")]
+async fn status_panel_embed_queue_follows_the_queue() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-queue.db");
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        seed(&pool).await?;
+        sqlx::query(
+            "INSERT INTO embed_queue (target_kind, target_id, text_hash, enqueued_at) \
+             SELECT 'message', id, 'h', 0 FROM messages",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+    }
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("span.status-queue"))
+        .await
+        .context("waiting for the embed queue counter")?;
+    let queue_text = || async {
+        client
+            .find(Locator::Css("span.status-queue"))
+            .await?
+            .text()
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let before = queue_text().await?;
+    assert!(
+        !before.contains("embed queue: 0"),
+        "seeded queue should be non-empty: {before}"
+    );
+
+    // Drain the queue behind the app's back (the background drainer is off
+    // under MNEMIS_DISABLE_LLM), as the drainer would.
+    let pool = mnemis_engine::db::open(&db_path).await?;
+    sqlx::query("DELETE FROM embed_queue")
+        .execute(&pool)
+        .await?;
+    let mut after = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        after = queue_text().await?;
+        if after.contains("embed queue: 0") {
+            break;
+        }
+    }
+    assert!(
+        after.contains("embed queue: 0"),
+        "counter should follow the drained queue without a sync: {after}"
+    );
+
+    client.close().await.ok();
+    Ok(())
+}
+
 /// Profile editor round-trip: load empty form, fill it, save, assert the
 /// `user_profile` + `contact_identifiers` rows landed, and confirm the
 /// first-run banner is gone.

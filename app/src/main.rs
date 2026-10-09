@@ -721,6 +721,17 @@ fn main() {
                 }
             };
 
+            // Embeddings are local and independent of the LLM config, so the
+            // queue drains in the background from startup rather than only
+            // during syncs. MNEMIS_DISABLE_LLM (ui_smoke) also keeps this off
+            // so tests never load the model.
+            if std::env::var("MNEMIS_DISABLE_LLM").is_err() {
+                tauri::async_runtime::spawn(mnemis_engine::embed::drain_continuously(
+                    pool.clone(),
+                    LocalEmbedder::shared(),
+                ));
+            }
+
             app.manage(AppState {
                 pool,
                 llm_stack: RwLock::new(llm_stack),

@@ -128,8 +128,36 @@ impl Embedder for LocalEmbedder {
 const MAX_ATTEMPTS: i64 = 5;
 const BATCH_SIZE: i64 = 100;
 
+/// How long [`drain_continuously`] sleeps once the queue has nothing it can
+/// make progress on. New entries also get picked up by the drains a sync runs,
+/// so this only bounds the lag for work enqueued outside a sync.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serializes drains in this process: the background loop and a sync's own
+/// drains would otherwise pick the same entries and embed them twice (and
+/// double-count failures against their retry budget).
+static DRAIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Keep the embed queue drained for the life of the process: drain batch after
+/// batch while entries succeed, then poll every [`IDLE_POLL`]. Errors (e.g. the
+/// model can't be downloaded yet) are logged and retried on the next poll.
+pub async fn drain_continuously(pool: SqlitePool, embedder: Arc<dyn Embedder>) {
+    loop {
+        match drain_once(&pool, embedder.as_ref()).await {
+            Ok(n) if n > 0 => {
+                info!(count = n, "background embed drain");
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = format!("{e:#}"), "background embed drain failed"),
+        }
+        tokio::time::sleep(IDLE_POLL).await;
+    }
+}
+
 /// Drain up to BATCH_SIZE queue entries once and return the count successfully embedded.
 pub async fn drain_once(pool: &SqlitePool, embedder: &dyn Embedder) -> Result<usize> {
+    let _serialized = DRAIN_LOCK.lock().await;
     let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue WHERE attempts < ?")
         .bind(MAX_ATTEMPTS)
         .fetch_one(pool)
@@ -505,6 +533,50 @@ mod tests {
             dot(&a, &b) > dot(&a, &c),
             "a translation should sit closer than an unrelated sentence"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_drain_empties_a_queue_larger_than_one_batch() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("test.db")).await?;
+        db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        let total = BATCH_SIZE + 50;
+        for i in 0..total {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO actions (title, confidence, status, extracted_at) \
+                 VALUES (?, 'high', 'pending', ?) RETURNING id",
+            )
+            .bind(format!("action {i}"))
+            .bind(now)
+            .fetch_one(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO embed_queue (target_kind, target_id, text_hash, enqueued_at) \
+                 VALUES ('action', ?, 'h', ?)",
+            )
+            .bind(id)
+            .bind(now)
+            .execute(&pool)
+            .await?;
+        }
+
+        let embedder = Arc::new(FixedEmbedder::new(vec![0.5_f32; 768]));
+        let task = tokio::spawn(drain_continuously(pool.clone(), embedder.clone()));
+        let mut left = total;
+        for _ in 0..100 {
+            (left,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue")
+                .fetch_one(&pool)
+                .await?;
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
+        assert_eq!(left, 0, "the loop should keep draining past one batch");
+        assert_eq!(embedder.call_count(), total as usize);
         Ok(())
     }
 

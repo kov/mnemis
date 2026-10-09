@@ -746,6 +746,22 @@ pub fn StatusPanel() -> impl IntoView {
     let syncing = RwSignal::new(false);
     let last_outcome: RwSignal<Option<Result<SyncOutcome, String>>> = RwSignal::new(None);
 
+    // The embed queue drains in the background, between syncs, so poll just
+    // its depth (a full `status` refetch would flash the Suspense fallback).
+    let live_queue: RwSignal<Option<i64>> = RwSignal::new(None);
+    if let Ok(handle) = set_interval_with_handle(
+        move || {
+            spawn_local(async move {
+                if let Ok(s) = fetch_status().await {
+                    live_queue.set(Some(s.embed_queue_depth));
+                }
+            })
+        },
+        std::time::Duration::from_secs(5),
+    ) {
+        on_cleanup(move || handle.clear());
+    }
+
     let on_click = move |_| {
         if syncing.get() {
             return;
@@ -774,7 +790,7 @@ pub fn StatusPanel() -> impl IntoView {
             <div class="status-row">
                 <Suspense fallback=|| view! { <span class="status-loading">"…"</span> }>
                     {move || status.get().map(|res| match res {
-                        Ok(s) => view! { <StatusPanelInner snap=s /> }.into_any(),
+                        Ok(s) => view! { <StatusPanelInner snap=s live_queue=live_queue /> }.into_any(),
                         Err(e) => view! { <span class="status-error">{format!("status error: {e}")}</span> }.into_any(),
                     })}
                 </Suspense>
@@ -835,8 +851,8 @@ pub fn StatusPanel() -> impl IntoView {
 }
 
 #[component]
-fn StatusPanelInner(snap: StatusSnapshot) -> impl IntoView {
-    let queue = snap.embed_queue_depth;
+fn StatusPanelInner(snap: StatusSnapshot, live_queue: RwSignal<Option<i64>>) -> impl IntoView {
+    let snap_queue = snap.embed_queue_depth;
     let last_extraction = snap
         .last_extraction_at
         .map(format_relative)
@@ -870,7 +886,9 @@ fn StatusPanelInner(snap: StatusSnapshot) -> impl IntoView {
             }}
         </div>
         <div class="status-meta">
-            <span class="status-queue">{format!("embed queue: {queue}")}</span>
+            <span class="status-queue">
+                {move || format!("embed queue: {}", live_queue.get().unwrap_or(snap_queue))}
+            </span>
             <span class="status-extraction">{last_extraction}</span>
         </div>
     }
