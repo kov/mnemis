@@ -175,7 +175,7 @@ pub fn build(inputs: &PromptInputs) -> String {
            shows only snippets, so call this before recording an action whenever the snippet \
            alone doesn't confirm the ask. There's a per-run fetch budget, so fetch what looks \
            promising, not everything.\n\
-         - search_messages(query): keyword/semantic search across recent messages for prior context\n\
+         - search_messages(query): keyword + semantic (meaning-based, cross-language) search across messages for prior context\n\
          - record_action(title, details, confidence, rationale, due_at?, evidence_external_ids[]): \
            record one concrete action the user must take. Returns {\"action_id\": \"A-N\", ...} — \
            hold onto the A-N id if you might need to revise the same action later in this response. \

@@ -105,6 +105,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Semantic hits for the agents' search_messages; the model loads lazily.
+    mnemis_engine::embed::install_query_embedder(mnemis_engine::embed::LocalEmbedder::shared());
     let cfg = config::load(cli.config.as_deref()).context("loading config")?;
 
     match cli.command {

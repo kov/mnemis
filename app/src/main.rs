@@ -723,9 +723,11 @@ fn main() {
 
             // Embeddings are local and independent of the LLM config, so the
             // queue drains in the background from startup rather than only
-            // during syncs. MNEMIS_DISABLE_LLM (ui_smoke) also keeps this off
-            // so tests never load the model.
+            // during syncs, and search_messages gets semantic hits.
+            // MNEMIS_DISABLE_LLM (ui_smoke) keeps both off so tests never
+            // load the model.
             if std::env::var("MNEMIS_DISABLE_LLM").is_err() {
+                mnemis_engine::embed::install_query_embedder(LocalEmbedder::shared());
                 tauri::async_runtime::spawn(mnemis_engine::embed::drain_continuously(
                     pool.clone(),
                     LocalEmbedder::shared(),

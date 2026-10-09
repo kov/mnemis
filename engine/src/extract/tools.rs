@@ -191,8 +191,9 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef::function(
             "search_messages".to_string(),
-            "Keyword search across messages in this source. Returns up to 10 matches \
-             with external_id, channel, posted_at, and a short snippet."
+            "Search messages in this source by keyword and by meaning (semantic matches \
+             also find paraphrases and other languages). Returns up to 10 matches with \
+             external_id, channel, posted_at, and a short snippet."
                 .to_string(),
             search_messages_params(),
         ),
@@ -244,7 +245,8 @@ pub fn chat_definitions() -> Vec<ToolDef> {
     vec![
         ToolDef::function(
             "search_messages".to_string(),
-            "Keyword search across ALL the user's ingested messages (every source). Returns \
+            "Search ALL the user's ingested messages (every source) by keyword and by \
+             meaning (semantic matches also find paraphrases and other languages). Returns \
              up to 10 matches with external_id, channel, posted_at, and a short snippet."
                 .to_string(),
             search_messages_params(),
@@ -434,43 +436,128 @@ fn sanitize_fts_query(raw: &str) -> String {
 }
 
 async fn search_messages(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> Result<String> {
+    search_messages_with(pool, scope, crate::embed::query_embedder(), arguments).await
+}
+
+/// Results returned to the model.
+const SEARCH_LIMIT: usize = 10;
+/// Nearest neighbours fetched before the scope filter (which vec0's KNN can't
+/// apply itself) narrows them down.
+const SEMANTIC_CANDIDATES: i64 = 40;
+/// Reciprocal-rank-fusion constant: damps the weight of top ranks so a hit
+/// both searches agree on beats one either ranks first alone.
+const RRF_K: f64 = 60.0;
+
+/// Hybrid search: FTS5 keyword hits and, when an embedder is available,
+/// nearest-neighbour hits from `messages_vec`, merged by reciprocal rank
+/// fusion. Semantic failures (model not loaded yet, nothing embedded) degrade
+/// to keyword-only rather than failing the tool call.
+async fn search_messages_with(
+    pool: &SqlitePool,
+    scope: ToolScope,
+    embedder: Option<&dyn crate::embed::Embedder>,
+    arguments: &str,
+) -> Result<String> {
     let args: SearchArgs =
         serde_json::from_str(arguments).context("parsing search_messages args")?;
-    let match_query = sanitize_fts_query(&args.query);
-    if match_query.is_empty() {
-        // No searchable terms (e.g. a date-only or punctuation query) — return
-        // empty rather than erroring; the model should use list_messages for
-        // time windows.
-        return Ok(serde_json::to_string(&Vec::<SearchHit>::new())?);
-    }
     let filter = scope.source_filter();
-    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
-        "SELECT m.external_id, m.posted_at, m.body, c.name \
-         FROM messages_fts \
-         JOIN messages m ON m.id = messages_fts.rowid \
-         JOIN channels c ON c.id = m.channel_id \
-         WHERE messages_fts MATCH ? AND (? IS NULL OR c.source_id = ?) \
-         ORDER BY rank LIMIT 10",
-    )
-    .bind(&match_query)
-    .bind(filter)
-    .bind(filter)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("FTS search failed for {match_query:?}"))?;
 
-    let hits: Vec<SearchHit> = rows
-        .into_iter()
-        .map(|(external_id, posted_at, body, channel)| SearchHit {
+    let match_query = sanitize_fts_query(&args.query);
+    let keyword: Vec<(i64,)> = if match_query.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT m.id \
+             FROM messages_fts \
+             JOIN messages m ON m.id = messages_fts.rowid \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE messages_fts MATCH ? AND (? IS NULL OR c.source_id = ?) \
+             ORDER BY rank LIMIT ?",
+        )
+        .bind(&match_query)
+        .bind(filter)
+        .bind(filter)
+        .bind(SEARCH_LIMIT as i64)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("FTS search failed for {match_query:?}"))?
+    };
+
+    let semantic: Vec<(i64,)> = match embedder {
+        Some(e) if !args.query.trim().is_empty() => {
+            match semantic_hits(pool, filter, e, &args.query).await {
+                Ok(hits) => hits,
+                Err(err) => {
+                    tracing::warn!(error = format!("{err:#}"), "semantic search skipped");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    let mut scores: Vec<(i64, f64)> = Vec::new();
+    for ranked in [&keyword, &semantic] {
+        for (rank, (id,)) in ranked.iter().enumerate() {
+            let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+            match scores.iter_mut().find(|(i, _)| i == id) {
+                Some((_, s)) => *s += score,
+                None => scores.push((*id, score)),
+            }
+        }
+    }
+    scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let mut hits = Vec::new();
+    for (id, _) in scores.into_iter().take(SEARCH_LIMIT) {
+        let (external_id, posted_at, body, channel): (String, i64, String, String) =
+            sqlx::query_as(
+                "SELECT m.external_id, m.posted_at, m.body, c.name \
+                 FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .context("loading search hit")?;
+        hits.push(SearchHit {
             external_id,
             posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_default(),
             snippet: snippet(&body, 200),
             channel,
-        })
-        .collect();
+        });
+    }
     Ok(serde_json::to_string(&hits)?)
+}
+
+/// Nearest messages to `query` in embedding space, within `source_filter`.
+async fn semantic_hits(
+    pool: &SqlitePool,
+    source_filter: Option<i64>,
+    embedder: &dyn crate::embed::Embedder,
+    query: &str,
+) -> Result<Vec<(i64,)>> {
+    let blob = crate::embed::vec_blob(&embedder.embed_query(query).await?);
+    sqlx::query_as(
+        "WITH knn AS ( \
+             SELECT rowid, distance FROM messages_vec \
+             WHERE embedding MATCH ? AND k = ? \
+         ) \
+         SELECT m.id FROM knn \
+         JOIN messages m ON m.id = knn.rowid \
+         JOIN channels c ON c.id = m.channel_id \
+         WHERE (? IS NULL OR c.source_id = ?) \
+         ORDER BY knn.distance LIMIT ?",
+    )
+    .bind(blob)
+    .bind(SEMANTIC_CANDIDATES)
+    .bind(source_filter)
+    .bind(source_filter)
+    .bind(SEARCH_LIMIT as i64)
+    .fetch_all(pool)
+    .await
+    .context("vector search failed")
 }
 
 #[derive(Deserialize)]
@@ -1502,6 +1589,78 @@ mod tests {
             hits2[0]["external_id"], "m2",
             "global search should span sources: {out2}"
         );
+    }
+
+    /// Embeds by topic, standing in for a model that knows "certificate" and
+    /// "certificado" mean the same thing.
+    struct TopicEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::embed::Embedder for TopicEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            let mut v = vec![0.0_f32; 768];
+            v[usize::from(!text.to_lowercase().contains("certific"))] = 1.0;
+            Ok(v)
+        }
+    }
+
+    struct BrokenEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::embed::Embedder for BrokenEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            anyhow::bail!("model not loaded")
+        }
+    }
+
+    #[tokio::test]
+    async fn search_messages_finds_semantic_matches_keywords_miss() {
+        let (_tmp, pool, scope) = db_with_messages(&[
+            ("lunch", "lunch on friday?"),
+            ("cert", "o certificado TLS vence amanhã"),
+        ])
+        .await;
+        for ext in ["lunch", "cert"] {
+            let (id, body): (i64, String) =
+                sqlx::query_as("SELECT id, body FROM messages WHERE external_id = ?")
+                    .bind(ext)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let v = crate::embed::Embedder::embed(&TopicEmbedder, &body)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO messages_vec(rowid, embedding) VALUES (?, vec_f32(?))")
+                .bind(id)
+                .bind(crate::embed::vec_blob(&v))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let q = json!({ "query": "certificate renewal" }).to_string();
+
+        let keyword_only: serde_json::Value =
+            serde_json::from_str(&search_messages_with(&pool, scope, None, &q).await.unwrap())
+                .unwrap();
+        assert_eq!(keyword_only.as_array().unwrap().len(), 0, "{keyword_only}");
+
+        let hybrid: serde_json::Value = serde_json::from_str(
+            &search_messages_with(&pool, scope, Some(&TopicEmbedder), &q)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hybrid[0]["external_id"], "cert", "{hybrid}");
+
+        // A failing embedder degrades to keyword results instead of an error.
+        let kw = json!({ "query": "lunch" }).to_string();
+        let degraded: serde_json::Value = serde_json::from_str(
+            &search_messages_with(&pool, scope, Some(&BrokenEmbedder), &kw)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(degraded[0]["external_id"], "lunch", "{degraded}");
     }
 
     #[tokio::test]

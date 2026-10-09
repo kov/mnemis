@@ -20,7 +20,31 @@ pub trait Embedder: Send + Sync {
         Ok(())
     }
 
+    /// Embed a stored document (message, action, note).
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Embed a search query. Models trained with asymmetric prompts (like
+    /// EmbeddingGemma) want a different prompt for queries than documents;
+    /// the default treats them alike.
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text).await
+    }
+}
+
+static QUERY_EMBEDDER: std::sync::OnceLock<Arc<dyn Embedder>> = std::sync::OnceLock::new();
+
+/// Enable semantic search: `search_messages` embeds queries with this and
+/// merges nearest-neighbour hits from `messages_vec` with its keyword hits.
+/// Process-wide (the app and CLI install [`LocalEmbedder::shared`] at
+/// startup) so the agent tools needn't thread an embedder through every call;
+/// without one, search stays keyword-only, which is what tests get. First
+/// install wins.
+pub fn install_query_embedder(embedder: Arc<dyn Embedder>) {
+    let _ = QUERY_EMBEDDER.set(embedder);
+}
+
+pub(crate) fn query_embedder() -> Option<&'static dyn Embedder> {
+    QUERY_EMBEDDER.get().map(|e| e.as_ref())
 }
 
 /// The model every vector table is built from. Changing it means re-embedding
@@ -39,10 +63,10 @@ const MODEL: EmbeddingModel = EmbeddingModel::EmbeddingGemma300MQ4;
 /// quadratically and the gist of an email is near the top.
 const MAX_LENGTH: usize = 1024;
 
-/// EmbeddingGemma's retrieval-document prompt. Everything we store is a
-/// document; a query-side embedding (for search) would use
-/// `"task: search result | query: "` instead.
+/// EmbeddingGemma's retrieval prompts: stored items are documents, searches
+/// are queries.
 const DOCUMENT_PROMPT: &str = "title: none | text: ";
+const QUERY_PROMPT: &str = "task: search result | query: ";
 
 /// In-process embedder backed by fastembed (ONNX Runtime on CPU). The model is
 /// downloaded on first use into `cache_dir` and loaded lazily, so constructing
@@ -114,7 +138,17 @@ impl Embedder for LocalEmbedder {
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let input = format!("{DOCUMENT_PROMPT}{text}");
+        self.embed_prompted(DOCUMENT_PROMPT, text).await
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_prompted(QUERY_PROMPT, text).await
+    }
+}
+
+impl LocalEmbedder {
+    async fn embed_prompted(&self, prompt: &str, text: &str) -> Result<Vec<f32>> {
+        let input = format!("{prompt}{text}");
         self.with_model(move |m| {
             m.embed([input], None)
                 .context("embedding text")?
@@ -123,6 +157,16 @@ impl Embedder for LocalEmbedder {
         })
         .await
     }
+}
+
+/// Pack a vector as the little-endian f32 blob `vec_f32()` / vec0 `MATCH`
+/// accept. Non-finite values become 0 (they'd poison the JSON path, and give
+/// meaningless distances anyway).
+pub(crate) fn vec_blob(embedding: &[f32]) -> Vec<u8> {
+    embedding
+        .iter()
+        .flat_map(|v| if v.is_finite() { *v } else { 0.0 }.to_le_bytes())
+        .collect()
 }
 
 const MAX_ATTEMPTS: i64 = 5;
@@ -272,17 +316,8 @@ async fn write_embedding(
     // pointless serialize/parse round-trip for what is fundamentally a packed
     // float array. A non-finite value still produces a meaningless similarity
     // score, but at least the queue keeps draining; log it so it's visible.
-    let mut blob = Vec::with_capacity(embedding.len() * 4);
-    let mut bad = 0usize;
-    for v in embedding {
-        let v = if v.is_finite() {
-            *v
-        } else {
-            bad += 1;
-            0.0
-        };
-        blob.extend_from_slice(&v.to_le_bytes());
-    }
+    let blob = vec_blob(embedding);
+    let bad = embedding.iter().filter(|v| !v.is_finite()).count();
     if bad > 0 {
         warn!(
             rowid,
