@@ -311,13 +311,14 @@ async fn wait_for_tcp_port(port: u16, timeout: Duration) -> Result<()> {
 /// or probe binary. Works for both `target/debug/` (cargo test/run) and
 /// release profiles.
 pub fn sibling_app_binary() -> Result<PathBuf> {
-    // Cargo writes integration test binaries to `target/{profile}/deps/<name>`
-    // and the main binary to `target/{profile}/<name>`. Walk up until we
-    // find a sibling `mnemis-app`.
+    // Cargo writes the main binary to `target/{profile}/<name>`; test binaries
+    // land in `target/{profile}/deps/` or, with the newer build-dir layout,
+    // `target/{profile}/build/<pkg>/<hash>/out/` — where an ancestor is itself
+    // a `mnemis-app` *directory*. Walk up until we find a sibling binary.
     let exe = std::env::current_exe()?;
-    for ancestor in exe.ancestors().skip(1).take(4) {
+    for ancestor in exe.ancestors().skip(1).take(6) {
         let candidate = ancestor.join("mnemis-app");
-        if candidate.exists() {
+        if candidate.is_file() {
             return Ok(candidate);
         }
     }
