@@ -193,7 +193,7 @@ pub fn definitions() -> Vec<ToolDef> {
             "search_messages".to_string(),
             "Search messages in this source by keyword and by meaning (semantic matches \
              also find paraphrases and other languages). Returns up to 10 matches with \
-             external_id, channel, posted_at, and a short snippet."
+             external_id, channel, posted_at, author, subject, and a short snippet."
                 .to_string(),
             search_messages_params(),
         ),
@@ -247,7 +247,7 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             "search_messages".to_string(),
             "Search ALL the user's ingested messages (every source) by keyword and by \
              meaning (semantic matches also find paraphrases and other languages). Returns \
-             up to 10 matches with external_id, channel, posted_at, and a short snippet."
+             up to 10 matches with external_id, channel, posted_at, author, subject, and a short snippet."
                 .to_string(),
             search_messages_params(),
         ),
@@ -416,6 +416,8 @@ struct SearchArgs {
 struct SearchHit {
     external_id: String,
     posted_at: String,
+    author: Option<String>,
+    subject: Option<String>,
     snippet: String,
     channel: String,
 }
@@ -510,20 +512,30 @@ async fn search_messages_with(
 
     let mut hits = Vec::new();
     for (id, _) in scores.into_iter().take(SEARCH_LIMIT) {
-        let (external_id, posted_at, body, channel): (String, i64, String, String) =
-            sqlx::query_as(
-                "SELECT m.external_id, m.posted_at, m.body, c.name \
-                 FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
-            )
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .context("loading search hit")?;
+        #[allow(clippy::type_complexity)]
+        let (external_id, posted_at, author, subject, body, channel): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body, c.name \
+                 FROM messages m JOIN channels c ON c.id = m.channel_id \
+                 LEFT JOIN people p ON p.id = m.author_id WHERE m.id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .context("loading search hit")?;
         hits.push(SearchHit {
             external_id,
             posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_default(),
+            author,
+            subject,
             snippet: snippet(&body, 200),
             channel,
         });
@@ -1378,11 +1390,39 @@ async fn get_action(pool: &SqlitePool, arguments: &str) -> Result<String> {
 /// cut. Public so the CLI `dump_prompt` command and the window projection share
 /// one snippet definition rather than drifting.
 pub fn snippet(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.replace('\n', " ");
+    // Collapse whitespace runs (HTML-derived bodies are often mostly `\r`,
+    // spaces and NBSPs) and drop the invisible format characters newsletters
+    // pad their preheaders with, so the budget goes to actual words.
+    let invisible = |c: char| {
+        matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}' | '\u{034F}'
+        )
+    };
+    let mut out = String::new();
+    let mut len = 0;
+    for word in text
+        .split(|c: char| c.is_whitespace() || invisible(c))
+        .filter(|w| !w.is_empty())
+    {
+        if len > 0 {
+            if len == max {
+                out.push('…');
+                return out;
+            }
+            out.push(' ');
+            len += 1;
+        }
+        for c in word.chars() {
+            if len == max {
+                out.push('…');
+                return out;
+            }
+            out.push(c);
+            len += 1;
+        }
     }
-    let truncated: String = text.chars().take(max).collect();
-    format!("{}…", truncated.replace('\n', " "))
+    out
 }
 
 #[cfg(test)]
@@ -1589,6 +1629,15 @@ mod tests {
             hits2[0]["external_id"], "m2",
             "global search should span sources: {out2}"
         );
+    }
+
+    #[test]
+    fn snippet_collapses_whitespace_and_invisible_padding() {
+        let body = "\r \r\u{a0}\r  Pay\u{200c}\u{200b}\u{feff} now\r\n\r\n  with   Pix";
+        assert_eq!(snippet(body, 200), "Pay now with Pix");
+        assert_eq!(snippet(body, 7), "Pay now…");
+        assert_eq!(snippet("ação", 3), "açã…");
+        assert_eq!(snippet("", 10), "");
     }
 
     /// Embeds by topic, standing in for a model that knows "certificate" and
