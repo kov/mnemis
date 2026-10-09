@@ -6,10 +6,10 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var model = model
-        // The iOS 26 shapes: on iPad a three-column split, like Mail, with
-        // the sections in the floating sidebar; on iPhone a tab bar with a
-        // navigation stack per section. A top tab bar over a split view is
-        // what Apple advises against: the two fight over the top edge.
+        // The iOS 26 shapes: on iPad a split with the sections in the
+        // floating sidebar; on iPhone a tab bar. Either way each section is a
+        // navigation stack, list then detail. A top tab bar over a split
+        // view is what Apple advises against: the two fight over the top edge.
         Group {
             if sizeClass == .compact {
                 CompactLayout()
@@ -39,7 +39,8 @@ struct ContentView: View {
     }
 }
 
-/// iPad: sections | list | detail.
+/// iPad: sections | a stack where the list's detail slides in over it (with
+/// back button and swipe), as in the Claude app.
 private struct SplitLayout: View {
     @Environment(AppModel.self) private var model
 
@@ -59,37 +60,16 @@ private struct SplitLayout: View {
             .navigationTitle("mnemis")
             .toolbar { SettingsItem() }
             .safeAreaInset(edge: .bottom) { LearningNote().padding() }
-        } content: {
-            switch model.selectedTab {
-            case .actions:
-                ActionListView(selection: $model.actionSelection)
-                    .navigationTitle("Actions")
-                    .toolbar { SyncItem() }
-            case .chat:
-                ChatListView(selection: $model.chatSelection)
-                    .navigationTitle("Chats")
-                    .toolbar { NewChatItem() }
-            }
         } detail: {
             switch model.selectedTab {
-            case .actions:
-                if let action = model.action(model.actionSelection) {
-                    ActionDetailView(action: action)
-                } else {
-                    ContentUnavailableView("No action selected", systemImage: "checklist")
-                }
-            case .chat:
-                if let id = model.chatSelection {
-                    ChatView(chatId: id).id(id)
-                } else {
-                    ContentUnavailableView("No chat selected", systemImage: "bubble.left.and.text.bubble.right")
-                }
+            case .actions: ActionsStack(showsSettings: false)
+            case .chat: ChatsStack(showsSettings: false)
             }
         }
     }
 }
 
-/// iPhone: a tab per section, each a list that pushes its detail.
+/// iPhone: a tab per section, each the same stack as on iPad.
 private struct CompactLayout: View {
     @Environment(AppModel.self) private var model
 
@@ -97,38 +77,61 @@ private struct CompactLayout: View {
         @Bindable var model = model
         TabView(selection: $model.selectedTab) {
             Tab("Actions", systemImage: "checklist", value: AppTab.actions) {
-                NavigationStack {
-                    ActionListView(selection: $model.actionSelection)
-                        .navigationTitle("Actions")
-                        .toolbar {
-                            SettingsItem()
-                            SyncItem()
-                        }
-                        .navigationDestination(item: $model.actionSelection) { id in
-                            if let action = model.action(id) {
-                                ActionDetailView(action: action)
-                            }
-                        }
-                }
+                ActionsStack(showsSettings: true)
             }
             .badge(model.actions.count)
             Tab("Chats", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
-                NavigationStack {
-                    ChatListView(selection: $model.chatSelection)
-                        .navigationTitle("Chats")
-                        .toolbar {
-                            SettingsItem()
-                            NewChatItem()
-                        }
-                        .navigationDestination(item: $model.chatSelection) { id in
-                            // The composer takes the bottom edge, as in Messages.
-                            ChatView(chatId: id).id(id)
-                                .toolbar(.hidden, for: .tabBar)
-                        }
-                }
+                ChatsStack(showsSettings: true)
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+    }
+}
+
+/// The action list; picking one pushes its detail.
+private struct ActionsStack: View {
+    @Environment(AppModel.self) private var model
+    /// On iPad Settings lives on the sidebar instead.
+    let showsSettings: Bool
+
+    var body: some View {
+        @Bindable var model = model
+        NavigationStack {
+            ActionListView(selection: $model.actionSelection)
+                .navigationTitle("Actions")
+                .toolbar {
+                    if showsSettings { SettingsItem() }
+                    SyncItem()
+                }
+                .navigationDestination(item: $model.actionSelection) { id in
+                    if let action = model.action(id) {
+                        ActionDetailView(action: action)
+                    }
+                }
+        }
+    }
+}
+
+/// The chat list; picking one pushes the conversation.
+private struct ChatsStack: View {
+    @Environment(AppModel.self) private var model
+    let showsSettings: Bool
+
+    var body: some View {
+        @Bindable var model = model
+        NavigationStack {
+            ChatListView(selection: $model.chatSelection)
+                .navigationTitle("Chats")
+                .toolbar {
+                    if showsSettings { SettingsItem() }
+                    NewChatItem()
+                }
+                .navigationDestination(item: $model.chatSelection) { id in
+                    // The composer takes the bottom edge, as in Messages.
+                    ChatView(chatId: id).id(id)
+                        .toolbar(.hidden, for: .tabBar)
+                }
+        }
     }
 }
 
