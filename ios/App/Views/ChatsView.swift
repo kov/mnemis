@@ -2,9 +2,11 @@ import SwiftUI
 
 struct ChatsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         @Bindable var model = model
+        let compact = sizeClass == .compact
         NavigationSplitView(columnVisibility: $model.columnVisibility) {
             List(selection: $model.chatSelection) {
                 ForEach(model.chats) { chat in
@@ -26,18 +28,31 @@ struct ChatsView: View {
                     )
                 }
             }
-            .navigationTitle("Chat")
-            .toolbar(.hidden, for: .navigationBar)
-            .toolbar(removing: .sidebarToggle)
+            .listColumnChrome(title: "Chat")
+            .trailingControls(when: compact) { NewChatButton() }
             .refreshable { await model.refreshChats() }
         } detail: {
-            if let id = model.chatSelection {
-                ChatView(chatId: id)
-                    .id(id)
-            } else {
-                ContentUnavailableView("No chat selected", systemImage: "bubble.left.and.text.bubble.right")
+            Group {
+                if let id = model.chatSelection {
+                    ChatView(chatId: id)
+                        .id(id)
+                } else {
+                    ContentUnavailableView("No chat selected", systemImage: "bubble.left.and.text.bubble.right")
+                }
             }
+            .trailingControls(when: !compact) { NewChatButton() }
         }
+    }
+}
+
+private struct NewChatButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("New chat", systemImage: "square.and.pencil") {
+            Task { await model.newChat() }
+        }
+        .disabled(model.engine == nil)
     }
 }
 
