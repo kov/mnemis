@@ -5,13 +5,18 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var model = model
-        // Each section's list carries the switcher in its navigation bar
-        // (`SectionSwitcher`), so nothing floats over the content.
-        Group {
-            switch model.selectedTab {
-            case .actions: ActionsView()
-            case .chat: ChatsView()
+        // One window-wide header bar holds the app's controls; the sections
+        // below drop their sidebar navigation bars.
+        VStack(spacing: 0) {
+            HeaderBar()
+            Divider()
+            Group {
+                switch model.selectedTab {
+                case .actions: ActionsView()
+                case .chat: ChatsView()
+                }
             }
+            .frame(maxHeight: .infinity)
         }
         .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
             SettingsView()
@@ -31,7 +36,76 @@ struct ContentView: View {
     }
 }
 
-/// Actions | Chat, icon-only, in the list's navigation bar.
+/// The window-wide bar: sidebar toggle and Settings on the left, the section
+/// switcher in the middle, the section's own actions on the right.
+struct HeaderBar: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    var body: some View {
+        HStack(spacing: 4) {
+            HStack(spacing: 4) {
+                if sizeClass == .regular {
+                    HeaderButton("Sidebar", systemImage: "sidebar.leading") {
+                        withAnimation {
+                            model.columnVisibility =
+                                model.columnVisibility == .detailOnly ? .all : .detailOnly
+                        }
+                    }
+                }
+                HeaderButton("Settings", systemImage: "gearshape") { model.showingSettings = true }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            SectionSwitcher()
+
+            HStack(spacing: 4) {
+                switch model.selectedTab {
+                case .actions:
+                    if model.isSyncing {
+                        ProgressView().frame(width: 44, height: 44)
+                    } else {
+                        HeaderButton("Sync", systemImage: "arrow.triangle.2.circlepath") {
+                            Task { await model.sync() }
+                        }
+                        .disabled(model.engine == nil)
+                    }
+                case .chat:
+                    HeaderButton("New chat", systemImage: "square.and.pencil") {
+                        Task { await model.newChat() }
+                    }
+                    .disabled(model.engine == nil)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 52)
+        .background(.bar)
+    }
+}
+
+private struct HeaderButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    init(_ title: String, systemImage: String, action: @escaping () -> Void) {
+        self.title = title
+        self.systemImage = systemImage
+        self.action = action
+    }
+
+    var body: some View {
+        Button(title, systemImage: systemImage, action: action)
+            .labelStyle(.iconOnly)
+            .font(.title3)
+            .frame(width: 44, height: 44)
+            .contentShape(.rect)
+    }
+}
+
+/// Actions | Chat, icon-only.
 struct SectionSwitcher: View {
     @Environment(AppModel.self) private var model
 
@@ -50,37 +124,17 @@ struct SectionSwitcher: View {
     }
 }
 
-struct SettingsButton: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        Button("Settings", systemImage: "gearshape") { model.showingSettings = true }
-    }
-}
-
 struct ActionsView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         @Bindable var model = model
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $model.columnVisibility) {
             ActionListView(selection: $model.actionSelection)
                 .navigationTitle("Actions")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { SettingsButton() }
-                    ToolbarItem(placement: .principal) { SectionSwitcher() }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        if model.isSyncing {
-                            ProgressView()
-                        } else {
-                            Button("Sync", systemImage: "arrow.triangle.2.circlepath") {
-                                Task { await model.sync() }
-                            }
-                            .disabled(model.engine == nil)
-                        }
-                    }
-                }
+                .toolbar(.hidden, for: .navigationBar)
+                // The header bar has the sidebar toggle.
+                .toolbar(removing: .sidebarToggle)
         } detail: {
             if let id = model.actionSelection, let action = model.actions.first(where: { $0.id == id }) {
                 ActionDetailView(action: action)

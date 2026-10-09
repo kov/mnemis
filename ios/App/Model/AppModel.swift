@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 
 enum AppTab: Hashable {
     case actions
@@ -23,6 +24,8 @@ final class AppModel {
     var selectedTab: AppTab = .actions
     /// Kept here rather than in the views so switching sections keeps them.
     var actionSelection: ActionDto.ID?
+    /// Shared by both sections' split views, driven by the header's toggle.
+    var columnVisibility: NavigationSplitViewVisibility = .all
     var chatSelection: ChatDto.ID?
     var showingSettings = false
 

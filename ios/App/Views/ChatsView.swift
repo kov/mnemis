@@ -5,7 +5,7 @@ struct ChatsView: View {
 
     var body: some View {
         @Bindable var model = model
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $model.columnVisibility) {
             List(selection: $model.chatSelection) {
                 ForEach(model.chats) { chat in
                     ChatRow(chat: chat)
@@ -27,17 +27,8 @@ struct ChatsView: View {
                 }
             }
             .navigationTitle("Chat")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { SettingsButton() }
-                ToolbarItem(placement: .principal) { SectionSwitcher() }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("New chat", systemImage: "square.and.pencil") {
-                        Task { await model.newChat() }
-                    }
-                    .disabled(model.engine == nil)
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
+            .toolbar(removing: .sidebarToggle)
             .refreshable { await model.refreshChats() }
         } detail: {
             if let id = model.chatSelection {
