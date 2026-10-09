@@ -1,15 +1,17 @@
 # mnemis project notes
 
-Tauri desktop app (in progress). Ingests email/chat, extracts action items via a local LLM (omlx), tracks them, syncs to calendar. See the auto-memory at `/home/kov/.claude/projects/-home-kov-Projects-mnemis/memory/` for design rationale and gotchas — don't re-derive them.
+Tauri desktop app plus a native iOS app (both in progress). Ingests email/chat, extracts action items via an LLM (omlx or Claude), tracks them, syncs to calendar. See the auto-memory (`~/.claude/projects/<this project>/memory/`) for design rationale and gotchas — don't re-derive them.
 
 ## Workspace layout
 
 ```
 mnemis/
-  Cargo.toml          # workspace: engine, app, cli, types
+  Cargo.toml          # workspace: engine, app, cli, types, ffi
   engine/             # mnemis-engine (lib): db, sources, ingest, embed, extract, queries
   types/              # mnemis-types (lib): pure-serde DTOs shared with the wasm frontend
   cli/                # mnemis-cli (bin): one-shot ops against the same SQLite
+  ffi/                # mnemis-ffi (lib): uniffi bindings of the engine for the iOS app
+  ios/                # SwiftUI app (iPhone + iPad); only the engine is shared
   app/                # mnemis-app (Tauri bin) + ui-probe (debug bin)
     src/main.rs       # Tauri setup + commands
     tauri.conf.json
@@ -46,6 +48,21 @@ MNEMIS_DB_PATH=/path/to/mnemis.db ./target/debug/mnemis-app
 # MNEMIS_CONFIG_PATH=/path/to/config.toml works the same way for the
 # config file (otherwise defaults to ~/.config/mnemis/config.toml).
 ```
+
+### iOS
+
+```
+cargo xtask build-ios                # engine xcframework + Swift bindings → ios/build/
+xcodebuild -project ios/Mnemis.xcodeproj -scheme Mnemis \
+    -destination 'platform=iOS Simulator,name=iPhone 17' build
+```
+
+Re-run `build-ios` whenever the engine or `ffi/` changes; Xcode won't build
+without `ios/build/`. The engine is built without its `local-embed` feature
+(ONNX Runtime has no iOS binaries), so search is keyword-only there. `ios/App/`
+is a file-system-synchronised group: new Swift files need no pbxproj edit.
+Data (SQLite, `config.toml`) lives in the app's Application Support; secrets in
+the iOS Keychain via the engine's `secrets` module.
 
 ### Linux: install to `~/.local`
 
@@ -150,6 +167,7 @@ The harness uses process groups (`setsid` at spawn, `kill(-pgid, ...)` at drop) 
 
 - `.githooks/pre-commit` runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`, plus separate `--manifest-path app/ui/Cargo.toml` fmt + clippy passes for the standalone UI workspace (clippy on `wasm32-unknown-unknown`, so `rustup target add wasm32-unknown-unknown` is required). Active via `git config core.hooksPath .githooks`.
 - For clippy with the `ui-probe` feature: `cargo clippy -p mnemis-app --bin ui-probe --features ui-probe -- -D warnings` (the feature is mnemis-app-only).
+- The hook isn't enabled in every clone; run its checks by hand if `git config core.hooksPath` is empty. For the iOS-only code paths also run `cargo clippy -p mnemis-engine -p mnemis-ffi --no-default-features --target aarch64-apple-ios -- -D warnings`.
 - `app/ui` is a standalone workspace — its deps don't pollute the host build graph. Don't `cd` into it casually; if you do, `cd -` afterwards or use `--manifest-path`. Format it with `cargo fmt --manifest-path app/ui/Cargo.toml`.
 
 ## Platform notes
