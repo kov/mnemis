@@ -43,10 +43,10 @@ struct ChatView: View {
             .frame(maxWidth: 760)
             .frame(maxWidth: .infinity)
         }
-        .background(Color(.systemGroupedBackground))
         .defaultScrollAnchor(.bottom)
         .scrollDismissesKeyboard(.interactively)
-        .safeAreaInset(edge: .bottom) { composer }
+        // A safe-area bar, unlike an inset, gets the scroll edge effect.
+        .safeAreaBar(edge: .bottom) { composer }
         .navigationTitle(model.chats.first(where: { $0.id == session.chatId })?.title ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .task {

@@ -187,6 +187,11 @@ final class AppModel {
         }
     }
 
+    func action(_ id: ActionDto.ID?) -> ActionDto? {
+        guard let id else { return nil }
+        return actions.first { $0.id == id }
+    }
+
     func report(_ error: Error) {
         if case let MnemisError.Failed(message) = error {
             errorMessage = message

@@ -2,21 +2,21 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         @Bindable var model = model
-        // The system tab bar: a floating glass bar at the top on iPad (with
-        // the draggable selection), at the bottom on iPhone. Each section's
-        // controls sit in its own navigation bars, beside it.
-        TabView(selection: $model.selectedTab) {
-            Tab("Actions", systemImage: "checklist", value: AppTab.actions) {
-                ActionsView()
-            }
-            Tab("Chat", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
-                ChatsView()
+        // The iOS 26 shapes: on iPad a three-column split, like Mail, with
+        // the sections in the floating sidebar; on iPhone a tab bar with a
+        // navigation stack per section. A top tab bar over a split view is
+        // what Apple advises against: the two fight over the top edge.
+        Group {
+            if sizeClass == .compact {
+                CompactLayout()
+            } else {
+                SplitLayout()
             }
         }
-        .tabViewStyle(.tabBarOnly)
         .onOpenURL { model.open($0) }
         .sheet(item: $model.pendingDismissal) { action in
             DismissReasonSheet(action: action)
@@ -39,87 +39,150 @@ struct ContentView: View {
     }
 }
 
-/// Settings (and the "Learning…" note) at the window's leading edge, on the
-/// list column.
-struct LeadingControls: ToolbarContent {
+/// iPad: sections | list | detail.
+private struct SplitLayout: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        NavigationSplitView(columnVisibility: $model.columnVisibility) {
+            List(selection: Binding(
+                get: { Optional(model.selectedTab) },
+                set: { if let tab = $0 { model.selectedTab = tab } }
+            )) {
+                Label("Actions", systemImage: "checklist")
+                    .badge(model.actions.count)
+                    .tag(AppTab.actions)
+                Label("Chats", systemImage: "bubble.left.and.text.bubble.right")
+                    .tag(AppTab.chat)
+            }
+            .navigationTitle("mnemis")
+            .toolbar { SettingsItem() }
+            .safeAreaInset(edge: .bottom) { LearningNote().padding() }
+        } content: {
+            switch model.selectedTab {
+            case .actions:
+                ActionListView(selection: $model.actionSelection)
+                    .navigationTitle("Actions")
+                    .toolbar { SyncItem() }
+            case .chat:
+                ChatListView(selection: $model.chatSelection)
+                    .navigationTitle("Chats")
+                    .toolbar { NewChatItem() }
+            }
+        } detail: {
+            switch model.selectedTab {
+            case .actions:
+                if let action = model.action(model.actionSelection) {
+                    ActionDetailView(action: action)
+                } else {
+                    ContentUnavailableView("No action selected", systemImage: "checklist")
+                }
+            case .chat:
+                if let id = model.chatSelection {
+                    ChatView(chatId: id).id(id)
+                } else {
+                    ContentUnavailableView("No chat selected", systemImage: "bubble.left.and.text.bubble.right")
+                }
+            }
+        }
+    }
+}
+
+/// iPhone: a tab per section, each a list that pushes its detail.
+private struct CompactLayout: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        TabView(selection: $model.selectedTab) {
+            Tab("Actions", systemImage: "checklist", value: AppTab.actions) {
+                NavigationStack {
+                    ActionListView(selection: $model.actionSelection)
+                        .navigationTitle("Actions")
+                        .toolbar {
+                            SettingsItem()
+                            SyncItem()
+                        }
+                        .navigationDestination(item: $model.actionSelection) { id in
+                            if let action = model.action(id) {
+                                ActionDetailView(action: action)
+                            }
+                        }
+                }
+            }
+            .badge(model.actions.count)
+            Tab("Chats", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
+                NavigationStack {
+                    ChatListView(selection: $model.chatSelection)
+                        .navigationTitle("Chats")
+                        .toolbar {
+                            SettingsItem()
+                            NewChatItem()
+                        }
+                        .navigationDestination(item: $model.chatSelection) { id in
+                            // The composer takes the bottom edge, as in Messages.
+                            ChatView(chatId: id).id(id)
+                                .toolbar(.hidden, for: .tabBar)
+                        }
+                }
+            }
+        }
+        .tabBarMinimizeBehavior(.onScrollDown)
+    }
+}
+
+private struct SettingsItem: ToolbarContent {
     @Environment(AppModel.self) private var model
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
             Button("Settings", systemImage: "gearshape") { model.showingSettings = true }
         }
-        if model.isLearning {
-            ToolbarItem(placement: .topBarLeading) {
-                Label("Learning…", systemImage: "brain")
-                    .labelStyle(.titleAndIcon)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .symbolEffect(.pulse)
-            }
-        }
     }
 }
 
-/// A section's own actions sit at the window's trailing edge: on the detail
-/// column side by side, on the list when the columns collapse (iPhone). The
-/// size class is read outside the split view, since its list column always
-/// reports compact.
-extension View {
-    func trailingControls(
-        when shown: Bool,
-        @ViewBuilder _ items: @escaping () -> some View
-    ) -> some View {
-        toolbar {
-            if shown {
-                ToolbarItem(placement: .topBarTrailing) { items() }
-            }
-        }
-    }
-
-    /// The list column: no title (the tab bar names the section) and the
-    /// app-wide controls.
-    func listColumnChrome(title: String) -> some View {
-        navigationTitle(title)
-            .toolbar(removing: .title)
-            .toolbar { LeadingControls() }
-    }
-}
-
-struct ActionsView: View {
+private struct SyncItem: ToolbarContent {
     @Environment(AppModel.self) private var model
-    @Environment(\.horizontalSizeClass) private var sizeClass
 
-    var body: some View {
-        @Bindable var model = model
-        let compact = sizeClass == .compact
-        NavigationSplitView(columnVisibility: $model.columnVisibility) {
-            ActionListView(selection: $model.actionSelection)
-                .listColumnChrome(title: "Actions")
-                .trailingControls(when: compact) { SyncButton() }
-        } detail: {
-            Group {
-                if let id = model.actionSelection, let action = model.actions.first(where: { $0.id == id }) {
-                    ActionDetailView(action: action)
-                } else {
-                    ContentUnavailableView("No action selected", systemImage: "checklist")
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            if model.isSyncing {
+                ProgressView()
+            } else {
+                Button("Sync", systemImage: "arrow.triangle.2.circlepath") {
+                    Task { await model.sync() }
                 }
+                .disabled(model.engine == nil)
             }
-            .trailingControls(when: !compact) { SyncButton() }
         }
     }
 }
 
-private struct SyncButton: View {
+private struct NewChatItem: ToolbarContent {
     @Environment(AppModel.self) private var model
 
-    var body: some View {
-        if model.isSyncing {
-            ProgressView()
-        } else {
-            Button("Sync", systemImage: "arrow.triangle.2.circlepath") {
-                Task { await model.sync() }
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("New chat", systemImage: "square.and.pencil") {
+                Task { await model.newChat() }
             }
             .disabled(model.engine == nil)
+        }
+    }
+}
+
+/// Shown while a dismissal reason is being merged into memory.
+struct LearningNote: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if model.isLearning {
+            Label("Learning from your feedback…", systemImage: "brain")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .symbolEffect(.pulse)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -130,6 +193,9 @@ struct ActionListView: View {
 
     var body: some View {
         List(selection: $selection) {
+            if model.isLearning {
+                LearningNote()
+            }
             if model.needsSetup {
                 Section {
                     Label(

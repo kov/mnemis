@@ -1,58 +1,31 @@
 import SwiftUI
 
-struct ChatsView: View {
+struct ChatListView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Binding var selection: ChatDto.ID?
 
     var body: some View {
-        @Bindable var model = model
-        let compact = sizeClass == .compact
-        NavigationSplitView(columnVisibility: $model.columnVisibility) {
-            List(selection: $model.chatSelection) {
-                ForEach(model.chats) { chat in
-                    ChatRow(chat: chat)
-                        .tag(chat.id)
-                        .swipeActions {
-                            Button("Delete", systemImage: "trash", role: .destructive) {
-                                Task { await model.deleteChat(chat) }
-                            }
+        List(selection: $selection) {
+            ForEach(model.chats) { chat in
+                ChatRow(chat: chat)
+                    .tag(chat.id)
+                    .swipeActions {
+                        Button("Delete", systemImage: "trash", role: .destructive) {
+                            Task { await model.deleteChat(chat) }
                         }
-                }
+                    }
             }
-            .overlay {
-                if model.chats.isEmpty {
-                    ContentUnavailableView(
-                        "No chats",
-                        systemImage: "bubble.left.and.text.bubble.right",
-                        description: Text("Ask about your mail and actions, or use “Talk about this” on an action.")
-                    )
-                }
-            }
-            .listColumnChrome(title: "Chat")
-            .trailingControls(when: compact) { NewChatButton() }
-            .refreshable { await model.refreshChats() }
-        } detail: {
-            Group {
-                if let id = model.chatSelection {
-                    ChatView(chatId: id)
-                        .id(id)
-                } else {
-                    ContentUnavailableView("No chat selected", systemImage: "bubble.left.and.text.bubble.right")
-                }
-            }
-            .trailingControls(when: !compact) { NewChatButton() }
         }
-    }
-}
-
-private struct NewChatButton: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        Button("New chat", systemImage: "square.and.pencil") {
-            Task { await model.newChat() }
+        .overlay {
+            if model.chats.isEmpty {
+                ContentUnavailableView(
+                    "No chats",
+                    systemImage: "bubble.left.and.text.bubble.right",
+                    description: Text("Ask about your mail and actions, or use “Talk about this” on an action.")
+                )
+            }
         }
-        .disabled(model.engine == nil)
+        .refreshable { await model.refreshChats() }
     }
 }
 
