@@ -99,6 +99,7 @@ private struct ActionsStack: View {
         NavigationStack {
             ActionListView(selection: $model.actionSelection)
                 .navigationTitle("Actions")
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if showsSettings { SettingsItem() }
                     SyncItem()
@@ -122,6 +123,7 @@ private struct ChatsStack: View {
         NavigationStack {
             ChatListView(selection: $model.chatSelection)
                 .navigationTitle("Chats")
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if showsSettings { SettingsItem() }
                     NewChatItem()
