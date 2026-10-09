@@ -140,6 +140,10 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "expected a high-confidence badge in the DOM. html: {body_html}"
     );
     assert!(
+        body_html.contains("data-field=\"email-date\""),
+        "expected the source email's date on the action. html: {body_html}"
+    );
+    assert!(
         !body_text.contains("background reading"),
         "the low-confidence action should be hidden behind the revealer. \
          got text: {body_text}"

@@ -224,6 +224,10 @@ pub struct ActionDto {
     pub created_at: i64,
     /// Unix seconds; `None` means no due date.
     pub due_at: Option<i64>,
+    /// Unix seconds: when the action's primary evidence message (the email it
+    /// came from) was sent. `None` when it has no primary evidence.
+    #[serde(default)]
+    pub source_posted_at: Option<i64>,
     /// Number of evidence messages linked.
     pub evidence_count: i64,
     /// Channel name (e.g. `INBOX`) for context.

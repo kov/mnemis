@@ -25,7 +25,7 @@ pub struct ActionFilter {
 pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec<ActionDto>> {
     let sql = if filter.include_resolved {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -35,7 +35,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          ORDER BY a.extracted_at DESC"
     } else {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -57,6 +57,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         String,
         String,
         Option<String>,
+        Option<i64>,
     )> = sqlx::query_as(sql)
         .fetch_all(pool)
         .await
@@ -74,6 +75,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         channel_name,
         source_name,
         sync_status,
+        source_posted_at,
     ) in rows
     {
         let evidence_count: (i64,) =
@@ -90,6 +92,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
             status: ActionStatus::parse(&status).unwrap_or(ActionStatus::Pending),
             created_at,
             due_at,
+            source_posted_at,
             evidence_count: evidence_count.0,
             channel_name: if channel_name.is_empty() {
                 None
@@ -430,6 +433,59 @@ mod tests {
         )
         .await?;
         assert_eq!(all.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_actions_carries_the_source_email_date() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let ctx = crate::test_util::seed_minimal(&pool).await?;
+        crate::test_util::seed_messages(
+            &pool,
+            ctx.source_id,
+            ctx.channel_id,
+            &[crate::test_util::SeedMessage {
+                external_id: "m1",
+                author_email: "ana@example.com",
+                author_name: "Ana",
+                subject: "Renewal",
+                body: "Please renew the cert.",
+                recipients: &[],
+            }],
+        )
+        .await?;
+        let (msg_id, posted_at): (i64, i64) =
+            sqlx::query_as("SELECT id, posted_at FROM messages WHERE external_id = 'm1'")
+                .fetch_one(&pool)
+                .await?;
+        let now = Utc::now().timestamp();
+        for (title, evidence) in [("with source", Some(msg_id)), ("without source", None)] {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO actions (title, confidence, status, extracted_at) \
+                 VALUES (?, 'high', 'pending', ?) RETURNING id",
+            )
+            .bind(title)
+            .bind(now)
+            .fetch_one(&pool)
+            .await?;
+            if let Some(m) = evidence {
+                sqlx::query(
+                    "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+                     VALUES (?, ?, 'source', 1)",
+                )
+                .bind(id)
+                .bind(m)
+                .execute(&pool)
+                .await?;
+            }
+        }
+
+        let rows = list_actions(&pool, ActionFilter::default()).await?;
+        let by_title = |t: &str| rows.iter().find(|a| a.title == t).unwrap().source_posted_at;
+        assert_eq!(by_title("with source"), Some(posted_at));
+        assert_eq!(by_title("without source"), None);
         Ok(())
     }
 

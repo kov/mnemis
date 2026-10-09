@@ -295,6 +295,9 @@ fn ActionListRow(action: ActionDto, selected: RwSignal<Option<i64>>) -> impl Int
         .unwrap_or_else(|| "?".to_string());
     let evidence = action.evidence_count;
     let due_label = action.due_at.map(unix_to_short_date);
+    let sent = action
+        .source_posted_at
+        .map(|t| (email_short_date(t), email_full_date(t)));
     let title = action.title.clone();
 
     let is_selected = move || selected.get() == Some(id);
@@ -307,6 +310,11 @@ fn ActionListRow(action: ActionDto, selected: RwSignal<Option<i64>>) -> impl Int
                 <div class="a-meta">{format!("{source} · {channel} · {evidence} evidence")}</div>
                 <div class="a-tags">
                     <span class=conf_class>{conf_label}</span>
+                    {sent.map(|(short, full)| view! {
+                        <span class="pill" data-field="email-date" title=format!("Email sent {full}")>
+                            {format!("\u{2709} {short}")}
+                        </span>
+                    })}
                     {due_label.map(|d| view! { <span class="pill">{format!("\u{23F0} {d}")}</span> })}
                 </div>
             </span>
@@ -346,6 +354,39 @@ fn unix_to_short_date(secs: i64) -> String {
         .copied()
         .unwrap_or("");
     format!("{name} {day}")
+}
+
+const WEEKDAY_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+fn local_date(secs: i64) -> js_sys::Date {
+    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0))
+}
+
+/// An email's date in local time for compact rows: "Oct 3", or "Oct 3, 2025"
+/// when it isn't from this year.
+fn email_short_date(secs: i64) -> String {
+    let d = local_date(secs);
+    let month = MONTH_NAMES[d.get_month() as usize % 12];
+    let day = d.get_date();
+    if d.get_full_year() == js_sys::Date::new_0().get_full_year() {
+        format!("{month} {day}")
+    } else {
+        format!("{month} {day}, {}", d.get_full_year())
+    }
+}
+
+/// An email's full local timestamp: "Fri, Oct 3, 2025, 14:05".
+fn email_full_date(secs: i64) -> String {
+    let d = local_date(secs);
+    format!(
+        "{}, {} {}, {}, {:02}:{:02}",
+        WEEKDAY_NAMES[d.get_day() as usize % 7],
+        MONTH_NAMES[d.get_month() as usize % 12],
+        d.get_date(),
+        d.get_full_year(),
+        d.get_hours(),
+        d.get_minutes()
+    )
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -510,6 +551,7 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
         .unwrap_or_else(|| "?".to_string());
     let title = action.title.clone();
     let details = action.details.clone();
+    let sent = action.source_posted_at.map(email_full_date);
     let id = action.id;
     let current_status = action.status;
 
@@ -577,6 +619,7 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
             </div>
             {details.map(|d| view! { <div class="action-details">{d}</div> })}
             <div class="action-meta">
+                {sent.map(|s| view! { <span data-field="email-date">{format!("Email sent {s} · ")}</span> })}
                 {format!("{source} · {channel} · {evidence} evidence")}
             </div>
             <div class="action-actions">
