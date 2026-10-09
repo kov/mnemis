@@ -552,6 +552,7 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
     let title = action.title.clone();
     let details = action.details.clone();
     let sent = action.source_posted_at.map(email_full_date);
+    let source_message_id = action.source_message_id;
     let id = action.id;
     let current_status = action.status;
 
@@ -622,6 +623,7 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
                 {sent.map(|s| view! { <span data-field="email-date">{format!("Email sent {s} · ")}</span> })}
                 {format!("{source} · {channel} · {evidence} evidence")}
             </div>
+            {source_message_id.map(|message_id| view! { <SourceEmail message_id=message_id /> })}
             <div class="action-actions">
                 {show_button(current_status, ActionStatus::Claimed).then(|| view! {
                     <button class="btn btn-secondary" on:click=move |_| trigger_claim(ActionStatus::Claimed, None)>"Claim"</button>
@@ -671,6 +673,50 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
             </Show>
             <ActionInlineChat action_id=id />
         </div>
+    }
+}
+
+/// Collapsed by default: the email an action was extracted from, fetched only
+/// when first revealed.
+#[component]
+fn SourceEmail(message_id: i64) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let email = LocalResource::new(move || async move {
+        if open.get() {
+            fetch_message(message_id).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    });
+    view! {
+        <div class="revealer" data-field="source-email-toggle" on:click=move |_| open.update(|v| *v = !*v)>
+            {move || if open.get() { "▾ Hide original email" } else { "▸ Show original email" }}
+        </div>
+        <Show when=move || open.get() fallback=|| view! { <></> }>
+            <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
+                {move || email.get().map(|res| match res {
+                    Ok(Some(m)) => {
+                        let from = match (m.author_display.clone(), m.author_addr.clone()) {
+                            (Some(n), Some(a)) => format!("{n} <{a}>"),
+                            (n, a) => n.or(a).unwrap_or_else(|| "?".to_string()),
+                        };
+                        let subject = m.subject.clone().unwrap_or_else(|| "(no subject)".to_string());
+                        view! {
+                            <div class="source-email" data-field="source-email">
+                                <div class="source-email-head">
+                                    <div><strong>{from}</strong></div>
+                                    <div class="source-email-when">{email_full_date(m.posted_at)}</div>
+                                    <div class="source-email-subject">{subject}</div>
+                                </div>
+                                <div class="read-body">{m.body.clone()}</div>
+                            </div>
+                        }.into_any()
+                    }
+                    Ok(None) => ().into_any(),
+                    Err(e) => view! { <div class="error">{format!("Couldn't load the email: {e}")}</div> }.into_any(),
+                })}
+            </Suspense>
+        </Show>
     }
 }
 

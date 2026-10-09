@@ -25,7 +25,7 @@ pub struct ActionFilter {
 pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec<ActionDto>> {
     let sql = if filter.include_resolved {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -35,7 +35,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          ORDER BY a.extracted_at DESC"
     } else {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -58,6 +58,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         String,
         Option<String>,
         Option<i64>,
+        Option<i64>,
     )> = sqlx::query_as(sql)
         .fetch_all(pool)
         .await
@@ -76,6 +77,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         source_name,
         sync_status,
         source_posted_at,
+        source_message_id,
     ) in rows
     {
         let evidence_count: (i64,) =
@@ -93,6 +95,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
             created_at,
             due_at,
             source_posted_at,
+            source_message_id,
             evidence_count: evidence_count.0,
             channel_name: if channel_name.is_empty() {
                 None
@@ -483,9 +486,11 @@ mod tests {
         }
 
         let rows = list_actions(&pool, ActionFilter::default()).await?;
-        let by_title = |t: &str| rows.iter().find(|a| a.title == t).unwrap().source_posted_at;
-        assert_eq!(by_title("with source"), Some(posted_at));
-        assert_eq!(by_title("without source"), None);
+        let by_title = |t: &str| rows.iter().find(|a| a.title == t).unwrap();
+        assert_eq!(by_title("with source").source_posted_at, Some(posted_at));
+        assert_eq!(by_title("with source").source_message_id, Some(msg_id));
+        assert_eq!(by_title("without source").source_posted_at, None);
+        assert_eq!(by_title("without source").source_message_id, None);
         Ok(())
     }
 

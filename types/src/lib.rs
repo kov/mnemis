@@ -228,6 +228,9 @@ pub struct ActionDto {
     /// came from) was sent. `None` when it has no primary evidence.
     #[serde(default)]
     pub source_posted_at: Option<i64>,
+    /// Internal id of that same message, for showing the original email.
+    #[serde(default)]
+    pub source_message_id: Option<i64>,
     /// Number of evidence messages linked.
     pub evidence_count: i64,
     /// Channel name (e.g. `INBOX`) for context.

@@ -153,6 +153,33 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "expected the low-confidence revealer to be visible. got text: {body_text}"
     );
 
+    // 6b. The original email is collapsed until revealed, then shows the
+    //     seeded body.
+    assert!(
+        !body_text.contains("take a pass by eod"),
+        "the source email should start collapsed. got text: {body_text}"
+    );
+    client
+        .find(Locator::Css("[data-field='source-email-toggle']"))
+        .await
+        .context("source email revealer")?
+        .click()
+        .await?;
+    let email = client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("[data-field='source-email']"))
+        .await
+        .context("waiting for the revealed source email")?
+        .text()
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        email.contains("take a pass by eod") && email.contains("q3 roadmap draft"),
+        "revealed email should show its subject and body. got: {email}"
+    );
+
     // 6a. Click "Done" on the visible high-confidence action; assert the
     //     list refreshes and the action is no longer rendered.
     let click_done = client
