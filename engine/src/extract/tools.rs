@@ -572,8 +572,45 @@ async fn semantic_hits(
     .context("vector search failed")
 }
 
+/// A list of message ids as the model sent it. The schema asks for an array,
+/// but models sometimes send that array JSON-encoded inside a string, or a bare
+/// id; read each as the list it means rather than failing the tool call.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IdList {
+    List(Vec<String>),
+    One(String),
+}
+
+impl IdList {
+    fn into_ids(self) -> Vec<String> {
+        match self {
+            IdList::List(ids) => ids,
+            IdList::One(s) => match serde_json::from_str::<Vec<String>>(s.trim()) {
+                Ok(ids) => ids,
+                Err(_) => vec![s],
+            },
+        }
+    }
+}
+
+fn id_list<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    IdList::deserialize(d).map(IdList::into_ids)
+}
+
+fn opt_id_list<'de, D>(d: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<IdList>::deserialize(d).map(|ids| ids.map(IdList::into_ids))
+}
+
 #[derive(Deserialize)]
 struct FetchArgs {
+    #[serde(deserialize_with = "id_list")]
     external_ids: Vec<String>,
 }
 
@@ -803,6 +840,7 @@ struct RecordArgs {
     rationale: String,
     #[serde(default)]
     due_at: Option<String>,
+    #[serde(deserialize_with = "id_list")]
     evidence_external_ids: Vec<String>,
 }
 
@@ -952,7 +990,7 @@ struct UpdateArgs {
     rationale: Option<String>,
     #[serde(default)]
     due_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_id_list")]
     evidence_external_ids: Option<Vec<String>>,
 }
 
@@ -1126,6 +1164,7 @@ struct ResolveArgs {
     status: String,
     confidence: String,
     rationale: String,
+    #[serde(deserialize_with = "id_list")]
     evidence_external_ids: Vec<String>,
 }
 
@@ -1471,6 +1510,39 @@ mod tests {
                 .contains("full body of A")
         );
         assert_eq!(v["not_found"][0], "msg-missing");
+    }
+
+    /// Models sometimes send the id list as a JSON-encoded string (seen from
+    /// Claude in chat) or a bare id; both must read as the list they mean.
+    #[tokio::test]
+    async fn fetch_messages_accepts_ids_encoded_as_a_string() {
+        let id = "20261009150415@no_reply.support@FFFF\"@epcms1p4";
+        let (_tmp, pool, scope) = db_with_messages(&[(id, "the full body")]).await;
+        for ids in [json!(serde_json::to_string(&[id]).unwrap()), json!(id)] {
+            let mut budget = FetchBudget::unlimited();
+            let args = json!({ "external_ids": ids }).to_string();
+            let out = fetch_messages(&pool, scope, &mut budget, &args)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["messages"][0]["external_id"], id, "{args}");
+        }
+    }
+
+    #[test]
+    fn optional_id_lists_still_take_null_and_absence() {
+        for args in [
+            json!({ "action_id": "A-1" }),
+            json!({ "action_id": "A-1", "evidence_external_ids": null }),
+        ] {
+            let parsed: UpdateArgs = serde_json::from_value(args).unwrap();
+            assert!(parsed.evidence_external_ids.is_none());
+        }
+        let parsed: UpdateArgs = serde_json::from_value(
+            json!({ "action_id": "A-1", "evidence_external_ids": "[\"m\"]" }),
+        )
+        .unwrap();
+        assert_eq!(parsed.evidence_external_ids, Some(vec!["m".to_string()]));
     }
 
     #[tokio::test]
