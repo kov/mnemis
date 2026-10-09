@@ -82,10 +82,11 @@ pub async fn sync_caldav(pool: &SqlitePool, backend: &dyn TaskBackend) -> Result
     let remote_by_uid: HashMap<&str, &RemoteTask> =
         remote.iter().map(|t| (t.uid.as_str(), t)).collect();
     let local = load_local(pool).await?;
+    let install = crate::settings::install_id(pool).await?;
 
     let mut summary = SyncSummary::default();
     for row in &local {
-        match reconcile_one(pool, backend, row, &remote_by_uid).await {
+        match reconcile_one(pool, backend, row, &remote_by_uid, &install).await {
             Ok(Outcome::Created) => summary.created += 1,
             Ok(Outcome::Pushed) => summary.pushed += 1,
             Ok(Outcome::Pulled) => summary.pulled += 1,
@@ -103,6 +104,7 @@ async fn reconcile_one(
     backend: &dyn TaskBackend,
     row: &LocalRow,
     remote_by_uid: &HashMap<&str, &RemoteTask>,
+    install: &str,
 ) -> Result<Outcome> {
     match &row.uid {
         Some(uid) => match remote_by_uid.get(uid.as_str()) {
@@ -156,7 +158,10 @@ async fn reconcile_one(
         },
         None => {
             if row.due_at.is_some() && !is_terminal(row.status) {
-                let uid = format!("mnemis-{}@mnemis", row.id);
+                // Row ids repeat across databases; the install id keeps two
+                // installs writing to one calendar from claiming each other's
+                // events. Already-linked actions keep the UID they were given.
+                let uid = format!("mnemis-{install}-{}@mnemis", row.id);
                 let write = task_write(row, &uid);
                 let created = backend.create_task(&write).await?;
                 link_created(pool, row.id, &uid, &created.href, &created.etag).await?;
@@ -668,8 +673,38 @@ mod tests {
                 .bind(id)
                 .fetch_one(&pool)
                 .await?;
-        assert_eq!(uid, Some(format!("mnemis-{id}@mnemis")));
+        let install = crate::settings::install_id(&pool).await?;
+        assert_eq!(uid, Some(format!("mnemis-{install}-{id}@mnemis")));
         assert_eq!(sync_status.as_deref(), Some("synced"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn separate_installs_give_the_same_action_id_different_uids() -> Result<()> {
+        let mut uids = Vec::new();
+        for _ in 0..2 {
+            let (_tmp, pool) = pool().await?;
+            let id = insert_action(
+                &pool,
+                "Call plumber",
+                "r",
+                "pending",
+                Some(500),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            sync_caldav(&pool, &MockBackend::default()).await?;
+            let (uid,): (Option<String>,) =
+                sqlx::query_as("SELECT external_calendar_uid FROM actions WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await?;
+            uids.push(uid.expect("action was linked"));
+        }
+        assert_ne!(uids[0], uids[1]);
         Ok(())
     }
 

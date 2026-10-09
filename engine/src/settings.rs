@@ -175,6 +175,27 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()
     Ok(())
 }
 
+const INSTALL_ID_KEY: &str = "install/id";
+
+/// A random id for this database, generated on first use and stable after.
+/// Anything this install publishes to a shared namespace (calendar event UIDs)
+/// carries it, so the desktop and a phone writing to one calendar never claim
+/// each other's items — row ids alone repeat across databases.
+pub async fn install_id(pool: &SqlitePool) -> Result<String> {
+    let fresh = serde_json::to_string(&uuid::Uuid::new_v4().simple().to_string())?;
+    // INSERT OR IGNORE then read back, so concurrent first calls agree on one id.
+    sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
+        .bind(INSTALL_ID_KEY)
+        .bind(&fresh)
+        .execute(pool)
+        .await
+        .context("writing install id")?;
+    let stored = get_setting(pool, INSTALL_ID_KEY)
+        .await?
+        .context("install id missing after insert")?;
+    serde_json::from_str(&stored).context("parsing install id")
+}
+
 const CHAT_SHOW_REASONING_KEY: &str = "chat/show_reasoning";
 
 /// Whether the chat view shows the model's reasoning. Defaults to **on** when

@@ -134,7 +134,12 @@ pub fn traces_dir_for(db_path: &Path) -> PathBuf {
 /// needed; if the file didn't exist, an empty `[paths]` is omitted so the
 /// resulting file is the minimum we can read back.
 pub fn save_llm(llm: &LlmSection) -> Result<()> {
-    let path = default_config_path();
+    save_llm_at(&default_config_path(), llm)
+}
+
+/// [`save_llm`] to an explicit file — for hosts (the iOS app) whose config
+/// lives in their own container rather than at [`default_config_path`].
+pub fn save_llm_at(path: &Path, llm: &LlmSection) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
@@ -144,7 +149,7 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
     // settings form never touches. Without this, saving from the UI would
     // silently wipe a hand-edited max_context_tokens.
     let (paths, existing_max_ctx, existing_timeout, existing_idle, existing_thinking) =
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(path) {
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(c) => (
                     c.paths,
@@ -174,7 +179,7 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
         paths,
     };
     let text = toml::to_string_pretty(&cfg).context("serializing config")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

@@ -3,6 +3,13 @@ name = "mnemis-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["local-embed"]
+# In-process embeddings via fastembed / ONNX Runtime. ORT ships no prebuilt
+# binaries for iOS, so the mobile bindings build without it and supply their
+# own `Embedder`.
+local-embed = ["dep:fastembed"]
+
 [dependencies]
 mnemis-types = { path = "../types" }
 anyhow = "1.0.102"
@@ -30,14 +37,15 @@ toml = "1.1.2"
 base64 = "0.22.1"
 icalendar = "0.17.10"
 roxmltree = "0.21.1"
+uuid = { version = "1.27.0", features = ["v4"] }
 # In-process embeddings (ONNX Runtime). Defaults off: no image models, and
 # rustls for both the model download and the ORT binary fetch, matching reqwest.
-fastembed = { version = "7.1.1", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "7.1.1", optional = true, default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 
 # Secret storage is OS-keychain-backed, with a per-platform backend behind the
 # `secrets` module's async API. Kept target-specific so neither backend's deps
 # pollute the other's build graph.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
 secret-service = { version = "5.0.0", features = ["rt-tokio-crypto-rust"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -52,6 +60,11 @@ objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["alloc", "NSString", "NSError"] }
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["LAContext", "LAError", "block2"] }
 block2 = { version = "0.6", default-features = false, features = ["alloc"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# iOS apps only have the data-protection keychain, scoped to the app, so plain
+# generic passwords need neither the macOS opt-in nor a biometric gate.
+security-framework = "3.7.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

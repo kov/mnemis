@@ -12,6 +12,9 @@
 //!   password fallback. **Requires a signed `.app` bundle** with the matching
 //!   entitlement; running an unsigned binary will fail keychain calls with
 //!   `errSecMissingEntitlement (-34018)`.
+//! - **iOS:** the same Keychain Services calls. iOS only has the
+//!   data-protection keychain and scopes it to the app, so there is no opt-in
+//!   and no biometric gate.
 //! - **everything else (Linux):** the freedesktop Secret Service over D-Bus
 //!   (`secret-service`), with attributes `application=mnemis`, `ref=<reference>`.
 //!
@@ -23,13 +26,13 @@
 /// Service / application name under which every mnemis secret is filed.
 const APPLICATION: &str = "mnemis";
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub use secret_service_backend::{delete, fetch, store};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use keychain_backend::{delete, fetch, store};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 mod secret_service_backend {
     use super::APPLICATION;
     use anyhow::{Context, Result};
@@ -112,7 +115,7 @@ mod secret_service_backend {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod keychain_backend {
     use super::APPLICATION;
     use anyhow::{Context, Result};
@@ -126,11 +129,13 @@ mod keychain_backend {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
     fn options(reference: &str) -> PasswordOptions {
+        #[cfg_attr(target_os = "ios", allow(unused_mut))]
         let mut opts = PasswordOptions::new_generic_password(APPLICATION, reference);
         // Route the item into the data-protection keychain. The app's own
         // access group (from `com.apple.application-identifier`) is implicit,
         // so we don't set one explicitly — that keeps the Rust code free of
-        // any team-ID baked-in string.
+        // any team-ID baked-in string. iOS has no other keychain.
+        #[cfg(target_os = "macos")]
         opts.use_protected_keychain();
         opts
     }
@@ -138,6 +143,7 @@ mod keychain_backend {
     pub async fn store(reference: &str, password: &str) -> Result<()> {
         // Biometric gate sits outside the blocking task so it owns the
         // foreground UI thread; the keychain write then runs unattended.
+        #[cfg(target_os = "macos")]
         super::biometric::prompt(&format!("Save credentials for {reference} to mnemis")).await?;
 
         let reference = reference.to_string();
@@ -171,6 +177,7 @@ mod keychain_backend {
     /// Delete the secret stored under `reference`. A missing entry is not an
     /// error — the post-condition (no such secret) already holds.
     pub async fn delete(reference: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
         super::biometric::prompt(&format!("Remove credentials for {reference} from mnemis"))
             .await?;
 

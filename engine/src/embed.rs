@@ -1,9 +1,7 @@
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -47,115 +45,131 @@ pub(crate) fn query_embedder() -> Option<&'static dyn Embedder> {
     QUERY_EMBEDDER.get().map(|e| e.as_ref())
 }
 
-/// The model every vector table is built from. Changing it means re-embedding
-/// everything (vectors from different models aren't comparable) — ship a
-/// migration that clears the `*_vec` tables and re-queues their sources, like
-/// `0007_local_embeddings.sql`. The dimension must match the `float[N]` of
-/// those tables.
-///
-/// EmbeddingGemma-300M, 4-bit: multilingual (mail here is English and
-/// Portuguese), 768-dim, comfortably fast on CPU. Not the int8 `...300MQ`:
-/// that one is *dynamically* quantized, which fastembed warns makes vectors
-/// from separate calls incompatible — and the drain embeds one item per call.
-const MODEL: EmbeddingModel = EmbeddingModel::EmbeddingGemma300MQ4;
+#[cfg(feature = "local-embed")]
+pub use local::LocalEmbedder;
 
-/// Token cap per input. EmbeddingGemma handles 2048, but attention cost grows
-/// quadratically and the gist of an email is near the top.
-const MAX_LENGTH: usize = 1024;
+#[cfg(feature = "local-embed")]
+mod local {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
-/// EmbeddingGemma's retrieval prompts: stored items are documents, searches
-/// are queries.
-const DOCUMENT_PROMPT: &str = "title: none | text: ";
-const QUERY_PROMPT: &str = "task: search result | query: ";
+    use anyhow::{Context, Result, anyhow};
+    use async_trait::async_trait;
+    use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+    use tracing::info;
 
-/// In-process embedder backed by fastembed (ONNX Runtime on CPU). The model is
-/// downloaded on first use into `cache_dir` and loaded lazily, so constructing
-/// one is free and app startup never blocks on it.
-pub struct LocalEmbedder {
-    cache_dir: PathBuf,
-    model: Arc<Mutex<Option<TextEmbedding>>>,
-}
+    use super::Embedder;
 
-impl LocalEmbedder {
-    pub fn new(cache_dir: PathBuf) -> Self {
-        Self {
-            cache_dir,
-            model: Arc::new(Mutex::new(None)),
+    /// The model every vector table is built from. Changing it means re-embedding
+    /// everything (vectors from different models aren't comparable) — ship a
+    /// migration that clears the `*_vec` tables and re-queues their sources, like
+    /// `0007_local_embeddings.sql`. The dimension must match the `float[N]` of
+    /// those tables.
+    ///
+    /// EmbeddingGemma-300M, 4-bit: multilingual (mail here is English and
+    /// Portuguese), 768-dim, comfortably fast on CPU. Not the int8 `...300MQ`:
+    /// that one is *dynamically* quantized, which fastembed warns makes vectors
+    /// from separate calls incompatible — and the drain embeds one item per call.
+    const MODEL: EmbeddingModel = EmbeddingModel::EmbeddingGemma300MQ4;
+
+    /// Token cap per input. EmbeddingGemma handles 2048, but attention cost grows
+    /// quadratically and the gist of an email is near the top.
+    const MAX_LENGTH: usize = 1024;
+
+    /// EmbeddingGemma's retrieval prompts: stored items are documents, searches
+    /// are queries.
+    const DOCUMENT_PROMPT: &str = "title: none | text: ";
+    const QUERY_PROMPT: &str = "task: search result | query: ";
+
+    /// In-process embedder backed by fastembed (ONNX Runtime on CPU). The model is
+    /// downloaded on first use into `cache_dir` and loaded lazily, so constructing
+    /// one is free and app startup never blocks on it.
+    pub struct LocalEmbedder {
+        cache_dir: PathBuf,
+        model: Arc<Mutex<Option<TextEmbedding>>>,
+    }
+
+    impl LocalEmbedder {
+        pub fn new(cache_dir: PathBuf) -> Self {
+            Self {
+                cache_dir,
+                model: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// The process-wide instance over [`Self::default_cache_dir`]. Callers that
+        /// rebuild their LLM stack (e.g. on a settings save) share it, so the model
+        /// is loaded once per process rather than once per rebuild.
+        pub fn shared() -> Arc<LocalEmbedder> {
+            static SHARED: std::sync::OnceLock<Arc<LocalEmbedder>> = std::sync::OnceLock::new();
+            SHARED
+                .get_or_init(|| Arc::new(LocalEmbedder::new(Self::default_cache_dir())))
+                .clone()
+        }
+
+        /// `<data_dir>/mnemis/models` — next to the default DB.
+        pub fn default_cache_dir() -> PathBuf {
+            dirs::data_dir()
+                .map(|d| d.join("mnemis/models"))
+                .unwrap_or_else(|| PathBuf::from("models"))
+        }
+
+        /// Run `f` against the loaded model on the blocking pool (inference and
+        /// the first-use download are both synchronous and CPU/IO heavy).
+        async fn with_model<T, F>(&self, f: F) -> Result<T>
+        where
+            T: Send + 'static,
+            F: FnOnce(&mut TextEmbedding) -> Result<T> + Send + 'static,
+        {
+            let slot = self.model.clone();
+            let cache_dir = self.cache_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut guard = slot.lock().map_err(|_| anyhow!("embedder lock poisoned"))?;
+                if guard.is_none() {
+                    info!(model = ?MODEL, cache = %cache_dir.display(), "loading embedding model");
+                    let threads = std::thread::available_parallelism()
+                        .map(|n| (n.get() / 2).max(1))
+                        .unwrap_or(1);
+                    let opts = TextInitOptions::new(MODEL)
+                        .with_cache_dir(cache_dir)
+                        .with_max_length(MAX_LENGTH)
+                        .with_intra_threads(threads)
+                        .with_show_download_progress(false);
+                    *guard = Some(TextEmbedding::try_new(opts).context("loading embedding model")?);
+                }
+                f(guard.as_mut().expect("model loaded above"))
+            })
+            .await
+            .context("embedding task panicked")?
         }
     }
 
-    /// The process-wide instance over [`Self::default_cache_dir`]. Callers that
-    /// rebuild their LLM stack (e.g. on a settings save) share it, so the model
-    /// is loaded once per process rather than once per rebuild.
-    pub fn shared() -> Arc<LocalEmbedder> {
-        static SHARED: std::sync::OnceLock<Arc<LocalEmbedder>> = std::sync::OnceLock::new();
-        SHARED
-            .get_or_init(|| Arc::new(LocalEmbedder::new(Self::default_cache_dir())))
-            .clone()
+    #[async_trait]
+    impl Embedder for LocalEmbedder {
+        async fn prepare(&self) -> Result<()> {
+            self.with_model(|_| Ok(())).await
+        }
+
+        async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.embed_prompted(DOCUMENT_PROMPT, text).await
+        }
+
+        async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            self.embed_prompted(QUERY_PROMPT, text).await
+        }
     }
 
-    /// `<data_dir>/mnemis/models` — next to the default DB.
-    pub fn default_cache_dir() -> PathBuf {
-        dirs::data_dir()
-            .map(|d| d.join("mnemis/models"))
-            .unwrap_or_else(|| PathBuf::from("models"))
-    }
-
-    /// Run `f` against the loaded model on the blocking pool (inference and
-    /// the first-use download are both synchronous and CPU/IO heavy).
-    async fn with_model<T, F>(&self, f: F) -> Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut TextEmbedding) -> Result<T> + Send + 'static,
-    {
-        let slot = self.model.clone();
-        let cache_dir = self.cache_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = slot.lock().map_err(|_| anyhow!("embedder lock poisoned"))?;
-            if guard.is_none() {
-                info!(model = ?MODEL, cache = %cache_dir.display(), "loading embedding model");
-                let threads = std::thread::available_parallelism()
-                    .map(|n| (n.get() / 2).max(1))
-                    .unwrap_or(1);
-                let opts = TextInitOptions::new(MODEL)
-                    .with_cache_dir(cache_dir)
-                    .with_max_length(MAX_LENGTH)
-                    .with_intra_threads(threads)
-                    .with_show_download_progress(false);
-                *guard = Some(TextEmbedding::try_new(opts).context("loading embedding model")?);
-            }
-            f(guard.as_mut().expect("model loaded above"))
-        })
-        .await
-        .context("embedding task panicked")?
-    }
-}
-
-#[async_trait]
-impl Embedder for LocalEmbedder {
-    async fn prepare(&self) -> Result<()> {
-        self.with_model(|_| Ok(())).await
-    }
-
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        self.embed_prompted(DOCUMENT_PROMPT, text).await
-    }
-
-    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        self.embed_prompted(QUERY_PROMPT, text).await
-    }
-}
-
-impl LocalEmbedder {
-    async fn embed_prompted(&self, prompt: &str, text: &str) -> Result<Vec<f32>> {
-        let input = format!("{prompt}{text}");
-        self.with_model(move |m| {
-            m.embed([input], None)
-                .context("embedding text")?
-                .pop()
-                .context("embedding model returned no vector")
-        })
-        .await
+    impl LocalEmbedder {
+        async fn embed_prompted(&self, prompt: &str, text: &str) -> Result<Vec<f32>> {
+            let input = format!("{prompt}{text}");
+            self.with_model(move |m| {
+                m.embed([input], None)
+                    .context("embedding text")?
+                    .pop()
+                    .context("embedding model returned no vector")
+            })
+            .await
+        }
     }
 }
 
@@ -550,6 +564,7 @@ mod tests {
 
     /// Live: downloads (first run) and loads the real model. Opt-in because of
     /// the model download: `cargo test -p mnemis-engine local_embedder -- --ignored`.
+    #[cfg(feature = "local-embed")]
     #[tokio::test]
     #[ignore]
     async fn local_embedder_produces_model_dim_vectors() -> Result<()> {
