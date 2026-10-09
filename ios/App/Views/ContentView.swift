@@ -5,18 +5,12 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var model = model
-        // Icon-only tabs: the switcher stays small, and the labels remain
-        // for VoiceOver.
-        TabView(selection: $model.selectedTab) {
-            Tab(value: AppTab.actions) {
-                ActionsView()
-            } label: {
-                Image(systemName: "checklist").accessibilityLabel("Actions")
-            }
-            Tab(value: AppTab.chat) {
-                ChatsView()
-            } label: {
-                Image(systemName: "bubble.left.and.text.bubble.right").accessibilityLabel("Chat")
+        // Each section's list carries the switcher in its navigation bar
+        // (`SectionSwitcher`), so nothing floats over the content.
+        Group {
+            switch model.selectedTab {
+            case .actions: ActionsView()
+            case .chat: ChatsView()
             }
         }
         .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
@@ -37,6 +31,25 @@ struct ContentView: View {
     }
 }
 
+/// Actions | Chat, icon-only, in the list's navigation bar.
+struct SectionSwitcher: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        Picker("Section", selection: $model.selectedTab) {
+            Image(systemName: "checklist")
+                .accessibilityLabel("Actions")
+                .tag(AppTab.actions)
+            Image(systemName: "bubble.left.and.text.bubble.right")
+                .accessibilityLabel("Chat")
+                .tag(AppTab.chat)
+        }
+        .pickerStyle(.segmented)
+        .fixedSize()
+    }
+}
+
 struct SettingsButton: View {
     @Environment(AppModel.self) private var model
 
@@ -47,14 +60,16 @@ struct SettingsButton: View {
 
 struct ActionsView: View {
     @Environment(AppModel.self) private var model
-    @State private var selection: ActionDto.ID?
 
     var body: some View {
+        @Bindable var model = model
         NavigationSplitView {
-            ActionListView(selection: $selection)
+            ActionListView(selection: $model.actionSelection)
                 .navigationTitle("Actions")
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) { SettingsButton() }
+                    ToolbarItem(placement: .principal) { SectionSwitcher() }
                     ToolbarItem(placement: .topBarTrailing) {
                         if model.isSyncing {
                             ProgressView()
@@ -67,7 +82,7 @@ struct ActionsView: View {
                     }
                 }
         } detail: {
-            if let id = selection, let action = model.actions.first(where: { $0.id == id }) {
+            if let id = model.actionSelection, let action = model.actions.first(where: { $0.id == id }) {
                 ActionDetailView(action: action)
             } else {
                 ContentUnavailableView("No action selected", systemImage: "checklist")

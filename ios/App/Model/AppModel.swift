@@ -21,6 +21,8 @@ final class AppModel {
     var errorMessage: String?
 
     var selectedTab: AppTab = .actions
+    /// Kept here rather than in the views so switching sections keeps them.
+    var actionSelection: ActionDto.ID?
     var chatSelection: ChatDto.ID?
     var showingSettings = false
 

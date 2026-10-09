@@ -27,8 +27,10 @@ struct ChatsView: View {
                 }
             }
             .navigationTitle("Chat")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { SettingsButton() }
+                ToolbarItem(placement: .principal) { SectionSwitcher() }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("New chat", systemImage: "square.and.pencil") {
                         Task { await model.newChat() }
