@@ -350,8 +350,8 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     // here for now; if we add more dump-like commands we can factor it out.
     let pool = db::open(&cfg.db_path()).await?;
 
-    let (source_id, source_kind, channel_name): (i64, String, String) = sqlx::query_as(
-        "SELECT c.source_id, s.kind, c.name FROM channels c \
+    let (source_kind, channel_name): (String, String) = sqlx::query_as(
+        "SELECT s.kind, c.name FROM channels c \
          JOIN sources s ON s.id = c.source_id WHERE c.id = ?",
     )
     .bind(channel_id)
@@ -460,7 +460,7 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
 
     // Match what extract_for_channel feeds the model — the dump is only
     // useful as a regression aid if the two prompts stay in sync.
-    let feedback = mnemis_engine::extract::load_feedback_for(&pool, source_id, channel_id).await?;
+    let memory_rules = mnemis_engine::memory::rules(&pool).await?;
     let inputs = prompt::PromptInputs {
         source_kind: &source_kind,
         channel_name: &channel_name,
@@ -469,7 +469,7 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
         custom_prompt: custom.as_deref(),
         current_time: Utc::now(),
         existing_actions: &existing,
-        feedback: &feedback,
+        memory_rules: memory_rules.as_deref(),
         window: &window,
     };
     println!("{}", prompt::build(&inputs));

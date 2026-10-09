@@ -449,9 +449,29 @@ async fn submit_dismissal_feedback(
     kind: FeedbackKind,
     comment: Option<String>,
 ) -> Result<(), String> {
-    mutations::record_dismissal_feedback(&state.pool, action_id, kind, comment)
+    mutations::record_dismissal_feedback(&state.pool, action_id, kind, comment.clone())
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    // A reason is something to learn: merge it into the memory rules in the
+    // background, so the dialog closes at once. Without an LLM it is only
+    // logged in `dismissal_feedback` (the very first merge folds such
+    // reasons in; later ones don't).
+    if let Some(reason) = comment.filter(|c| !c.trim().is_empty())
+        && let Some(stack) = state.current_llm()
+    {
+        let pool = state.pool.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = mnemis_engine::memory::learn_from_feedback(
+                &pool, &stack.llm, action_id, kind, &reason,
+            )
+            .await
+            {
+                warn!(error = %format!("{e:#}"), action_id, "merging feedback into memory failed");
+            }
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]

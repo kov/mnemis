@@ -8,6 +8,7 @@ pub mod extract;
 pub mod ingest;
 pub mod llm;
 pub mod maintenance;
+pub mod memory;
 pub mod mutations;
 pub mod orchestrator;
 pub mod queries;

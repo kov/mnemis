@@ -16,6 +16,8 @@ pub struct RenderInputs {
     pub custom_prompt: Option<String>,
     /// A pre-rendered "this conversation is about X" block for a seeded chat.
     pub seed: Option<String>,
+    /// The rules learned from the user's feedback (`crate::memory`).
+    pub memory_rules: Option<String>,
 }
 
 /// Assemble the system prompt from already-gathered parts (no I/O).
@@ -46,6 +48,15 @@ pub fn render(inputs: &RenderInputs) -> String {
         out.push('\n');
     }
 
+    if let Some(rules) = inputs.memory_rules.as_deref() {
+        out.push_str(
+            "\nWhat they have taught you about which messages are (and aren't) action items \
+             for them — apply it when you judge or create actions:\n",
+        );
+        out.push_str(rules.trim());
+        out.push('\n');
+    }
+
     out.push_str("\n# Current time\n");
     out.push_str(&inputs.now_iso);
     out.push_str("\nResolve relative dates (\"Friday\", \"tomorrow\") against this.\n");
@@ -69,12 +80,14 @@ pub async fn build_system_prompt(pool: &SqlitePool, chat_id: i64) -> Result<Stri
         .context("loading user profile for chat prompt")?;
 
     let seed = load_seed(pool, chat_id).await?;
+    let memory_rules = crate::memory::rules(pool).await?;
 
     Ok(render(&RenderInputs {
         now_iso: Utc::now().to_rfc3339(),
         user_display_name: profile.display_name,
         custom_prompt: profile.custom_prompt,
         seed,
+        memory_rules,
     }))
 }
 
@@ -224,6 +237,7 @@ mod tests {
             user_display_name: "Gustavo".to_string(),
             custom_prompt: Some("Ana is my direct report.".to_string()),
             seed: Some("This conversation is about action A-42.".to_string()),
+            memory_rules: Some("- Newsletters are never action items".to_string()),
         });
         assert!(p.contains("mnemis's assistant"));
         assert!(p.contains("high confidence so the change applies immediately"));
@@ -232,6 +246,7 @@ mod tests {
         assert!(p.contains("2026-05-30T12:00:00+00:00"));
         assert!(p.contains("# This conversation"));
         assert!(p.contains("A-42"));
+        assert!(p.contains("- Newsletters are never action items"));
     }
 
     #[test]
@@ -241,9 +256,11 @@ mod tests {
             user_display_name: "Gustavo".to_string(),
             custom_prompt: Some("   ".to_string()),
             seed: None,
+            memory_rules: None,
         });
         assert!(!p.contains("What they told you"));
         assert!(!p.contains("# This conversation"));
+        assert!(!p.contains("What they have taught you"));
     }
 
     #[tokio::test]
