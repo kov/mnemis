@@ -45,17 +45,21 @@ private struct ChatRow: View {
     let chat: ChatDto
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                if chat.seededFromKind == "action" {
-                    Image(systemName: "checklist").foregroundStyle(.secondary)
-                }
+        HStack(spacing: 12) {
+            Image(systemName: chat.seededFromKind == "action" ? "checklist" : "bubble.left.and.text.bubble.right")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 34, height: 34)
+                .background(Color.accentColor.opacity(0.14), in: .circle)
+            VStack(alignment: .leading, spacing: 2) {
                 Text(chat.title ?? "New chat")
+                    .font(.body.weight(.medium))
                     .lineLimit(2)
+                Text(Date.fromUnix(chat.updatedAt), format: .relative(presentation: .named))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            Text(Date.fromUnix(chat.updatedAt), format: .relative(presentation: .named))
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
+        .padding(.vertical, 2)
     }
 }

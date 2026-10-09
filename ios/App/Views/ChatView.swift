@@ -40,7 +40,10 @@ struct ChatView: View {
                 }
             }
             .padding()
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
         }
+        .background(Color(.systemGroupedBackground))
         .defaultScrollAnchor(.bottom)
         .scrollDismissesKeyboard(.interactively)
         .safeAreaInset(edge: .bottom) { composer }
@@ -52,30 +55,43 @@ struct ChatView: View {
         }
     }
 
+    /// A floating glass field with its send/stop button, over the transcript.
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Ask about your mail…", text: $draft, axis: .vertical)
-                .lineLimit(1...6)
-                .focused($composerFocused)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(.background.secondary, in: .rect(cornerRadius: 20))
-            if session.sending {
-                Button("Stop", systemImage: "stop.circle.fill") {
-                    if let engine = model.engine { session.stop(engine) }
+        GlassEffectContainer(spacing: 10) {
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("Ask about your mail…", text: $draft, axis: .vertical)
+                    .lineLimit(1...6)
+                    .focused($composerFocused)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 11)
+                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
+                Group {
+                    if session.sending {
+                        Button {
+                            if let engine = model.engine { session.stop(engine) }
+                        } label: {
+                            Image(systemName: "stop.fill")
+                                .frame(width: 24, height: 24)
+                        }
+                        .accessibilityLabel("Stop")
+                    } else {
+                        Button { send() } label: {
+                            Image(systemName: "arrow.up")
+                                .font(.body.weight(.semibold))
+                                .frame(width: 24, height: 24)
+                        }
+                        .accessibilityLabel("Send")
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
                 }
-                .labelStyle(.iconOnly)
-                .font(.title)
-            } else {
-                Button("Send", systemImage: "arrow.up.circle.fill") { send() }
-                    .labelStyle(.iconOnly)
-                    .font(.title)
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .buttonStyle(.glassProminent)
+                .buttonBorderShape(.circle)
+                .controlSize(.large)
             }
         }
         .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(.bar)
+        .padding(.bottom, 8)
+        .frame(maxWidth: 760)
     }
 
     private func send() {

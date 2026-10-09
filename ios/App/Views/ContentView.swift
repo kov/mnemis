@@ -5,11 +5,10 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var model = model
-        // One window-wide header bar holds the app's controls; the sections
-        // below drop their sidebar navigation bars.
+        // One window-wide header holds the app's controls, as glass over the
+        // window's background; the sections below drop their sidebar bars.
         VStack(spacing: 0) {
             HeaderBar()
-            Divider()
             Group {
                 switch model.selectedTab {
                 case .actions: ActionsView()
@@ -18,6 +17,8 @@ struct ContentView: View {
             }
             .frame(maxHeight: .infinity)
         }
+        .background(Color(.systemGroupedBackground))
+        .onOpenURL { model.open($0) }
         .sheet(item: $model.pendingDismissal) { action in
             DismissReasonSheet(action: action)
         }
@@ -39,58 +40,68 @@ struct ContentView: View {
     }
 }
 
-/// The window-wide bar: sidebar toggle and Settings on the left, the section
-/// switcher in the middle, the section's own actions on the right.
+/// The window-wide header: sidebar toggle and Settings on the left, the
+/// section switcher in the middle, the section's own actions on the right.
 struct HeaderBar: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        HStack(spacing: 4) {
-            HStack(spacing: 4) {
-                if sizeClass == .regular {
-                    HeaderButton("Sidebar", systemImage: "sidebar.leading") {
-                        withAnimation {
-                            model.columnVisibility =
-                                model.columnVisibility == .detailOnly ? .all : .detailOnly
+        HStack(spacing: 12) {
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
+                    if sizeClass == .regular {
+                        HeaderButton("Sidebar", systemImage: "sidebar.leading") {
+                            withAnimation(.smooth) {
+                                model.columnVisibility =
+                                    model.columnVisibility == .detailOnly ? .all : .detailOnly
+                            }
                         }
                     }
-                }
-                HeaderButton("Settings", systemImage: "gearshape") { model.showingSettings = true }
-                if model.isLearning {
-                    Label("Learning…", systemImage: "brain")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .symbolEffect(.pulse)
+                    HeaderButton("Settings", systemImage: "gearshape") { model.showingSettings = true }
+                    if model.isLearning {
+                        Label("Learning…", systemImage: "brain")
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .symbolEffect(.pulse)
+                            .padding(.horizontal, 12)
+                            .frame(height: 40)
+                            .glassEffect()
+                            .transition(.opacity.combined(with: .scale))
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
             SectionSwitcher()
 
-            HStack(spacing: 4) {
-                switch model.selectedTab {
-                case .actions:
-                    if model.isSyncing {
-                        ProgressView().frame(width: 44, height: 44)
-                    } else {
-                        HeaderButton("Sync", systemImage: "arrow.triangle.2.circlepath") {
-                            Task { await model.sync() }
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
+                    switch model.selectedTab {
+                    case .actions:
+                        if model.isSyncing {
+                            ProgressView()
+                                .frame(width: 40, height: 40)
+                                .glassEffect(in: .circle)
+                        } else {
+                            HeaderButton("Sync", systemImage: "arrow.triangle.2.circlepath") {
+                                Task { await model.sync() }
+                            }
+                            .disabled(model.engine == nil)
+                        }
+                    case .chat:
+                        HeaderButton("New chat", systemImage: "square.and.pencil") {
+                            Task { await model.newChat() }
                         }
                         .disabled(model.engine == nil)
                     }
-                case .chat:
-                    HeaderButton("New chat", systemImage: "square.and.pencil") {
-                        Task { await model.newChat() }
-                    }
-                    .disabled(model.engine == nil)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
-        .padding(.horizontal, 8)
-        .frame(height: 52)
-        .background(.bar)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .animation(.smooth, value: model.isLearning)
     }
 }
 
@@ -106,28 +117,52 @@ private struct HeaderButton: View {
     }
 
     var body: some View {
-        Button(title, systemImage: systemImage, action: action)
-            .labelStyle(.iconOnly)
-            .font(.title3)
-            .frame(width: 44, height: 44)
-            .contentShape(.rect)
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.body.weight(.medium))
+                .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .accessibilityLabel(title)
     }
 }
 
-/// Actions | Chat.
+/// Actions | Chat: a glass capsule whose selection slides between segments.
 struct SectionSwitcher: View {
     @Environment(AppModel.self) private var model
+    @Namespace private var selection
 
     var body: some View {
-        @Bindable var model = model
-        Picker("Section", selection: $model.selectedTab) {
-            Label("Actions", systemImage: "checklist")
-                .tag(AppTab.actions)
-            Label("Chat", systemImage: "bubble.left.and.text.bubble.right")
-                .tag(AppTab.chat)
+        HStack(spacing: 2) {
+            segment(.actions, title: "Actions", systemImage: "checklist")
+            segment(.chat, title: "Chat", systemImage: "bubble.left.and.text.bubble.right")
         }
-        .pickerStyle(.segmented)
-        .fixedSize()
+        .padding(4)
+        .glassEffect(.regular.interactive(), in: .capsule)
+    }
+
+    private func segment(_ tab: AppTab, title: String, systemImage: String) -> some View {
+        let selected = model.selectedTab == tab
+        return Button {
+            withAnimation(.smooth(duration: 0.3)) { model.selectedTab = tab }
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(selected ? Color.accentColor : .primary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background {
+                    if selected {
+                        Capsule()
+                            .fill(Color.accentColor.opacity(0.16))
+                            .matchedGeometryEffect(id: "selection", in: selection)
+                    }
+                }
+                .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -201,35 +236,26 @@ struct ActionRow: View {
     let action: ActionDto
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(action.title)
-                .font(.body)
+                .font(.body.weight(.medium))
                 .lineLimit(2)
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 ConfidenceBadge(confidence: action.confidence)
                 if let due = action.dueAt {
-                    Label(Date.fromUnix(due).formatted(date: .abbreviated, time: .omitted), systemImage: "calendar")
+                    DueBadge(due: due)
                 }
+                Spacer(minLength: 0)
                 if let posted = action.sourcePostedAt {
                     Text(Date.fromUnix(posted), format: .relative(presentation: .named))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                 }
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 2)
-    }
-}
-
-struct ConfidenceBadge: View {
-    let confidence: Confidence
-
-    var body: some View {
-        switch confidence {
-        case .high: Text("High").foregroundStyle(.green)
-        case .medium: Text("Medium").foregroundStyle(.orange)
-        case .low: Text("Low").foregroundStyle(.secondary)
-        }
+        .padding(.vertical, 4)
     }
 }
 

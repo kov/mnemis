@@ -42,6 +42,15 @@ final class AppModel {
         do {
             engine = try await Engine.open(dataDir: Self.dataDirectory.path)
             await refresh()
+            #if DEBUG
+            // `-MnemisOpenURL mnemis://…` at launch opens that screen, so the
+            // simulator can be driven without taps (and without the
+            // confirmation `simctl openurl` raises).
+            if let link = UserDefaults.standard.string(forKey: "MnemisOpenURL"),
+               let url = URL(string: link) {
+                open(url)
+            }
+            #endif
         } catch {
             report(error)
         }
@@ -159,6 +168,22 @@ final class AppModel {
             _ = try await engine.learnFromDismissal(actionId: action.id, reason: reason)
         } catch {
             report(error)
+        }
+    }
+
+    /// Deep links: `mnemis://action/<id>` and `mnemis://chat/<id>` open that
+    /// action or chat (for notifications, and for driving the app in tests).
+    func open(_ url: URL) {
+        guard url.scheme == "mnemis", let id = Int64(url.lastPathComponent) else { return }
+        switch url.host() {
+        case "action":
+            selectedTab = .actions
+            actionSelection = id
+        case "chat":
+            selectedTab = .chat
+            chatSelection = id
+        default:
+            break
         }
     }
 
