@@ -7,6 +7,8 @@
 //!   developer's Apple Team ID and signing identity. Reads from `git config`
 //!   (`mnemis.appleTeamId`, `mnemis.appleSigningIdentity`) first, falling back
 //!   to the `MNEMIS_APPLE_TEAM_ID` / `APPLE_SIGNING_IDENTITY` env vars.
+//! - `build-ios` — build the engine bindings the Xcode project in `ios/` links:
+//!   `ios/build/MnemisEngine.xcframework` and the generated Swift.
 //!
 //! Store the values once, globally:
 //! ```
@@ -24,6 +26,7 @@ fn main() -> Result<()> {
         Some("install") => install(&args[1..]),
         Some("build-macos") => build_macos(&args[1..]),
         Some("run-macos") => run_macos(&args[1..]),
+        Some("build-ios") => build_ios(),
         Some(cmd) => {
             eprintln!("unknown subcommand: {cmd}");
             print_help();
@@ -42,7 +45,8 @@ fn print_help() {
          Subcommands:\n  \
          install [--prefix P]  Linux: build + install binary, icons and .desktop\n  \
          build-macos          Bundle a signed mnemis.app for macOS\n  \
-         run-macos            build-macos then `open` the resulting .app\n"
+         run-macos            build-macos then `open` the resulting .app\n  \
+         build-ios            Build the iOS engine xcframework + Swift bindings\n"
     );
 }
 
@@ -361,6 +365,102 @@ fn run_macos(args: &[String]) -> Result<()> {
     }
     println!("==> open {}", app_path.display());
     run(Command::new("open").arg(&app_path))
+}
+
+/// Must match the Xcode project's `IPHONEOS_DEPLOYMENT_TARGET`. Rust otherwise
+/// picks its own floor and the linker warns about every object in the archive.
+const IOS_DEPLOYMENT_TARGET: &str = "26.0";
+
+/// Build what `ios/Mnemis.xcodeproj` links: a static library per iOS triple,
+/// wrapped in `ios/build/MnemisEngine.xcframework`, and the uniffi-generated
+/// Swift in `ios/build/Generated/`. Neither is checked in.
+fn build_ios() -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("build-ios only runs on macOS");
+    }
+    let root = workspace_root()?;
+    let out = root.join("ios/build");
+    let headers = out.join("headers");
+    let generated = out.join("Generated");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&headers)?;
+
+    // Device and simulator are both arm64 under different triples, so lipo
+    // can't merge them; the xcframework keeps them apart.
+    const TRIPLES: [&str; 2] = ["aarch64-apple-ios", "aarch64-apple-ios-sim"];
+    for triple in TRIPLES {
+        println!("==> cargo build --release -p mnemis-ffi --target {triple}");
+        run(Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "mnemis-ffi",
+                "--lib",
+                "--target",
+                triple,
+            ])
+            .env("IPHONEOS_DEPLOYMENT_TARGET", IOS_DEPLOYMENT_TARGET)
+            .current_dir(&root))
+        .with_context(|| format!("building for {triple} (rustup target add {triple}?)"))?;
+    }
+
+    // uniffi reads the interface out of a built library, which has to be one
+    // this machine can load: the host dylib.
+    println!("==> uniffi-bindgen generate (swift)");
+    run(Command::new("cargo")
+        .args(["build", "--release", "-p", "mnemis-ffi", "--lib"])
+        .current_dir(&root))?;
+    run(Command::new("cargo")
+        .args([
+            "run",
+            "--release",
+            "-p",
+            "mnemis-ffi",
+            "--features",
+            "cli",
+            "--bin",
+            "uniffi-bindgen",
+            "--",
+            "generate",
+            "--library",
+            "target/release/libmnemis_ffi.dylib",
+            "--language",
+            "swift",
+            "--no-format",
+            "--out-dir",
+        ])
+        .arg(&generated)
+        .current_dir(&root))?;
+
+    // Xcode wants the header and module map laid out like a framework's.
+    for entry in std::fs::read_dir(&generated)? {
+        let path = entry?.path();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("h") => std::fs::rename(
+                &path,
+                headers.join(path.file_name().context("header name")?),
+            )?,
+            Some("modulemap") => std::fs::rename(&path, headers.join("module.modulemap"))?,
+            _ => {}
+        }
+    }
+
+    let xcframework = out.join("MnemisEngine.xcframework");
+    let mut cmd = Command::new("xcodebuild");
+    cmd.arg("-create-xcframework");
+    for triple in TRIPLES {
+        cmd.arg("-library")
+            .arg(root.join(format!("target/{triple}/release/libmnemis_ffi.a")))
+            .arg("-headers")
+            .arg(&headers);
+    }
+    cmd.arg("-output").arg(&xcframework).stdout(Stdio::null());
+    run(&mut cmd).context("xcodebuild -create-xcframework failed")?;
+
+    println!("built     {}", xcframework.display());
+    println!("generated {}", generated.display());
+    Ok(())
 }
 
 /// Resolve a value by checking `git config --get <key>` first, then the env

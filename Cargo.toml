@@ -1,4 +1,4 @@
 [workspace]
-members = ["engine", "app", "cli", "types", "xtask", "ui-probe"]
+members = ["engine", "app", "cli", "types", "ffi", "xtask", "ui-probe"]
 exclude = ["attic/v1", "app/ui"]
 resolver = "3"

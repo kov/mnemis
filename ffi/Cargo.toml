@@ -1,0 +1,28 @@
+[package]
+name = "mnemis-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "mnemis_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+# No `local-embed`: ONNX Runtime has no iOS binaries; the app supplies its own
+# embedder (none yet, so search is keyword-only).
+mnemis-engine = { path = "../engine", default-features = false }
+mnemis-types = { path = "../types" }
+anyhow = "1.0.102"
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uniffi = "0.32.2"
