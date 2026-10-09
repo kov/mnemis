@@ -366,7 +366,6 @@ impl ThinkingLevel {
 pub struct LlmConfigDto {
     pub base_url: String,
     pub chat_model: String,
-    pub embedding_model: String,
     pub bearer_token: Option<String>,
     /// Coarse chain-of-thought budget knob; always applied (defaults to
     /// [`ThinkingLevel::Medium`] when absent from an older config).
@@ -589,12 +588,12 @@ fn parse_model_not_found(raw: &str) -> Option<String> {
     Some(match (model, available) {
         (Some(m), Some(a)) => format!(
             "Model \"{m}\" isn't on the LLM server. Available: {a}. \
-             Fix chat_model / embedding_model in config."
+             Fix chat_model in config."
         ),
-        (Some(m), None) => format!(
-            "Model \"{m}\" isn't on the LLM server — fix chat_model / embedding_model in config."
-        ),
-        _ => "The configured model isn't on the LLM server — fix chat_model / embedding_model \
+        (Some(m), None) => {
+            format!("Model \"{m}\" isn't on the LLM server — fix chat_model in config.")
+        }
+        _ => "The configured model isn't on the LLM server — fix chat_model \
               in config."
             .to_string(),
     })
@@ -745,10 +744,8 @@ mod thinking_level_tests {
     fn dto_defaults_thinking_level_when_absent() {
         // An older config payload without `thinking_level` still deserializes,
         // landing on the default so a budget is always resolvable.
-        let dto: LlmConfigDto = serde_json::from_str(
-            r#"{"base_url":"u","chat_model":"c","embedding_model":"e","config_path":"p"}"#,
-        )
-        .unwrap();
+        let dto: LlmConfigDto =
+            serde_json::from_str(r#"{"base_url":"u","chat_model":"c","config_path":"p"}"#).unwrap();
         assert_eq!(dto.thinking_level, ThinkingLevel::Medium);
     }
 }

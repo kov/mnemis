@@ -199,6 +199,20 @@ pub fn test_model_name() -> String {
     std::env::var("MNEMIS_TEST_LLM_MODEL").unwrap_or_else(|_| "mock-model".to_string())
 }
 
+// ---------- Embedders ----------------------------------------------------
+
+/// An embedder whose every `embed` fails, as an unreachable backend would —
+/// for tests that exercise sync paths without caring about vectors. Entries
+/// stay queued with a bumped attempt count.
+pub struct FailingEmbedder;
+
+#[async_trait]
+impl crate::embed::Embedder for FailingEmbedder {
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+        anyhow::bail!("embedder unavailable in tests")
+    }
+}
+
 // ---------- DB seed helpers ----------------------------------------------
 
 pub struct SeedCtx {

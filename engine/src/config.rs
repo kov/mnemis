@@ -14,7 +14,6 @@ pub struct Config {
 pub struct LlmSection {
     pub base_url: String,
     pub chat_model: String,
-    pub embedding_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
     /// The server's context window, in tokens. The extractor derives its
@@ -148,7 +147,6 @@ pub fn save_llm(llm: &LlmSection) -> Result<()> {
         llm: LlmSection {
             base_url: llm.base_url.clone(),
             chat_model: llm.chat_model.clone(),
-            embedding_model: llm.embedding_model.clone(),
             bearer_token: llm.bearer_token.clone(),
             max_context_tokens: llm.max_context_tokens.or(existing_max_ctx),
             request_timeout_secs: llm.request_timeout_secs.or(existing_timeout),

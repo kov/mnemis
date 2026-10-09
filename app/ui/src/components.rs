@@ -1354,7 +1354,6 @@ pub fn SettingsLlm() -> impl IntoView {
 fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
     let base_url = RwSignal::new(initial.base_url.clone());
     let chat = RwSignal::new(initial.chat_model.clone());
-    let embed = RwSignal::new(initial.embedding_model.clone());
     let token = RwSignal::new(initial.bearer_token.clone().unwrap_or_default());
     let config_path = initial.config_path.clone();
     let toast: RwSignal<Option<String>> = RwSignal::new(None);
@@ -1363,7 +1362,6 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
 
     let base_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let chat_ref: NodeRef<leptos::html::Input> = NodeRef::new();
-    let embed_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let token_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let level_ref: NodeRef<leptos::html::Select> = NodeRef::new();
 
@@ -1385,7 +1383,6 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
         let cfg = LlmConfigDto {
             base_url: pull(base_ref, base_url.get()),
             chat_model: pull(chat_ref, chat.get()),
-            embedding_model: pull(embed_ref, embed.get()),
             bearer_token: {
                 let v = pull(token_ref, token.get());
                 if v.is_empty() { None } else { Some(v) }
@@ -1408,8 +1405,6 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
             <input class="settings-input" node_ref=base_ref prop:value=move || base_url.get() />
             <label>"Chat model"</label>
             <input class="settings-input" node_ref=chat_ref prop:value=move || chat.get() />
-            <label>"Embedding model"</label>
-            <input class="settings-input" node_ref=embed_ref prop:value=move || embed.get() />
             <label>"Bearer token (optional)"</label>
             <input class="settings-input" node_ref=token_ref prop:value=move || token.get() />
             <label>"Thinking budget"</label>

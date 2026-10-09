@@ -1,92 +1,127 @@
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
-use tracing::warn;
-
-/// Request timeout for an embedding call. Embeddings are cheap (one short
-/// forward pass), so a stuck request past this is the server wedging — bound
-/// it so a degraded server can't hang the whole drain. Shorter than the chat
-/// timeout since embeddings should never take minutes.
-const EMBED_TIMEOUT_SECS: u64 = 120;
+use tracing::{info, warn};
 
 /// Embeds text into vectors. Trait-shaped so the worker can be tested
-/// without an omlx server.
+/// without loading a real model.
 #[async_trait]
 pub trait Embedder: Send + Sync {
+    /// Make the embedder ready to serve (e.g. download/load a model). Called
+    /// once per drain before any entry is touched, so a failure here — no
+    /// network for the first model download, a corrupt cache — skips the drain
+    /// instead of burning every queued entry's retry budget.
+    async fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
 }
 
-#[derive(Debug, Serialize)]
-struct EmbeddingsRequest<'a> {
-    model: &'a str,
-    input: &'a str,
+/// The model every vector table is built from. Changing it means re-embedding
+/// everything (vectors from different models aren't comparable) — ship a
+/// migration that clears the `*_vec` tables and re-queues their sources, like
+/// `0007_local_embeddings.sql`. The dimension must match the `float[N]` of
+/// those tables.
+///
+/// EmbeddingGemma-300M, 4-bit: multilingual (mail here is English and
+/// Portuguese), 768-dim, comfortably fast on CPU. Not the int8 `...300MQ`:
+/// that one is *dynamically* quantized, which fastembed warns makes vectors
+/// from separate calls incompatible — and the drain embeds one item per call.
+const MODEL: EmbeddingModel = EmbeddingModel::EmbeddingGemma300MQ4;
+
+/// Token cap per input. EmbeddingGemma handles 2048, but attention cost grows
+/// quadratically and the gist of an email is near the top.
+const MAX_LENGTH: usize = 1024;
+
+/// EmbeddingGemma's retrieval-document prompt. Everything we store is a
+/// document; a query-side embedding (for search) would use
+/// `"task: search result | query: "` instead.
+const DOCUMENT_PROMPT: &str = "title: none | text: ";
+
+/// In-process embedder backed by fastembed (ONNX Runtime on CPU). The model is
+/// downloaded on first use into `cache_dir` and loaded lazily, so constructing
+/// one is free and app startup never blocks on it.
+pub struct LocalEmbedder {
+    cache_dir: PathBuf,
+    model: Arc<Mutex<Option<TextEmbedding>>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct EmbeddingsResponse {
-    data: Vec<EmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbeddingData {
-    embedding: Vec<f32>,
-}
-
-/// omlx (OpenAI-compatible) `/v1/embeddings` client.
-pub struct OmlxEmbedder {
-    http: reqwest::Client,
-    base_url: String,
-    model: String,
-    bearer_token: Option<String>,
-}
-
-impl OmlxEmbedder {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(EMBED_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+impl LocalEmbedder {
+    pub fn new(cache_dir: PathBuf) -> Self {
         Self {
-            http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            model: model.into(),
-            bearer_token: None,
+            cache_dir,
+            model: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.bearer_token = Some(token.into());
-        self
+    /// The process-wide instance over [`Self::default_cache_dir`]. Callers that
+    /// rebuild their LLM stack (e.g. on a settings save) share it, so the model
+    /// is loaded once per process rather than once per rebuild.
+    pub fn shared() -> Arc<LocalEmbedder> {
+        static SHARED: std::sync::OnceLock<Arc<LocalEmbedder>> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| Arc::new(LocalEmbedder::new(Self::default_cache_dir())))
+            .clone()
+    }
+
+    /// `<data_dir>/mnemis/models` — next to the default DB.
+    pub fn default_cache_dir() -> PathBuf {
+        dirs::data_dir()
+            .map(|d| d.join("mnemis/models"))
+            .unwrap_or_else(|| PathBuf::from("models"))
+    }
+
+    /// Run `f` against the loaded model on the blocking pool (inference and
+    /// the first-use download are both synchronous and CPU/IO heavy).
+    async fn with_model<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut TextEmbedding) -> Result<T> + Send + 'static,
+    {
+        let slot = self.model.clone();
+        let cache_dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = slot.lock().map_err(|_| anyhow!("embedder lock poisoned"))?;
+            if guard.is_none() {
+                info!(model = ?MODEL, cache = %cache_dir.display(), "loading embedding model");
+                let threads = std::thread::available_parallelism()
+                    .map(|n| (n.get() / 2).max(1))
+                    .unwrap_or(1);
+                let opts = TextInitOptions::new(MODEL)
+                    .with_cache_dir(cache_dir)
+                    .with_max_length(MAX_LENGTH)
+                    .with_intra_threads(threads)
+                    .with_show_download_progress(false);
+                *guard = Some(TextEmbedding::try_new(opts).context("loading embedding model")?);
+            }
+            f(guard.as_mut().expect("model loaded above"))
+        })
+        .await
+        .context("embedding task panicked")?
     }
 }
 
 #[async_trait]
-impl Embedder for OmlxEmbedder {
+impl Embedder for LocalEmbedder {
+    async fn prepare(&self) -> Result<()> {
+        self.with_model(|_| Ok(())).await
+    }
+
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let url = format!("{}/embeddings", self.base_url);
-        let body = EmbeddingsRequest {
-            model: &self.model,
-            input: text,
-        };
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(token) = &self.bearer_token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("embeddings API error (HTTP {status}): {body}");
-        }
-        let parsed: EmbeddingsResponse = serde_json::from_str(&body)
-            .with_context(|| format!("failed to parse embeddings response: {body}"))?;
-        let mut data = parsed.data;
-        let first = data.pop().context("empty embeddings response")?;
-        Ok(first.embedding)
+        let input = format!("{DOCUMENT_PROMPT}{text}");
+        self.with_model(move |m| {
+            m.embed([input], None)
+                .context("embedding text")?
+                .pop()
+                .context("embedding model returned no vector")
+        })
+        .await
     }
 }
 
@@ -95,6 +130,15 @@ const BATCH_SIZE: i64 = 100;
 
 /// Drain up to BATCH_SIZE queue entries once and return the count successfully embedded.
 pub async fn drain_once(pool: &SqlitePool, embedder: &dyn Embedder) -> Result<usize> {
+    let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue WHERE attempts < ?")
+        .bind(MAX_ATTEMPTS)
+        .fetch_one(pool)
+        .await?;
+    if pending.0 == 0 {
+        return Ok(0);
+    }
+    embedder.prepare().await?;
+
     let queue: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT id, target_kind, target_id FROM embed_queue \
          WHERE attempts < ? ORDER BY enqueued_at LIMIT ?",
@@ -372,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_non_finite_embedding_values() -> Result<()> {
-        // Regression: live OmlxEmbedder occasionally returns NaN/Inf for
+        // Regression: a server-backed embedder once returned returns NaN/Inf for
         // certain inputs, and serde_json serializes those as `null`. The
         // resulting JSON (`[0.5, null, 0.3, ...]`) makes sqlite-vec's
         // strtod-based vec_f32() parser bail with "JSON parsing error",
@@ -438,6 +482,29 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert_eq!(vcount, 1, "actions_vec should hold one embedding");
+        Ok(())
+    }
+
+    /// Live: downloads (first run) and loads the real model. Opt-in because of
+    /// the model download: `cargo test -p mnemis-engine local_embedder -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn local_embedder_produces_model_dim_vectors() -> Result<()> {
+        let embedder = LocalEmbedder::new(LocalEmbedder::default_cache_dir());
+        embedder.prepare().await?;
+        let a = embedder
+            .embed("Reunião amanhã às 10h sobre o orçamento")
+            .await?;
+        let b = embedder
+            .embed("Meeting tomorrow at 10am about the budget")
+            .await?;
+        let c = embedder.embed("The cat sat on the mat").await?;
+        assert_eq!(a.len(), 768, "must match the float[768] vec tables");
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        assert!(
+            dot(&a, &b) > dot(&a, &c),
+            "a translation should sit closer than an unrelated sentence"
+        );
         Ok(())
     }
 

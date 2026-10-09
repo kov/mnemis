@@ -47,7 +47,6 @@ secrets for mail sources are **not** stored here — they go in the OS keychain.
 [llm]
 base_url = "http://localhost:1234/v1"
 chat_model = "qwen3-30b-a3b"
-embedding_model = "nomic-embed-text"
 # bearer_token = "..."          # optional, for authenticated servers
 # max_context_tokens = 32768    # optional; the server's context window
 # request_timeout_secs = 300    # optional; per-request timeout
@@ -62,10 +61,13 @@ embedding_model = "nomic-embed-text"
 |-------|----------|---------|-------------|
 | `base_url` | yes | | Base URL of the Responses API server (include `/v1` if your server expects it) |
 | `chat_model` | yes | | Model used for extraction. Must match a model loaded on the server |
-| `embedding_model` | yes | | Model used for message/action embeddings |
 | `bearer_token` | no | | Bearer token for API authentication |
 | `max_context_tokens` | no | `32768` | The server's context window. mnemis sizes its message-window batches from this so a single call doesn't overflow the server |
 | `request_timeout_secs` | no | `300` | Total per-request timeout for chat calls. Bounds a hang if the server accepts a request and never answers |
+
+Embeddings are computed in-process (EmbeddingGemma-300M via fastembed); the
+model is downloaded once into `~/.local/share/mnemis/models/` (the platform data
+dir on macOS) on first use.
 
 ### `[paths]`
 

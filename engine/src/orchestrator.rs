@@ -509,10 +509,7 @@ mod tests {
         db::migrate(&pool).await?;
 
         let llm = MockLlm::new(vec![mock::no_tools("noop")]);
-        let embedder: Arc<dyn Embedder> = Arc::new(crate::embed::OmlxEmbedder::new(
-            "http://0.0.0.0".to_string(),
-            "noop".to_string(),
-        ));
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::test_util::FailingEmbedder);
         let out = sync_now(
             &pool,
             &llm,
@@ -641,10 +638,7 @@ mod tests {
         .await?;
 
         let source = OneMessageSource(SourceId(source_id));
-        let embedder: Arc<dyn Embedder> = Arc::new(crate::embed::OmlxEmbedder::new(
-            "http://0.0.0.0".to_string(),
-            "noop".to_string(),
-        ));
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::test_util::FailingEmbedder);
 
         let counts = sync_one_source_with(
             &pool,
@@ -714,10 +708,7 @@ mod tests {
         }
 
         let source = OneMessageSource(SourceId(source_id));
-        let embedder: Arc<dyn Embedder> = Arc::new(crate::embed::OmlxEmbedder::new(
-            "http://0.0.0.0".to_string(),
-            "noop".to_string(),
-        ));
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::test_util::FailingEmbedder);
 
         let counts = sync_one_source_with(
             &pool,

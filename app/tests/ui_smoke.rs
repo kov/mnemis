@@ -2543,7 +2543,7 @@ async fn toast_classifies_per_source_error() -> Result<()> {
         &config_path,
         format!(
             "[llm]\nbase_url = \"http://0.0.0.0:1/v1\"\nchat_model = \"none\"\n\
-             embedding_model = \"none\"\n\n[paths]\ndb = \"{}\"\n",
+             \n[paths]\ndb = \"{}\"\n",
             db_path.display(),
         ),
     )?;

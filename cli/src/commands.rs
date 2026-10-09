@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use mnemis_engine::config::Config;
 use mnemis_engine::db;
-use mnemis_engine::embed::{Embedder, OmlxEmbedder, drain_once};
+use mnemis_engine::embed::{Embedder, LocalEmbedder, drain_once};
 use mnemis_engine::extract::{extract_for_channel, prompt};
 use mnemis_engine::llm::LlmClient;
 use mnemis_engine::maintenance;
@@ -126,7 +126,7 @@ pub async fn add_source_imap(
 pub async fn sync(cfg: &Config) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
     let llm = build_llm(cfg);
-    let embedder: Arc<dyn Embedder> = Arc::new(build_embedder(cfg));
+    let embedder: Arc<dyn Embedder> = LocalEmbedder::shared();
 
     let count_sources: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sources")
         .fetch_one(&pool)
@@ -334,8 +334,8 @@ pub async fn chat(
 
 pub async fn embed_once(cfg: &Config) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
-    let embedder = build_embedder(cfg);
-    let processed = drain_once(&pool, &embedder).await?;
+    let embedder = LocalEmbedder::shared();
+    let processed = drain_once(&pool, embedder.as_ref()).await?;
     println!("Embedded {processed} target(s).");
     Ok(())
 }
@@ -348,14 +348,6 @@ fn build_llm(cfg: &Config) -> LlmClient {
         Some(t) => llm.with_bearer_token(t.clone()),
         None => llm,
     }
-}
-
-fn build_embedder(cfg: &Config) -> OmlxEmbedder {
-    let mut e = OmlxEmbedder::new(cfg.llm.base_url.clone(), cfg.llm.embedding_model.clone());
-    if let Some(t) = &cfg.llm.bearer_token {
-        e = e.with_bearer_token(t.clone());
-    }
-    e
 }
 
 pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {

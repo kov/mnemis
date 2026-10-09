@@ -30,6 +30,9 @@ toml = "1.1.2"
 base64 = "0.22.1"
 icalendar = "0.17.10"
 roxmltree = "0.21.1"
+# In-process embeddings (ONNX Runtime). Defaults off: no image models, and
+# rustls for both the model download and the ORT binary fetch, matching reqwest.
+fastembed = { version = "7.1.1", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 
 # Secret storage is OS-keychain-backed, with a per-platform backend behind the
 # `secrets` module's async API. Kept target-specific so neither backend's deps

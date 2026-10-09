@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use mnemis_engine::config::Config;
-use mnemis_engine::embed::{Embedder, OmlxEmbedder};
+use mnemis_engine::embed::{Embedder, LocalEmbedder};
 use mnemis_engine::llm::LlmClient;
 use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
@@ -357,7 +357,6 @@ async fn get_llm_config(_state: State<'_, AppState>) -> Result<LlmConfigDto, Str
             thinking_level: cfg.llm.resolved_thinking_level(),
             base_url: cfg.llm.base_url,
             chat_model: cfg.llm.chat_model,
-            embedding_model: cfg.llm.embedding_model,
             bearer_token: cfg.llm.bearer_token,
             config_path: cfg_path.display().to_string(),
         }),
@@ -373,7 +372,6 @@ async fn save_llm_config(state: State<'_, AppState>, cfg: LlmConfigDto) -> Resul
     config::save_llm(&config::LlmSection {
         base_url: cfg.base_url,
         chat_model: cfg.chat_model,
-        embedding_model: cfg.embedding_model,
         bearer_token: cfg.bearer_token.filter(|s| !s.trim().is_empty()),
         // None → save_llm keeps whatever's already in the file. This form
         // edits none of max_context_tokens / request_timeout_secs /
@@ -786,13 +784,9 @@ fn build_llm_stack(cfg: &Config) -> LlmStack {
     if let Some(t) = &cfg.llm.bearer_token {
         llm = llm.with_bearer_token(t.clone());
     }
-    let mut embedder = OmlxEmbedder::new(cfg.llm.base_url.clone(), cfg.llm.embedding_model.clone());
-    if let Some(t) = &cfg.llm.bearer_token {
-        embedder = embedder.with_bearer_token(t.clone());
-    }
     LlmStack {
         llm,
-        embedder: Arc::new(embedder),
+        embedder: LocalEmbedder::shared(),
         chat_model: cfg.llm.chat_model.clone(),
         window_char_budget: mnemis_engine::extract::window_char_budget_for(
             cfg.llm.resolved_max_context_tokens(),
