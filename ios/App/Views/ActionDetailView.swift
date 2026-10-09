@@ -20,6 +20,9 @@ struct ActionDetailView: View {
             }
 
             Section {
+                Button("Talk about this", systemImage: "bubble.left.and.text.bubble.right") {
+                    Task { await model.talkAbout(action) }
+                }
                 Button("Mark done", systemImage: "checkmark.circle") {
                     Task { await model.setStatus(action, to: .done) }
                 }

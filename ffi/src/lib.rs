@@ -6,21 +6,23 @@
 //! `mnemis-types` are exported as remote records, errors flatten to a message,
 //! and every call runs on a runtime this crate owns.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Once, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, Once, RwLock};
 use std::time::Duration;
 
 use mnemis_engine::embed::{Embedder, NoEmbedder};
 use mnemis_engine::llm::LlmBackend;
 use mnemis_engine::source::SourceId;
-use mnemis_engine::{config, db, mutations, orchestrator, queries, settings};
+use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, Confidence, LlmConfigDto, LlmProvider,
-    MessageActionRef, MessageDetailDto, ProfileIdentifier, SourceHealth, SourceRowDto,
-    SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
+    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
+    LlmConfigDto, LlmProvider, MessageActionRef, MessageDetailDto, ProfileIdentifier, SourceHealth,
+    SourceRowDto, SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
 };
 use sqlx::SqlitePool;
+use tokio_util::sync::CancellationToken;
 
 uniffi::setup_scaffolding!();
 
@@ -67,6 +69,7 @@ struct LlmStack {
     llm: LlmBackend,
     chat_model: String,
     window_char_budget: usize,
+    max_context_tokens: usize,
     idle_timeout: Duration,
 }
 
@@ -78,6 +81,7 @@ impl LlmStack {
             window_char_budget: mnemis_engine::extract::window_char_budget_for(
                 cfg.llm.resolved_max_context_tokens(),
             ),
+            max_context_tokens: cfg.llm.resolved_max_context_tokens(),
             idle_timeout: Duration::from_secs(cfg.llm.resolved_chat_idle_timeout_secs()),
         })
     }
@@ -88,6 +92,15 @@ pub struct Engine {
     pool: SqlitePool,
     data_dir: PathBuf,
     llm: RwLock<Option<Arc<LlmStack>>>,
+    /// Stop handles for in-flight chat sends, by chat id (one send per chat).
+    chat_cancels: Mutex<HashMap<i64, CancellationToken>>,
+}
+
+/// Receives a chat turn's events as the engine produces them. Implemented in
+/// Swift; called from engine threads, so the implementation hops to its own.
+#[uniffi::export(with_foreign)]
+pub trait ChatListener: Send + Sync {
+    fn on_event(&self, event: ChatEvent);
 }
 
 impl Engine {
@@ -134,6 +147,7 @@ impl Engine {
                 pool,
                 data_dir,
                 llm: RwLock::new(llm),
+                chat_cancels: Mutex::new(HashMap::new()),
             }))
         })
         .await
@@ -307,6 +321,125 @@ impl Engine {
         .await
     }
 
+    /// Chats, most recently active first.
+    pub async fn list_chats(&self, include_archived: bool) -> Result<Vec<ChatDto>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { chat::store::list_chats(&pool, include_archived).await }).await
+    }
+
+    /// Start a chat, blank or seeded from an entity (`"action"` / `"message"`
+    /// and its id), which titles it after that entity.
+    pub async fn create_chat(
+        &self,
+        seeded_from_kind: Option<String>,
+        seeded_from_id: Option<i64>,
+    ) -> Result<i64, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            chat::create_chat(&pool, seeded_from_kind.as_deref(), seeded_from_id).await
+        })
+        .await
+    }
+
+    /// The most recent chat seeded from this entity, so "Talk about this"
+    /// resumes rather than starting over.
+    pub async fn find_seeded_chat(
+        &self,
+        seeded_from_kind: String,
+        seeded_from_id: i64,
+    ) -> Result<Option<i64>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            chat::store::find_seeded_chat(&pool, &seeded_from_kind, seeded_from_id).await
+        })
+        .await
+    }
+
+    pub async fn chat_turns(&self, chat_id: i64) -> Result<Vec<ChatTurnDto>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { chat::store::load_turns(&pool, chat_id).await }).await
+    }
+
+    /// What a seeded chat is about, for its header; `None` for a blank chat.
+    pub async fn chat_seed_label(&self, chat_id: i64) -> Result<Option<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { chat::prompt::seed_label(&pool, chat_id).await }).await
+    }
+
+    pub async fn set_chat_archived(&self, chat_id: i64, archived: bool) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { chat::store::set_archived(&pool, chat_id, archived).await }).await
+    }
+
+    pub async fn delete_chat(&self, chat_id: i64) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { chat::store::delete_chat(&pool, chat_id).await }).await
+    }
+
+    /// Run one user message through the chat agent. Every event is persisted
+    /// before `listener` sees it, so the transcript from [`Self::chat_turns`]
+    /// is the truth; the events only make it live. Returns when the turn ends
+    /// (a `Done` or `Error` event has been delivered either way).
+    pub async fn send_chat_message(
+        self: Arc<Self>,
+        chat_id: i64,
+        text: String,
+        listener: Arc<dyn ChatListener>,
+    ) -> Result<(), MnemisError> {
+        let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
+            message: "No LLM configured. Set it up in Settings.".into(),
+        })?;
+        let cancel = CancellationToken::new();
+        if let Ok(mut map) = self.chat_cancels.lock() {
+            map.insert(chat_id, cancel.clone());
+        }
+        let engine = Arc::clone(&self);
+        let result = run(async move {
+            let pool = engine.pool.clone();
+            let system_prompt = chat::prompt::build_system_prompt(&pool, chat_id).await?;
+            let traces = config::traces_dir_for(&engine.data_dir.join("mnemis.db"));
+            let sink = move |e: ChatEvent| listener.on_event(e);
+            chat::run_chat_turn(
+                &pool,
+                &stack.llm,
+                &system_prompt,
+                chat_id,
+                &text,
+                stack.window_char_budget,
+                stack.max_context_tokens,
+                stack.idle_timeout,
+                Some(cancel),
+                &sink,
+                Some(&traces),
+            )
+            .await?;
+            // A blank chat gets a real title from its first message. Detached:
+            // the turn is over, and the list picks the title up on its next load.
+            let llm = stack.llm.clone();
+            tokio::spawn(async move {
+                if let Err(e) = chat::maybe_generate_title(&pool, &llm, chat_id, &text).await {
+                    tracing::debug!(error = %format!("{e:#}"), "chat title generation failed");
+                }
+            });
+            Ok(())
+        })
+        .await;
+        if let Ok(mut map) = self.chat_cancels.lock() {
+            map.remove(&chat_id);
+        }
+        result
+    }
+
+    /// Stop the in-flight send for `chat_id`; it ends with what it has so far.
+    /// A no-op when nothing is in flight.
+    pub fn cancel_chat_message(&self, chat_id: i64) {
+        if let Ok(map) = self.chat_cancels.lock()
+            && let Some(token) = map.get(&chat_id)
+        {
+            token.cancel();
+        }
+    }
+
     /// Poll every source, extract actions, and sync the calendar.
     pub async fn sync_now(&self) -> Result<SyncOutcome, MnemisError> {
         let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
@@ -476,6 +609,40 @@ pub struct ChannelRowDto {
     pub muted: bool,
     pub last_synced_at: Option<i64>,
     pub message_count: i64,
+}
+
+#[uniffi::remote(Record)]
+pub struct ChatDto {
+    pub id: i64,
+    pub title: Option<String>,
+    pub seeded_from_kind: Option<String>,
+    pub seeded_from_id: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived: bool,
+}
+
+#[uniffi::remote(Record)]
+pub struct ChatTurnDto {
+    pub id: i64,
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub reasoning: Option<String>,
+    pub created_at: i64,
+}
+
+#[uniffi::remote(Enum)]
+pub enum ChatEvent {
+    Delta { text: String },
+    Reasoning { text: String },
+    AssistantMessage { text: String },
+    ToolCall { name: String, arguments: String },
+    ToolResult { name: String, output: String },
+    Compacting,
+    Done,
+    Error { message: String },
 }
 
 #[uniffi::remote(Record)]

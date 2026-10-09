@@ -1,6 +1,11 @@
 import Foundation
 import Observation
 
+enum AppTab: Hashable {
+    case actions
+    case chat
+}
+
 /// The app's view of the engine: what the screens show, and the calls that
 /// change it. Everything correct-or-not lives in the Rust engine; this only
 /// keeps the latest answers around for SwiftUI.
@@ -12,7 +17,12 @@ final class AppModel {
     private(set) var sources: [SourceRowDto] = []
     private(set) var isSyncing = false
     private(set) var lastSync: SyncOutcome?
+    private(set) var chats: [ChatDto] = []
     var errorMessage: String?
+
+    var selectedTab: AppTab = .actions
+    var chatSelection: ChatDto.ID?
+    var showingSettings = false
 
     /// True until an LLM and at least one account are configured — the
     /// actions list shows a setup prompt instead of an empty list.
@@ -33,6 +43,7 @@ final class AppModel {
         do {
             actions = try await engine.listActions(includeResolved: false)
             sources = try await engine.listSources()
+            chats = try await engine.listChats(includeArchived: false)
             let llm = try await engine.llmConfig()
             needsSetup = sources.isEmpty || llm.chatModel.isEmpty
         } catch {
@@ -64,6 +75,56 @@ final class AppModel {
             report(error)
         }
         await refresh()
+    }
+
+    func refreshChats() async {
+        guard let engine else { return }
+        do {
+            chats = try await engine.listChats(includeArchived: false)
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Open the chat about `action` — the existing one if there is one — on
+    /// the Chat tab.
+    func talkAbout(_ action: ActionDto) async {
+        guard let engine else { return }
+        do {
+            let id: Int64
+            if let existing = try await engine.findSeededChat(seededFromKind: "action", seededFromId: action.id) {
+                id = existing
+            } else {
+                id = try await engine.createChat(seededFromKind: "action", seededFromId: action.id)
+            }
+            await refreshChats()
+            chatSelection = id
+            selectedTab = .chat
+        } catch {
+            report(error)
+        }
+    }
+
+    func newChat() async {
+        guard let engine else { return }
+        do {
+            let id = try await engine.createChat(seededFromKind: nil, seededFromId: nil)
+            await refreshChats()
+            chatSelection = id
+        } catch {
+            report(error)
+        }
+    }
+
+    func deleteChat(_ chat: ChatDto) async {
+        guard let engine else { return }
+        do {
+            try await engine.deleteChat(chatId: chat.id)
+            if chatSelection == chat.id { chatSelection = nil }
+        } catch {
+            report(error)
+        }
+        await refreshChats()
     }
 
     func report(_ error: Error) {

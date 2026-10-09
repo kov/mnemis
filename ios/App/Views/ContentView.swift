@@ -2,18 +2,54 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
-    @State private var selection: ActionDto.ID?
-    @State private var showingSettings = false
 
     var body: some View {
         @Bindable var model = model
+        TabView(selection: $model.selectedTab) {
+            Tab("Actions", systemImage: "checklist", value: AppTab.actions) {
+                ActionsView()
+            }
+            Tab("Chat", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
+                ChatsView()
+            }
+        }
+        .tabViewStyle(.sidebarAdaptable)
+        .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
+            SettingsView()
+        }
+        .alert(
+            "Something went wrong",
+            isPresented: Binding(
+                get: { model.errorMessage != nil },
+                set: { if !$0 { model.errorMessage = nil } }
+            ),
+            presenting: model.errorMessage
+        ) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { message in
+            Text(message)
+        }
+    }
+}
+
+struct SettingsButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Settings", systemImage: "gearshape") { model.showingSettings = true }
+    }
+}
+
+struct ActionsView: View {
+    @Environment(AppModel.self) private var model
+    @State private var selection: ActionDto.ID?
+
+    var body: some View {
         NavigationSplitView {
             ActionListView(selection: $selection)
                 .navigationTitle("Actions")
                 .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Settings", systemImage: "gearshape") { showingSettings = true }
-                    }
+                    ToolbarItem(placement: .topBarLeading) { SettingsButton() }
                     ToolbarItem(placement: .topBarTrailing) {
                         if model.isSyncing {
                             ProgressView()
@@ -31,21 +67,6 @@ struct ContentView: View {
             } else {
                 ContentUnavailableView("No action selected", systemImage: "checklist")
             }
-        }
-        .sheet(isPresented: $showingSettings, onDismiss: { Task { await model.refresh() } }) {
-            SettingsView()
-        }
-        .alert(
-            "Something went wrong",
-            isPresented: Binding(
-                get: { model.errorMessage != nil },
-                set: { if !$0 { model.errorMessage = nil } }
-            ),
-            presenting: model.errorMessage
-        ) { _ in
-            Button("OK", role: .cancel) {}
-        } message: { message in
-            Text(message)
         }
     }
 }
