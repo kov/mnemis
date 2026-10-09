@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use mnemis_engine::embed::{Embedder, NoEmbedder};
 use mnemis_engine::llm::LlmBackend;
+use mnemis_engine::source::SourceId;
 use mnemis_engine::{config, db, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, Confidence, LlmConfigDto, LlmProvider, MessageActionRef,
-    MessageDetailDto, ProfileIdentifier, SourceHealth, SourceRowDto, SourceStatus, StatusSnapshot,
-    SyncOutcome, ThinkingLevel, UserProfileDto,
+    ActionDto, ActionStatus, ChannelRowDto, Confidence, LlmConfigDto, LlmProvider,
+    MessageActionRef, MessageDetailDto, ProfileIdentifier, SourceHealth, SourceRowDto,
+    SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
 };
 use sqlx::SqlitePool;
 
@@ -196,6 +197,38 @@ impl Engine {
     pub async fn delete_source(&self, source_id: i64) -> Result<(), MnemisError> {
         let pool = self.pool.clone();
         run(async move { settings::delete_source(&pool, source_id).await }).await
+    }
+
+    /// The source's folders, refreshed from the server first so ones created
+    /// there show up. Discovery is best-effort: offline, the known folders
+    /// still come back.
+    pub async fn list_folders(&self, source_id: i64) -> Result<Vec<ChannelRowDto>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            match orchestrator::build_imap_source(&pool, SourceId(source_id)).await {
+                Ok(source) => {
+                    if let Err(e) = orchestrator::discover_channels(&pool, &source, source_id).await
+                    {
+                        tracing::warn!(error = %format!("{e:#}"), source_id, "folder discovery failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), source_id, "no source for discovery")
+                }
+            }
+            settings::list_source_channels(&pool, source_id).await
+        })
+        .await
+    }
+
+    /// Subscribe to (poll) or mute a folder.
+    pub async fn set_folder_subscribed(
+        &self,
+        channel_id: i64,
+        subscribed: bool,
+    ) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { settings::set_channel_muted(&pool, channel_id, !subscribed).await }).await
     }
 
     pub async fn user_profile(&self) -> Result<UserProfileDto, MnemisError> {
@@ -431,6 +464,18 @@ pub struct SourceRowDto {
     pub health: SourceHealth,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+#[uniffi::remote(Record)]
+pub struct ChannelRowDto {
+    pub id: i64,
+    pub source_id: i64,
+    pub external_id: String,
+    pub name: String,
+    pub kind: String,
+    pub muted: bool,
+    pub last_synced_at: Option<i64>,
+    pub message_count: i64,
 }
 
 #[uniffi::remote(Record)]

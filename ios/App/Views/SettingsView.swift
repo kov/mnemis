@@ -73,7 +73,9 @@ struct SettingsView: View {
 
                 Section("Mail accounts") {
                     ForEach(model.sources, id: \.id) { source in
-                        SourceRow(source: source)
+                        NavigationLink { FoldersView(source: source) } label: {
+                            SourceRow(source: source)
+                        }
                     }
                     .onDelete(perform: deleteSources)
                     NavigationLink("Add account") { AddAccountView() }
