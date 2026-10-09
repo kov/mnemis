@@ -25,6 +25,10 @@ pub struct ChannelInfo {
     pub name: String,
     /// 'mailbox' | 'channel' | 'dm' | 'group'
     pub kind: String,
+    /// Whether a newly discovered channel starts subscribed (polled) rather
+    /// than muted. Only consulted the first time a channel is seen; after that
+    /// the user's choice stands.
+    pub subscribed_by_default: bool,
 }
 
 #[derive(Debug, Clone)]

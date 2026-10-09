@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_imap::Session;
+use async_imap::types::NameAttribute;
 use async_native_tls::TlsStream;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -12,6 +13,19 @@ use super::{
     ChannelInfo, Cursor, ImportedAuthor, ImportedMessage, PollBatch, Recipient, Source, SourceId,
     SourceKind,
 };
+
+/// New folders start muted except the inbox and the sent folder: what was
+/// asked of the user and what they promised. The sent folder is the one the
+/// server flags `\Sent` (RFC 6154), or failing that, one named like it.
+fn subscribed_by_default(mailbox: &str, flagged_sent: bool) -> bool {
+    if mailbox.eq_ignore_ascii_case("INBOX") || flagged_sent {
+        return true;
+    }
+    let leaf = mailbox.rsplit(['/', '.']).next().unwrap_or(mailbox);
+    ["sent", "sent items", "sent messages", "sent mail"]
+        .iter()
+        .any(|n| leaf.eq_ignore_ascii_case(n))
+}
 
 /// How many recent UIDs to pull on first poll or after UIDVALIDITY change.
 const BOOTSTRAP_MESSAGE_COUNT: u32 = 50;
@@ -100,6 +114,10 @@ impl Source for ImapSource {
                 external_id: n.name().to_string(),
                 name: super::imap_utf7::decode_mailbox_name(n.name()),
                 kind: "mailbox".to_string(),
+                subscribed_by_default: subscribed_by_default(
+                    n.name(),
+                    n.attributes().contains(&NameAttribute::Sent),
+                ),
             })
             .collect();
         let _ = session.logout().await;
@@ -376,7 +394,30 @@ fn compress_uid_set(uids: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compress_uid_set;
+    use super::{compress_uid_set, subscribed_by_default};
+
+    #[test]
+    fn only_the_inbox_and_sent_folder_are_subscribed_by_default() {
+        assert!(subscribed_by_default("INBOX", false));
+        assert!(subscribed_by_default("Inbox", false));
+        assert!(
+            subscribed_by_default("Enviadas", true),
+            "the server's \\Sent flag wins"
+        );
+        assert!(subscribed_by_default("Sent", false));
+        assert!(subscribed_by_default("INBOX.Sent Items", false));
+        assert!(subscribed_by_default("[Gmail]/Sent Mail", false));
+        for other in [
+            "Archive",
+            "Trash",
+            "Junk Mail",
+            "Drafts",
+            "INBOX/Lembrar",
+            "Sentinel",
+        ] {
+            assert!(!subscribed_by_default(other, false), "{other}");
+        }
+    }
 
     #[test]
     fn compresses_contiguous_ranges() {

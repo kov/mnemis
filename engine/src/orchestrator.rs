@@ -426,14 +426,17 @@ pub async fn discover_channels(
 ) -> Result<usize> {
     let channels = source.list_channels().await.context("listing channels")?;
     for ch in &channels {
+        // A folder seen for the first time takes the source's default; one we
+        // already know keeps whatever the user chose.
         sqlx::query(
-            "INSERT INTO channels (source_id, external_id, name, kind) \
-             VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO channels (source_id, external_id, name, kind, muted) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         )
         .bind(source_id)
         .bind(&ch.external_id)
         .bind(&ch.name)
         .bind(&ch.kind)
+        .bind(!ch.subscribed_by_default)
         .execute(pool)
         .await
         .with_context(|| format!("upserting channel {}", ch.external_id))?;
@@ -757,11 +760,13 @@ mod tests {
                     external_id: "INBOX".to_string(),
                     name: "INBOX".to_string(),
                     kind: "mailbox".to_string(),
+                    subscribed_by_default: true,
                 },
                 ChannelInfo {
                     external_id: "INBOX/Lembrar".to_string(),
                     name: "INBOX/Lembrar".to_string(),
                     kind: "mailbox".to_string(),
+                    subscribed_by_default: false,
                 },
             ])
         }
@@ -799,9 +804,22 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert_eq!(count, 2, "both folders inserted");
+        let muted_of = |ext: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let (m,): (i64,) =
+                    sqlx::query_as("SELECT muted FROM channels WHERE external_id = ?")
+                        .bind(ext)
+                        .fetch_one(&pool)
+                        .await?;
+                anyhow::Ok(m)
+            }
+        };
+        assert_eq!(muted_of("INBOX").await?, 0, "subscribed by default");
+        assert_eq!(muted_of("INBOX/Lembrar").await?, 1, "muted by default");
 
-        // Mute one, then re-discover: no duplicates, mute preserved.
-        sqlx::query("UPDATE channels SET muted = 1 WHERE external_id = 'INBOX/Lembrar'")
+        // Flip both, then re-discover: no duplicates, the user's choice stands.
+        sqlx::query("UPDATE channels SET muted = 1 - muted")
             .execute(&pool)
             .await?;
         discover_channels(&pool, &source, source_id).await?;
@@ -811,11 +829,16 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert_eq!(count, 2, "re-discovery adds no duplicates");
-        let (muted,): (i64,) =
-            sqlx::query_as("SELECT muted FROM channels WHERE external_id = 'INBOX/Lembrar'")
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(muted, 1, "re-discovery preserves mute state");
+        assert_eq!(
+            muted_of("INBOX").await?,
+            1,
+            "re-discovery preserves mute state"
+        );
+        assert_eq!(
+            muted_of("INBOX/Lembrar").await?,
+            0,
+            "re-discovery preserves mute state"
+        );
         Ok(())
     }
 }
