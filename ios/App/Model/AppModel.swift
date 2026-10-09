@@ -28,6 +28,10 @@ final class AppModel {
     var columnVisibility: NavigationSplitViewVisibility = .all
     var chatSelection: ChatDto.ID?
     var showingSettings = false
+    /// The action just dismissed, while the "why?" sheet is up.
+    var pendingDismissal: ActionDto?
+    /// A dismissal reason is being merged into memory.
+    private(set) var isLearning = false
 
     /// True until an LLM and at least one account are configured — the
     /// actions list shows a setup prompt instead of an empty list.
@@ -130,6 +134,32 @@ final class AppModel {
             report(error)
         }
         await refreshChats()
+    }
+
+    /// Dismiss at once, like the desktop, then ask why; the answer is optional.
+    func dismiss(_ action: ActionDto) async {
+        await setStatus(action, to: .dismissed)
+        if actionSelection == action.id { actionSelection = nil }
+        pendingDismissal = action
+    }
+
+    /// Record the reason and merge it into memory in the background.
+    func teach(_ action: ActionDto, reason: String) async {
+        let reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let engine, !reason.isEmpty else { return }
+        do {
+            try await engine.recordDismissalReason(actionId: action.id, reason: reason)
+        } catch {
+            report(error)
+            return
+        }
+        isLearning = true
+        defer { isLearning = false }
+        do {
+            _ = try await engine.learnFromDismissal(actionId: action.id, reason: reason)
+        } catch {
+            report(error)
+        }
     }
 
     func report(_ error: Error) {

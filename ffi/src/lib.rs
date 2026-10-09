@@ -15,11 +15,12 @@ use std::time::Duration;
 use mnemis_engine::embed::{Embedder, NoEmbedder};
 use mnemis_engine::llm::LlmBackend;
 use mnemis_engine::source::SourceId;
-use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
+use mnemis_engine::{chat, config, db, memory, mutations, orchestrator, queries, settings};
 use mnemis_types::{
     ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
-    LlmConfigDto, LlmProvider, MessageActionRef, MessageDetailDto, ProfileIdentifier, SourceHealth,
-    SourceRowDto, SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
+    FeedbackKind, LlmConfigDto, LlmProvider, MessageActionRef, MessageDetailDto, ProfileIdentifier,
+    SourceHealth, SourceRowDto, SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel,
+    UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
@@ -180,6 +181,63 @@ impl Engine {
             mutations::update_action_status(&pool, action_id, status, dismissed_reason).await
         })
         .await
+    }
+
+    /// Record why the user dismissed `action_id` (the action is already
+    /// dismissed with [`Self::set_action_status`]). Follow with
+    /// [`Self::learn_from_dismissal`] to merge the reason into memory.
+    pub async fn record_dismissal_reason(
+        &self,
+        action_id: i64,
+        reason: String,
+    ) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            mutations::record_dismissal_feedback(
+                &pool,
+                action_id,
+                FeedbackKind::Dismissed,
+                Some(reason),
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Merge a dismissal reason into the memory rules (one LLM call) and
+    /// return the updated rules.
+    pub async fn learn_from_dismissal(
+        &self,
+        action_id: i64,
+        reason: String,
+    ) -> Result<String, MnemisError> {
+        let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
+            message: "No LLM configured, so the reason was saved but not learned yet.".into(),
+        })?;
+        let pool = self.pool.clone();
+        run(async move {
+            memory::learn_from_feedback(
+                &pool,
+                &stack.llm,
+                action_id,
+                FeedbackKind::Dismissed,
+                &reason,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// The rules learned from feedback, `None` until there are any.
+    pub async fn memory_rules(&self) -> Result<Option<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { memory::rules(&pool).await }).await
+    }
+
+    /// Replace the rules with the user's edit; empty clears them.
+    pub async fn save_memory_rules(&self, rules: String) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { memory::save_rules(&pool, &rules).await }).await
     }
 
     pub async fn status(&self) -> Result<StatusSnapshot, MnemisError> {

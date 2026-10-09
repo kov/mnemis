@@ -27,7 +27,7 @@ struct ActionDetailView: View {
                     Task { await model.setStatus(action, to: .done) }
                 }
                 Button("Dismiss", systemImage: "xmark.circle", role: .destructive) {
-                    Task { await model.setStatus(action, to: .dismissed) }
+                    Task { await model.dismiss(action) }
                 }
             }
 

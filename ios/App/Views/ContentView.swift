@@ -18,6 +18,9 @@ struct ContentView: View {
             }
             .frame(maxHeight: .infinity)
         }
+        .sheet(item: $model.pendingDismissal) { action in
+            DismissReasonSheet(action: action)
+        }
         .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
             SettingsView()
         }
@@ -54,6 +57,12 @@ struct HeaderBar: View {
                     }
                 }
                 HeaderButton("Settings", systemImage: "gearshape") { model.showingSettings = true }
+                if model.isLearning {
+                    Label("Learning…", systemImage: "brain")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .symbolEffect(.pulse)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -105,18 +114,16 @@ private struct HeaderButton: View {
     }
 }
 
-/// Actions | Chat, icon-only.
+/// Actions | Chat.
 struct SectionSwitcher: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         @Bindable var model = model
         Picker("Section", selection: $model.selectedTab) {
-            Image(systemName: "checklist")
-                .accessibilityLabel("Actions")
+            Label("Actions", systemImage: "checklist")
                 .tag(AppTab.actions)
-            Image(systemName: "bubble.left.and.text.bubble.right")
-                .accessibilityLabel("Chat")
+            Label("Chat", systemImage: "bubble.left.and.text.bubble.right")
                 .tag(AppTab.chat)
         }
         .pickerStyle(.segmented)
@@ -171,7 +178,7 @@ struct ActionListView: View {
                     }
                     .swipeActions(edge: .trailing) {
                         Button("Dismiss", systemImage: "xmark") {
-                            Task { await model.setStatus(action, to: .dismissed) }
+                            Task { await model.dismiss(action) }
                         }
                         .tint(.gray)
                     }

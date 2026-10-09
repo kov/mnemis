@@ -71,6 +71,16 @@ struct SettingsView: View {
                     }
                 }
 
+                Section {
+                    NavigationLink {
+                        MemoryView()
+                    } label: {
+                        Label("Memory", systemImage: "brain")
+                    }
+                } footer: {
+                    Text("Rules mnemis has learned from your feedback.")
+                }
+
                 Section("Mail accounts") {
                     ForEach(model.sources, id: \.id) { source in
                         NavigationLink { FoldersView(source: source) } label: {
