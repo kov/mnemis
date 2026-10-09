@@ -5,6 +5,10 @@ struct ChatView: View {
     @State private var session: ChatSession
     @State private var draft = ""
     @FocusState private var composerFocused: Bool
+    @State private var position = ScrollPosition(edge: .bottom)
+    /// Keep the newest lines in view as the transcript grows, until the
+    /// reader scrolls up.
+    @State private var followsBottom = true
 
     init(chatId: Int64) {
         _session = State(initialValue: ChatSession(chatId: chatId))
@@ -43,7 +47,21 @@ struct ChatView: View {
             .frame(maxWidth: 760)
             .frame(maxWidth: .infinity)
         }
-        .defaultScrollAnchor(.bottom)
+        .scrollPosition($position)
+        // Heights settle after the turns load (lazy rows, the push
+        // animation), so a one-off scroll to the end stops short and leaves
+        // the last lines under the composer. Re-pin whenever the content
+        // grows instead.
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { _, _ in
+            if followsBottom { position.scrollTo(edge: .bottom) }
+        }
+        .onScrollPhaseChange { _, phase, context in
+            guard phase == .idle else { return }
+            let geometry = context.geometry
+            let end = geometry.contentSize.height + geometry.contentInsets.bottom
+                - geometry.containerSize.height
+            followsBottom = geometry.contentOffset.y >= end - 40
+        }
         .scrollDismissesKeyboard(.interactively)
         // A safe-area bar, unlike an inset, gets the scroll edge effect.
         .safeAreaBar(edge: .bottom) { composer }
@@ -98,6 +116,7 @@ struct ChatView: View {
         guard let engine = model.engine else { return }
         let text = draft
         draft = ""
+        followsBottom = true
         Task { await session.send(text, engine: engine, model: model) }
     }
 }
