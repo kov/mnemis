@@ -10,6 +10,14 @@ use tracing::{info, warn};
 /// without loading a real model.
 #[async_trait]
 pub trait Embedder: Send + Sync {
+    /// Whether this embedder produces vectors at all. A host without one (the
+    /// iOS bindings, until the platform embedder lands) passes
+    /// [`NoEmbedder`]; drains then leave the queue untouched instead of
+    /// burning every entry's retry budget, so a real embedder picks it up later.
+    fn enabled(&self) -> bool {
+        true
+    }
+
     /// Make the embedder ready to serve (e.g. download/load a model). Called
     /// once per drain before any entry is touched, so a failure here — no
     /// network for the first model download, a corrupt cache — skips the drain
@@ -26,6 +34,20 @@ pub trait Embedder: Send + Sync {
     /// the default treats them alike.
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embed(text).await
+    }
+}
+
+/// The embedder for hosts that have none: drains skip, search stays keyword-only.
+pub struct NoEmbedder;
+
+#[async_trait]
+impl Embedder for NoEmbedder {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+        bail!("no embedder configured")
     }
 }
 
@@ -215,6 +237,9 @@ pub async fn drain_continuously(pool: SqlitePool, embedder: Arc<dyn Embedder>) {
 
 /// Drain up to BATCH_SIZE queue entries once and return the count successfully embedded.
 pub async fn drain_once(pool: &SqlitePool, embedder: &dyn Embedder) -> Result<usize> {
+    if !embedder.enabled() {
+        return Ok(0);
+    }
     let _serialized = DRAIN_LOCK.lock().await;
     let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue WHERE attempts < ?")
         .bind(MAX_ATTEMPTS)
@@ -488,6 +513,23 @@ mod tests {
         assert_eq!(attempts, 1);
         assert!(err.unwrap().contains("simulated failure"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_embedder_leaves_the_queue_untouched() -> Result<()> {
+        let (_tmp, pool) = setup_with_messages().await?;
+        let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue WHERE attempts = 0")
+            .fetch_one(&pool)
+            .await?;
+        assert!(before.0 > 0);
+
+        assert_eq!(drain_once(&pool, &NoEmbedder).await?, 0);
+
+        let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embed_queue WHERE attempts = 0")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(after.0, before.0, "no entry should have spent a retry");
         Ok(())
     }
 
