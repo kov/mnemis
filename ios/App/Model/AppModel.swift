@@ -70,18 +70,24 @@ final class AppModel {
             }
             // `-MnemisEval 2026-07-20:2026-08-21:50` scores extraction with
             // the current LLM over the mail of those dates that actions came
-            // from, plus 50 other messages, writing nothing.
+            // from, plus 50 other messages, writing nothing. A fourth part,
+            // `staged`, uses the per-message staged turns.
             if let spec = UserDefaults.standard.string(forKey: "MnemisEval") {
                 let parts = spec.split(separator: ":").map(String.init)
                 let day = Date.ISO8601FormatStyle().year().month().day()
+                // A long run must not let the device lock: iOS kills a
+                // backgrounded app that keeps the model busy.
+                UIApplication.shared.isIdleTimerDisabled = true
+                defer { UIApplication.shared.isIdleTimerDisabled = false }
                 do {
-                    guard parts.count == 3, let others = Int64(parts[2]) else {
-                        throw MnemisError.Failed(message: "expected from:to:others")
+                    guard parts.count >= 3, let others = Int64(parts[2]) else {
+                        throw MnemisError.Failed(message: "expected from:to:others[:staged]")
                     }
                     let report = try await engine.evaluateExtraction(
                         from: Int64(try day.parse(parts[0]).timeIntervalSince1970),
                         to: Int64(try day.parse(parts[1]).timeIntervalSince1970),
-                        others: others
+                        others: others,
+                        staged: parts.count > 3 && parts[3] == "staged"
                     )
                     print("[MnemisEval] \(report)")
                 } catch {

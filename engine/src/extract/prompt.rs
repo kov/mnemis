@@ -192,7 +192,11 @@ pub fn build(inputs: &PromptInputs) -> String {
 /// matches one of the user's identifiers with `(you)` — the direct-recipient
 /// signal the model uses to tell "addressed to me" from "merely cc'd". Emits
 /// nothing for a kind with no recipients (e.g. chat sources have none).
-fn render_recipients(out: &mut String, recipients: &[Recipient], user_identifiers: &[String]) {
+pub(crate) fn render_recipients(
+    out: &mut String,
+    recipients: &[Recipient],
+    user_identifiers: &[String],
+) {
     let is_self = |r: &Recipient| {
         r.address
             .as_deref()

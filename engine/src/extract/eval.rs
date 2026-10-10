@@ -17,9 +17,18 @@ use sqlx::SqlitePool;
 
 use super::{
     DryCall, ExtractionScope, batch_system_prompt, load_channel, load_existing_actions, load_rows,
-    load_user_profile_for, run_agent_loop, split_into_batches,
+    load_user_profile_for, run_agent_loop, split_into_batches, staged,
 };
 use crate::llm::LlmTransport;
+
+/// How the model is driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// The production agent loop over a batch's metadata.
+    Agent,
+    /// Per message: summarise, judge 0/1, then record (see `staged`).
+    Staged,
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct EvalReport {
@@ -45,6 +54,7 @@ pub struct EvalReport {
 /// Evaluate over the messages of unmuted channels posted in `[from, to)`
 /// (unix seconds): every one an action was recorded from, plus `others` more,
 /// picked by a fixed scramble of their ids so repeated runs see the same set.
+#[allow(clippy::too_many_arguments)]
 pub async fn evaluate(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
@@ -53,6 +63,7 @@ pub async fn evaluate(
     from: i64,
     to: i64,
     others: i64,
+    strategy: Strategy,
 ) -> Result<EvalReport> {
     let started = Instant::now();
     let picked: Vec<(i64, i64)> = sqlx::query_as(
@@ -88,6 +99,7 @@ pub async fn evaluate(
             idle_timeout,
             channel_id,
             &ids,
+            strategy,
             &mut report,
         )
         .await?;
@@ -96,6 +108,7 @@ pub async fn evaluate(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_channel(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
@@ -103,6 +116,7 @@ async fn evaluate_channel(
     idle_timeout: Duration,
     channel_id: i64,
     ids: &HashSet<i64>,
+    strategy: Strategy,
     report: &mut EvalReport,
 ) -> Result<()> {
     let channel = load_channel(pool, channel_id).await?;
@@ -172,6 +186,25 @@ async fn evaluate_channel(
             .max()
             .and_then(|t| chrono::DateTime::from_timestamp(t + 600, 0))
             .unwrap_or_else(chrono::Utc::now);
+        if strategy == Strategy::Staged {
+            let ctx = staged::Context {
+                profile: &profile,
+                memory_rules: memory_rules.as_deref(),
+                existing: &existing,
+                now,
+                body_chars: window_char_budget,
+                idle_timeout,
+            };
+            for message in &batch {
+                match staged::run(pool, llm, scope, &ctx, message, Some(&mut calls)).await {
+                    Ok(summary) => report
+                        .summaries
+                        .push(format!("{}: {summary}", channel.name)),
+                    Err(e) => report.errors.push(format!("{}: {e:#}", channel.name)),
+                }
+            }
+            continue;
+        }
         let prompt = batch_system_prompt(
             &channel,
             &profile,
@@ -330,6 +363,7 @@ mod tests {
             now - 3600,
             now + 3600,
             1,
+            Strategy::Agent,
         )
         .await?;
 
@@ -343,6 +377,64 @@ mod tests {
         assert!(report.errors.is_empty());
         // Nothing the model "recorded" reached the database.
         assert_eq!(fetch_actions(&pool).await?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_strategy_records_only_what_it_judges_actionable() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let pool = crate::db::open(&tmp.path().join("t.db")).await?;
+        crate::db::migrate(&pool).await?;
+        let ctx = seed_minimal(&pool).await?;
+        seed_messages(
+            &pool,
+            ctx.source_id,
+            ctx.channel_id,
+            &[
+                message("ask", "Review", "Can you review the budget by Friday?"),
+                message("news", "Digest", "Ten crates you should know about."),
+            ],
+        )
+        .await?;
+        let args = serde_json::json!({
+            "title": "Review the budget", "details": "", "confidence": "high", "rationale": "",
+            "evidence_external_ids": ["ask"],
+        });
+        tools::dispatch(
+            &pool,
+            tools::ToolScope::Source(ctx.source_id),
+            &mut tools::FetchBudget::unlimited(),
+            "record_action",
+            &args.to_string(),
+        )
+        .await;
+
+        // Per message: a summary, a verdict, and (on 1) the recording turns.
+        let llm = MockLlm::new(vec![
+            mock::no_tools("Ana asks the user to review the budget by Friday."),
+            mock::no_tools("1"),
+            mock::record_action("Review the budget", "high", &["ask"]),
+            mock::no_tools("Ten crates newsletter."),
+            mock::no_tools("0"),
+        ]);
+        let now = chrono::Utc::now().timestamp();
+        let report = evaluate(
+            &pool,
+            &llm,
+            100_000,
+            Duration::from_secs(5),
+            now - 3600,
+            now + 3600,
+            5,
+            Strategy::Staged,
+        )
+        .await?;
+
+        assert_eq!(report.found, vec!["Review the budget"]);
+        assert!(report.invented.is_empty());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.summaries.len(), 2);
+        assert_eq!(fetch_actions(&pool).await?.len(), 1);
         Ok(())
     }
 }

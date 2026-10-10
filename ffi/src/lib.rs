@@ -591,12 +591,14 @@ impl Engine {
     /// Development tool: score the configured LLM's extraction over the
     /// messages posted in `[from, to)` (unix seconds) that actions were
     /// recorded from, plus `others` more, without writing anything (see
-    /// `extract::eval`). Returns the report as JSON.
+    /// `extract::eval`). `staged` picks the per-message staged strategy over
+    /// the agent loop. Returns the report as JSON.
     pub async fn evaluate_extraction(
         &self,
         from: i64,
         to: i64,
         others: i64,
+        staged: bool,
     ) -> Result<String, MnemisError> {
         let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
             message: "No LLM configured. Set it up in Settings.".into(),
@@ -611,6 +613,11 @@ impl Engine {
                 from,
                 to,
                 others,
+                if staged {
+                    mnemis_engine::extract::eval::Strategy::Staged
+                } else {
+                    mnemis_engine::extract::eval::Strategy::Agent
+                },
             )
             .await?;
             Ok(serde_json::to_string_pretty(&report)?)

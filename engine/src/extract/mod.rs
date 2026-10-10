@@ -11,6 +11,7 @@ use crate::source::Recipient;
 
 pub mod eval;
 pub mod prompt;
+mod staged;
 pub mod tools;
 pub mod trace;
 
@@ -594,6 +595,40 @@ pub(crate) struct DryCall {
 
 const MUTATING_TOOLS: [&str; 3] = ["record_action", "update_action", "resolve_action"];
 
+/// Run a tool call — or, with `dry`, capture it if it would change actions,
+/// answering as if it had worked.
+async fn dispatch_or_capture(
+    pool: &SqlitePool,
+    scope: ExtractionScope,
+    fetch_budget: &mut tools::FetchBudget,
+    dry: Option<&mut Vec<DryCall>>,
+    name: &str,
+    arguments: &str,
+) -> tools::DispatchOutput {
+    match dry {
+        Some(calls) if MUTATING_TOOLS.contains(&name) => {
+            calls.push(DryCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            });
+            let recorded = name == "record_action";
+            let output = if recorded {
+                serde_json::json!({
+                    "action_id": format!("A-{}", 900_000 + calls.len()),
+                    "status": "recorded",
+                })
+            } else {
+                serde_json::json!({ "status": "ok" })
+            };
+            tools::DispatchOutput {
+                output: output.to_string(),
+                recorded_action: recorded,
+            }
+        }
+        _ => tools::dispatch(pool, scope.tool_scope(), fetch_budget, name, arguments).await,
+    }
+}
+
 /// Run the extraction agent over one batch. With `dry`, the tools that change
 /// actions only record their calls there (answering as if they had worked) —
 /// for evaluations that must not touch the user's data.
@@ -729,37 +764,15 @@ async fn run_agent_loop(
 
         for (call_id, name, arguments) in function_calls {
             debug!(name = %name, call_id = %call_id, "dispatching tool");
-            let out = match dry.as_deref_mut() {
-                Some(calls) if MUTATING_TOOLS.contains(&name.as_str()) => {
-                    calls.push(DryCall {
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    });
-                    let recorded = name == "record_action";
-                    let output = if recorded {
-                        serde_json::json!({
-                            "action_id": format!("A-{}", 900_000 + calls.len()),
-                            "status": "recorded",
-                        })
-                    } else {
-                        serde_json::json!({ "status": "ok" })
-                    };
-                    tools::DispatchOutput {
-                        output: output.to_string(),
-                        recorded_action: recorded,
-                    }
-                }
-                _ => {
-                    tools::dispatch(
-                        pool,
-                        scope.tool_scope(),
-                        &mut fetch_budget,
-                        &name,
-                        &arguments,
-                    )
-                    .await
-                }
-            };
+            let out = dispatch_or_capture(
+                pool,
+                scope,
+                &mut fetch_budget,
+                dry.as_deref_mut(),
+                &name,
+                &arguments,
+            )
+            .await;
             if out.recorded_action {
                 actions_created += 1;
             }
