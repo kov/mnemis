@@ -973,6 +973,7 @@ mod tests {
             body: "Please take a look".to_string(),
             body_format: "text".to_string(),
             recipients: Vec::new(),
+            links: None,
             raw_json: None,
             flags: 0,
         };
@@ -1105,6 +1106,7 @@ mod tests {
             body: "And one more thing".to_string(),
             body_format: "text".to_string(),
             recipients: Vec::new(),
+            links: None,
             raw_json: None,
             flags: 0,
         };

@@ -69,6 +69,9 @@ enum Command {
     },
     /// Drain the embed queue once against the configured embedding model. For debugging.
     EmbedOnce,
+    /// Fill in the links of mail ingested before links were kept, fetching
+    /// each IMAP folder's messages again from the given date (YYYY-MM-DD).
+    BackfillLinks { since: String },
     /// Zero out user data (messages, actions, embeddings, etc.) while keeping
     /// sources, channels, contacts, settings, and user_profile. Source/channel
     /// cursors are rewound so the next sync re-bootstraps.
@@ -132,6 +135,7 @@ async fn main() -> Result<()> {
             seed_message,
         } => commands::chat(&cfg, &text, chat_id, seed_action.as_deref(), seed_message).await,
         Command::EmbedOnce => commands::embed_once(&cfg).await,
+        Command::BackfillLinks { since } => commands::backfill_links(&cfg, &since).await,
         Command::ResetData { yes } => commands::reset_data(&cfg, yes).await,
     }
 }

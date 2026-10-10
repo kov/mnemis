@@ -564,6 +564,7 @@ mod tests {
                     body: "Please take a look".to_string(),
                     body_format: "text".to_string(),
                     recipients: Vec::new(),
+                    links: None,
                     raw_json: None,
                     flags: 0,
                 }],

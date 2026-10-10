@@ -463,6 +463,7 @@ mod tests {
             body: "hello world".to_string(),
             body_format: "text".to_string(),
             recipients: Vec::new(),
+            links: None,
             raw_json: None,
             flags: 0,
         };

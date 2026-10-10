@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod imap;
 pub mod imap_utf7;
+pub mod links;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub i64);
@@ -66,6 +67,9 @@ pub struct ImportedMessage {
     /// to/cc addressees, captured at ingest. Empty when the source doesn't
     /// carry recipient headers (chat sources) or none were present.
     pub recipients: Vec<Recipient>,
+    /// Where the message's links lead, for mail; None when the source has
+    /// no notion of them (chat) or didn't look.
+    pub links: Option<Vec<links::Link>>,
     pub raw_json: Option<String>,
     pub flags: u32,
 }

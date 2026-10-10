@@ -476,6 +476,19 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     Ok(())
 }
 
+pub async fn backfill_links(cfg: &Config, since: &str) -> Result<()> {
+    let day = chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d").context("since: YYYY-MM-DD")?;
+    let pool = db::open(&cfg.db_path()).await?;
+    db::migrate(&pool).await?;
+    let (updated, fetched) = maintenance::backfill_links(
+        &pool,
+        day.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc(),
+    )
+    .await?;
+    println!("Fetched {fetched} messages, filled in links for {updated}.");
+    Ok(())
+}
+
 pub async fn reset_data(cfg: &Config, yes: bool) -> Result<()> {
     let path = cfg.db_path();
     let pool = db::open(&path).await?;

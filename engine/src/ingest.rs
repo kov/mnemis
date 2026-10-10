@@ -110,11 +110,19 @@ async fn insert_message_if_new(
         Some(serde_json::to_string(&msg.recipients).context("serializing recipients")?)
     };
 
+    let links_json = msg
+        .links
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serializing links")?;
+
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO messages \
          (channel_id, external_id, parent_external_id, author_id, posted_at, \
-          subject, body, body_format, recipients_json, raw_json, flags, ingested_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+          subject, body, body_format, recipients_json, links_json, raw_json, flags, \
+          ingested_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(channel_id)
     .bind(&msg.external_id)
@@ -125,6 +133,7 @@ async fn insert_message_if_new(
     .bind(&msg.body)
     .bind(&msg.body_format)
     .bind(recipients_json.as_deref())
+    .bind(links_json.as_deref())
     .bind(msg.raw_json.as_deref())
     .bind(msg.flags as i64)
     .bind(ingested_at)
@@ -222,6 +231,7 @@ mod tests {
             body: body.to_string(),
             body_format: "text".to_string(),
             recipients: Vec::new(),
+            links: None,
             raw_json: None,
             flags: 0,
         }

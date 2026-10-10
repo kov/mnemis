@@ -9,6 +9,7 @@ use mail_parser::MessageParser;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
+use super::links::{self, Link};
 use super::{
     ChannelInfo, Cursor, ImportedAuthor, ImportedMessage, PollBatch, Recipient, Source, SourceId,
     SourceKind,
@@ -212,6 +213,7 @@ impl Source for ImapSource {
                         body,
                         body_format: "text".to_string(),
                         recipients,
+                        links: Some(links::from_message(&msg)),
                         raw_json: None,
                         flags,
                     });
@@ -296,9 +298,54 @@ impl Source for ImapSource {
             body,
             body_format: "text".to_string(),
             recipients,
+            links: Some(links::from_message(&msg)),
             raw_json: None,
             flags,
         })
+    }
+}
+
+impl ImapSource {
+    /// The links of every message in a mailbox dated `since` or later, by
+    /// Message-ID: one session, bodies fetched in chunks. For filling in
+    /// messages ingested before links were kept.
+    pub async fn links_since(
+        &self,
+        channel_external_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, Vec<Link>)>> {
+        const CHUNK: usize = 50;
+        let mut session = self.connect().await?;
+        session
+            .examine(channel_external_id)
+            .await
+            .with_context(|| format!("failed to examine mailbox: {channel_external_id}"))?;
+        let mut uids: Vec<u32> = session
+            .uid_search(format!("SINCE {}", since.format("%d-%b-%Y")))
+            .await
+            .context("IMAP search failed")?
+            .into_iter()
+            .collect();
+        uids.sort_unstable();
+        let parser = MessageParser::default();
+        let mut out = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(CHUNK) {
+            let fetches: Vec<_> = session
+                .uid_fetch(compress_uid_set(chunk), "(UID BODY.PEEK[])")
+                .await?
+                .try_collect()
+                .await?;
+            for fetch in &fetches {
+                let Some(msg) = parser.parse(fetch.body().unwrap_or_default()) else {
+                    continue;
+                };
+                if let Some(id) = msg.message_id() {
+                    out.push((id.to_string(), links::from_message(&msg)));
+                }
+            }
+        }
+        let _ = session.logout().await;
+        Ok(out)
     }
 }
 

@@ -80,6 +80,59 @@ pub async fn reset_data(pool: &SqlitePool) -> Result<ResetCounts> {
     Ok(ResetCounts { before, after })
 }
 
+/// Fill in `links_json` for mail ingested before links were kept: every IMAP
+/// channel's messages dated `since` or later that have none yet, matched by
+/// Message-ID. Returns (messages updated, messages fetched).
+pub async fn backfill_links(
+    pool: &SqlitePool,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<(u64, u64)> {
+    use anyhow::Context as _;
+
+    let channels: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT DISTINCT c.id, c.source_id, c.external_id FROM channels c \
+         JOIN sources s ON s.id = c.source_id \
+         JOIN messages m ON m.channel_id = c.id \
+         WHERE s.kind = 'imap' AND m.posted_at >= ? AND m.links_json IS NULL",
+    )
+    .bind(since.timestamp())
+    .fetch_all(pool)
+    .await
+    .context("listing channels to backfill")?;
+    let (mut updated, mut fetched) = (0, 0);
+    let mut sources = std::collections::HashMap::new();
+    for (channel_id, source_id, mailbox) in channels {
+        if let std::collections::hash_map::Entry::Vacant(e) = sources.entry(source_id) {
+            e.insert(
+                crate::orchestrator::build_imap_source(pool, crate::source::SourceId(source_id))
+                    .await?,
+            );
+        }
+        let links = match sources[&source_id].links_since(&mailbox, since).await {
+            Ok(links) => links,
+            Err(e) => {
+                tracing::warn!(mailbox, "backfilling links failed: {e:#}");
+                continue;
+            }
+        };
+        fetched += links.len() as u64;
+        for (message_id, links) in links {
+            updated += sqlx::query(
+                "UPDATE messages SET links_json = ? \
+                 WHERE channel_id = ? AND external_id = ? AND links_json IS NULL",
+            )
+            .bind(serde_json::to_string(&links)?)
+            .bind(channel_id)
+            .bind(&message_id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        }
+        tracing::info!(mailbox, updated, fetched, "backfilled links");
+    }
+    Ok((updated, fetched))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +190,7 @@ mod tests {
             body: "hello world".to_string(),
             body_format: "text".to_string(),
             recipients: Vec::new(),
+            links: None,
             raw_json: None,
             flags: 0,
         };
