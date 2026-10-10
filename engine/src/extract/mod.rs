@@ -451,6 +451,8 @@ struct WindowRow {
     /// (worst-case fetch size), but NOT rendered into the window.
     body: String,
     author_display: Option<String>,
+    /// The author's address (their `people.external_id`).
+    author_address: Option<String>,
     recipients: Vec<Recipient>,
 }
 
@@ -478,9 +480,10 @@ async fn load_rows(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT m.id, m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
-             m.recipients_json \
+             p.external_id, m.recipients_json \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              WHERE m.channel_id = ? AND m.id > ? \
@@ -495,7 +498,16 @@ async fn load_rows(
     Ok(rows
         .into_iter()
         .map(
-            |(id, external_id, posted_at, subject, body, author_display, recipients_json)| {
+            |(
+                id,
+                external_id,
+                posted_at,
+                subject,
+                body,
+                author_display,
+                author_address,
+                recipients_json,
+            )| {
                 // Tolerate NULL / malformed recipients_json — recipients are a
                 // triage hint, never load-bearing for correctness.
                 let recipients = recipients_json
@@ -509,6 +521,7 @@ async fn load_rows(
                     subject,
                     body,
                     author_display,
+                    author_address,
                     recipients,
                 }
             },
@@ -1117,6 +1130,7 @@ mod tests {
             subject: None,
             body: "x".repeat(body_len),
             author_display: None,
+            author_address: None,
             recipients: Vec::new(),
         }
     }

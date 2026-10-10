@@ -409,11 +409,14 @@ mod tests {
         )
         .await;
 
-        // Per message: a summary, a verdict, and (on 1) the recording turns.
+        // Per message: a kind, a summary, a verdict, and (on 1) the recording
+        // turns.
         let llm = MockLlm::new(vec![
+            mock::no_tools("personal"),
             mock::no_tools("Ana asks the user to review the budget by Friday."),
             mock::no_tools("1"),
             mock::record_action("Review the budget", "high", &["ask"]),
+            mock::no_tools("notification"),
             mock::no_tools("Ten crates newsletter."),
             mock::no_tools("0"),
         ]);

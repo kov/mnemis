@@ -1,7 +1,8 @@
 //! Extraction in small, single-purpose turns, for models with a small context
-//! that lose the thread in the agent loop: per message, summarise it (no
-//! tools), decide whether it needs the user to act (a 0 or 1), and only then
-//! record the action from the summary with a narrow tool set.
+//! that lose the thread in the agent loop: per message, classify it (marketing,
+//! phishing and the like), summarise it (no tools), decide from both whether
+//! it needs the user to act (a 0 or 1), and only then record the action from
+//! the summary with a narrow tool set.
 
 use std::time::Duration;
 
@@ -18,6 +19,30 @@ const SUMMARY_SYSTEM: &str = "You summarize one email for an assistant that keep
     what its user has to do. In at most three sentences, say who sent it, what it asks or tells \
     the reader, and any date or deadline it gives. Write in English, whatever the email's \
     language. Report only what the email says.";
+
+const KIND_SYSTEM: &str = "You sort email for an assistant that keeps track of what its \
+    user has to do. Judge the email by its sender address, links and wording, and reply with \
+    one word:\n\
+    personal: written by a person to the user\n\
+    account: about the user's own account, order, bill, investment or service, such as a \
+    failed payment, a security alert, a statement or a shareholder vote\n\
+    notification: other automated mail, such as receipts, shipping updates, one-time codes, \
+    newsletters and social network notifications\n\
+    marketing: promotions, offers, upsells and invitations to buy, sign up or enroll\n\
+    phishing: pretends to be a company or person to get credentials, money or clicks; tell \
+    signs are a sender domain that doesn't belong to the brand named, threats of closing an \
+    account, and urgent requests to log in or pay through a link\n\
+    spam: other unsolicited junk";
+
+/// The kinds `KIND_SYSTEM` offers.
+const KINDS: [&str; 6] = [
+    "personal",
+    "account",
+    "notification",
+    "marketing",
+    "phishing",
+    "spam",
+];
 
 /// Tool turns allowed per message once it is judged actionable.
 const ACTION_TURNS: usize = 3;
@@ -45,6 +70,16 @@ pub(super) async fn run(
     let stream = agent::StreamCtx::headless(ctx.idle_timeout);
 
     let body = clean(&message.body, ctx.body_chars);
+    let kind = parse_kind(&text_of(
+        &send(
+            llm,
+            &kind_system(ctx),
+            format!("{headers}\n{body}"),
+            &[],
+            &stream,
+        )
+        .await?,
+    ));
     let summary = text_of(
         &send(
             llm,
@@ -55,12 +90,12 @@ pub(super) async fn run(
         )
         .await?,
     );
-    let digest = format!("{headers}Summary: {summary}\n");
+    let digest = format!("{headers}Kind: {kind}\nSummary: {summary}\n");
 
     let verdict = text_of(&send(llm, &relevance_system(ctx), digest.clone(), &[], &stream).await?);
     if !verdict.trim_start().starts_with('1') {
         return Ok(format!(
-            "{}: not actionable — {summary}",
+            "{}: {kind}, not actionable — {summary}",
             message.external_id
         ));
     }
@@ -132,7 +167,7 @@ pub(super) async fn run(
         }
     }
     Ok(format!(
-        "{}: {actions} recorded — {summary}",
+        "{}: {kind}, {actions} recorded — {summary}",
         message.external_id
     ))
 }
@@ -173,11 +208,21 @@ fn text_of(response: &ResponsesResponse) -> String {
         .to_string()
 }
 
+/// The first known kind in the reply, or "unknown".
+fn parse_kind(reply: &str) -> &'static str {
+    let reply = reply.to_lowercase();
+    reply
+        .split(|c: char| !c.is_alphabetic())
+        .find_map(|word| KINDS.into_iter().find(|kind| *kind == word))
+        .unwrap_or("unknown")
+}
+
 fn headers(message: &WindowRow, identifiers: &[String]) -> String {
-    let mut out = format!(
-        "From: {}\n",
-        message.author_display.as_deref().unwrap_or("?")
-    );
+    let name = message.author_display.as_deref().unwrap_or("?");
+    let mut out = match message.author_address.as_deref() {
+        Some(address) => format!("From: {name} <{address}>\n"),
+        None => format!("From: {name}\n"),
+    };
     render_recipients(&mut out, &message.recipients, identifiers);
     if let Some(date) = DateTime::<Utc>::from_timestamp(message.posted_at, 0) {
         out.push_str(&format!("Date: {}\n", date.to_rfc3339()));
@@ -206,13 +251,39 @@ fn who(ctx: &Context<'_>) -> String {
     }
 }
 
+fn kind_system(ctx: &Context<'_>) -> String {
+    let mut out = KIND_SYSTEM.to_string();
+    if let Some(prompt) = ctx
+        .profile
+        .custom_prompt
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
+        out.push_str(&format!(
+            "\n\nAbout the user, to tell their real accounts and services from imitations: {}",
+            prompt.trim()
+        ));
+    }
+    out.push_str("\n\nReply with the one word and nothing else.");
+    out
+}
+
 fn relevance_system(ctx: &Context<'_>) -> String {
     let mut out = format!(
         "You decide whether an email needs {} to do something. It is now {}.\n\n\
-         Answer 1 when the email asks the user to do something, records something the user \
-         promised to do, or sets a deadline that affects the user. Answer 0 for newsletters, \
-         promotions, information without an ask, asks aimed at someone else, and things \
-         already done.\n",
+         Answer 1 only when the user must do something specific: a person asks them to, they \
+         promised to, or something of theirs needs attention by a date (a failed payment, a \
+         bill due, a vote or decision with a deadline, a security problem on their account).\n\n\
+         Answer 0 for everything else, including:\n\
+         - marketing and offers, even when they invite the reader to buy, sign up, enroll, \
+         upgrade or try something\n\
+         - newsletters, digests and social network notifications (invitations, likes, job \
+         alerts)\n\
+         - receipts, confirmations, shipping updates and one-time codes\n\
+         - information without an ask, and asks aimed at someone else\n\
+         - things already done\n\n\
+         The Kind line comes from a classifier that has read the whole email: marketing, \
+         spam and phishing are 0, since acting on them is never what the user needs.\n",
         who(ctx),
         ctx.now.to_rfc3339()
     );
@@ -253,4 +324,17 @@ fn action_system(ctx: &Context<'_>, external_id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_kind;
+
+    #[test]
+    fn reads_the_kind_out_of_a_chatty_reply() {
+        assert_eq!(parse_kind("Marketing."), "marketing");
+        assert_eq!(parse_kind("**phishing**"), "phishing");
+        assert_eq!(parse_kind("I think this is spam"), "spam");
+        assert_eq!(parse_kind("no idea"), "unknown");
+    }
 }
