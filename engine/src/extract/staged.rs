@@ -1,12 +1,19 @@
 //! Extraction in small, single-purpose turns, for models with a small context
-//! that lose the thread in the agent loop: per message, classify it (marketing,
-//! phishing and the like), summarise it (no tools), decide from both whether
+//! that lose the thread in the agent loop: per message, classify it (marketing
+//! and spam are dropped), summarise it (no tools), decide from both whether
 //! it needs the user to act (a 0 or 1), and only then record the action from
 //! the summary with a narrow tool set.
+//!
+//! Whether the sender looks like an impostor is decided in code, from
+//! signals the model can't judge: a domain the user has never had mail from,
+//! and a sender name that has nothing to do with that domain. A new domain
+//! records the to-do with a warning; with the name on top, the message is a
+//! warning only. The name alone means nothing: mailing services, bots and
+//! people at their employer's domain make it common in genuine mail.
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
@@ -14,6 +21,7 @@ use super::prompt::{ExistingAction, render_recipients};
 use super::{DryCall, ExtractionScope, UserProfile, WindowRow, dispatch_or_capture, tools};
 use crate::agent;
 use crate::llm::{ContentItem, InputItem, LlmTransport, OutputItem, ResponsesResponse, Role};
+use crate::source::links::registrable;
 
 const SUMMARY_SYSTEM: &str = "You summarize one email for an assistant that keeps track of \
     what its user has to do. In at most three sentences, say who sent it, what it asks or tells \
@@ -29,20 +37,16 @@ const KIND_SYSTEM: &str = "You sort email for an assistant that keeps track of w
     notification: other automated mail, such as receipts, shipping updates, one-time codes, \
     newsletters and social network notifications\n\
     marketing: promotions, offers, upsells and invitations to buy, sign up or enroll\n\
-    phishing: pretends to be a company or person to get credentials, money or clicks; tell \
-    signs are a sender domain that doesn't belong to the brand named, threats of closing an \
-    account, and urgent requests to log in or pay through a link\n\
-    spam: other unsolicited junk";
+    spam: unsolicited junk";
+
+/// Kinds that are never actionable, whatever the email asks.
+const IGNORED_KINDS: [&str; 2] = ["marketing", "spam"];
 
 /// The kinds `KIND_SYSTEM` offers.
-const KINDS: [&str; 6] = [
-    "personal",
-    "account",
-    "notification",
-    "marketing",
-    "phishing",
-    "spam",
-];
+const KINDS: [&str; 5] = ["personal", "account", "notification", "marketing", "spam"];
+
+/// Link domains named in a warning.
+const WARNING_LINKS: usize = 3;
 
 /// Tool turns allowed per message once it is judged actionable.
 const ACTION_TURNS: usize = 3;
@@ -58,6 +62,15 @@ pub(super) struct Context<'a> {
     pub idle_timeout: Duration,
 }
 
+/// What a staged run made of one message.
+pub(super) struct Outcome {
+    /// A line on what was decided, for the caller to report.
+    pub summary: String,
+    /// Set when the sender is suspicious enough that the message is shown as
+    /// a warning instead of a to-do.
+    pub warning: Option<String>,
+}
+
 pub(super) async fn run(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
@@ -65,7 +78,7 @@ pub(super) async fn run(
     ctx: &Context<'_>,
     message: &WindowRow,
     mut dry: Option<&mut Vec<DryCall>>,
-) -> Result<String> {
+) -> Result<Outcome> {
     let headers = headers(message, &ctx.profile.identifiers);
     let stream = agent::StreamCtx::headless(ctx.idle_timeout);
 
@@ -90,15 +103,27 @@ pub(super) async fn run(
         )
         .await?,
     );
+    let quiet = |what: &str| Outcome {
+        summary: format!("{}: {kind}, {what} — {summary}", message.external_id),
+        warning: None,
+    };
+    if IGNORED_KINDS.contains(&kind) {
+        return Ok(quiet("not actionable"));
+    }
+    let suspicion = suspicion(pool, message).await?;
+    if suspicion.signals.len() >= 2 {
+        return Ok(Outcome {
+            summary: format!("{}: {kind}, warning only — {summary}", message.external_id),
+            warning: Some(suspicion.warning()),
+        });
+    }
     let digest = format!("{headers}Kind: {kind}\nSummary: {summary}\n");
 
     let verdict = text_of(&send(llm, &relevance_system(ctx), digest.clone(), &[], &stream).await?);
     if !verdict.trim_start().starts_with('1') {
-        return Ok(format!(
-            "{}: {kind}, not actionable — {summary}",
-            message.external_id
-        ));
+        return Ok(quiet("not actionable"));
     }
+    let caution = (!suspicion.signals.is_empty()).then(|| suspicion.warning());
 
     let defs: Vec<_> = tools::definitions()
         .into_iter()
@@ -145,6 +170,10 @@ pub(super) async fn run(
             break;
         }
         for (call_id, name, arguments) in calls {
+            let arguments = match (&caution, name.as_str()) {
+                (Some(caution), "record_action") => with_caution(&arguments, caution),
+                _ => arguments,
+            };
             let out = dispatch_or_capture(
                 pool,
                 scope,
@@ -166,10 +195,115 @@ pub(super) async fn run(
             break;
         }
     }
-    Ok(format!(
-        "{}: {kind}, {actions} recorded — {summary}",
-        message.external_id
-    ))
+    let flag = if caution.is_some() {
+        ", with warning"
+    } else {
+        ""
+    };
+    Ok(quiet(&format!("{actions} recorded{flag}")))
+}
+
+/// Why a sender looks like an impostor; empty when it doesn't.
+struct Suspicion {
+    signals: Vec<String>,
+    /// Where the message's links lead, other than the sender's own domain.
+    links: Vec<String>,
+}
+
+impl Suspicion {
+    fn warning(&self) -> String {
+        let mut out = format!("Suspicious sender: {}", self.signals.join("; "));
+        if !self.links.is_empty() {
+            out.push_str(&format!("; its links go to {}", self.links.join(", ")));
+        }
+        out
+    }
+}
+
+async fn suspicion(pool: &SqlitePool, message: &WindowRow) -> Result<Suspicion> {
+    let mut found = Suspicion {
+        signals: Vec::new(),
+        links: Vec::new(),
+    };
+    let Some(host) = message
+        .author_address
+        .as_deref()
+        .and_then(|a| a.rsplit_once('@'))
+        .map(|(_, d)| d.to_lowercase())
+    else {
+        return Ok(found);
+    };
+    let domain = registrable(&host);
+    let (earlier,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM messages m JOIN people p ON p.id = m.author_id \
+         WHERE (p.external_id LIKE '%@' || ?1 OR p.external_id LIKE '%.' || ?1) \
+         AND m.posted_at < ?2",
+    )
+    .bind(&domain)
+    .bind(message.posted_at)
+    .fetch_one(pool)
+    .await
+    .context("loading sender history")?;
+    if earlier > 0 {
+        return Ok(found);
+    }
+    found
+        .signals
+        .push(format!("the first email you've had from {domain}"));
+    if let Some(name) = message.author_display.as_deref()
+        && name_unrelated_to_host(name, &host)
+    {
+        found.signals.push(format!(
+            "the name \"{name}\" has nothing to do with {domain}"
+        ));
+    }
+    for link in &message.links {
+        let to = registrable(&link.host);
+        if to != domain && !found.links.contains(&to) && found.links.len() < WARNING_LINKS {
+            found.links.push(to);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a sender's name reads like someone other than its address's
+/// host: none of its words (of four letters or more) appears in the host,
+/// as "Bradesco Net Empresas" from `suporte5.ux6qrc.com` does, nor does the
+/// registered domain appear in the name ("SpaceXAI" from `x.ai`).
+fn name_unrelated_to_host(name: &str, host: &str) -> bool {
+    let fold = |s: &str| -> String {
+        s.to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect()
+    };
+    if name.contains('@') {
+        return false;
+    }
+    let domain: String = fold(&registrable(host)).split_whitespace().collect();
+    let host: String = fold(host).split_whitespace().collect();
+    let name = fold(name);
+    let words: Vec<&str> = name.split_whitespace().filter(|w| w.len() >= 4).collect();
+    let joined: String = name.split_whitespace().collect();
+    !words.is_empty()
+        && !words.iter().any(|w| host.contains(w))
+        && !host.contains(&joined)
+        && !joined.contains(&domain)
+}
+
+/// A record_action call with the warning ahead of its details.
+fn with_caution(arguments: &str, caution: &str) -> String {
+    let Ok(mut args) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return arguments.to_string();
+    };
+    let details = args["details"].as_str().unwrap_or("").trim().to_string();
+    args["details"] = if details.is_empty() {
+        format!("⚠️ {caution}.")
+    } else {
+        format!("⚠️ {caution}.\n\n{details}")
+    }
+    .into();
+    args.to_string()
 }
 
 async fn send(
@@ -281,9 +415,7 @@ fn relevance_system(ctx: &Context<'_>) -> String {
          alerts)\n\
          - receipts, confirmations, shipping updates and one-time codes\n\
          - information without an ask, and asks aimed at someone else\n\
-         - things already done\n\n\
-         The Kind line comes from a classifier that has read the whole email: marketing, \
-         spam and phishing are 0, since acting on them is never what the user needs.\n",
+         - things already done\n",
         who(ctx),
         ctx.now.to_rfc3339()
     );
@@ -328,12 +460,44 @@ fn action_system(ctx: &Context<'_>, external_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_kind;
+    use super::{name_unrelated_to_host, parse_kind, with_caution};
+
+    #[test]
+    fn tells_names_that_belong_to_their_host() {
+        assert!(name_unrelated_to_host(
+            "Bradesco Net Empresas|Portal Digital PJ",
+            "suporte5.ux6qrc.com"
+        ));
+        assert!(name_unrelated_to_host("Exodus", "balaguer.cat"));
+        assert!(!name_unrelated_to_host(
+            "Amazon Web Services",
+            "amazonaws.com"
+        ));
+        assert!(!name_unrelated_to_host("QuintoAndar", "quintoandar.com.br"));
+        assert!(!name_unrelated_to_host(
+            "Clube FII",
+            "contato.clubefii.com.br"
+        ));
+        assert!(!name_unrelated_to_host("SpaceXAI", "x.ai"));
+        assert!(!name_unrelated_to_host("a@b.com", "c.com"));
+        assert!(!name_unrelated_to_host("X", "y.com"), "no word to compare");
+    }
+
+    #[test]
+    fn puts_the_warning_ahead_of_the_details() {
+        let args = with_caution(
+            r#"{"title":"Pay","details":"Due Friday"}"#,
+            "Suspicious sender: x",
+        );
+        let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(args["details"], "⚠️ Suspicious sender: x.\n\nDue Friday");
+        assert_eq!(args["title"], "Pay");
+    }
 
     #[test]
     fn reads_the_kind_out_of_a_chatty_reply() {
         assert_eq!(parse_kind("Marketing."), "marketing");
-        assert_eq!(parse_kind("**phishing**"), "phishing");
+        assert_eq!(parse_kind("**spam**"), "spam");
         assert_eq!(parse_kind("I think this is spam"), "spam");
         assert_eq!(parse_kind("no idea"), "unknown");
     }

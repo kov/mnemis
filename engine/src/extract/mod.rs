@@ -454,6 +454,8 @@ struct WindowRow {
     /// The author's address (their `people.external_id`).
     author_address: Option<String>,
     recipients: Vec<Recipient>,
+    /// Where the message's links lead; empty when not known.
+    links: Vec<crate::source::links::Link>,
 }
 
 async fn load_window(
@@ -481,9 +483,10 @@ async fn load_rows(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT m.id, m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
-             p.external_id, m.recipients_json \
+             p.external_id, m.recipients_json, m.links_json \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              WHERE m.channel_id = ? AND m.id > ? \
@@ -507,6 +510,7 @@ async fn load_rows(
                 author_display,
                 author_address,
                 recipients_json,
+                links_json,
             )| {
                 // Tolerate NULL / malformed recipients_json — recipients are a
                 // triage hint, never load-bearing for correctness.
@@ -523,6 +527,10 @@ async fn load_rows(
                     author_display,
                     author_address,
                     recipients,
+                    links: links_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default(),
                 }
             },
         )
@@ -1133,6 +1141,7 @@ mod tests {
             body: "x".repeat(body_len),
             author_display: None,
             author_address: None,
+            links: Vec::new(),
             recipients: Vec::new(),
         }
     }

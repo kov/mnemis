@@ -47,6 +47,9 @@ pub struct EvalReport {
     pub dismissed: Vec<String>,
     pub updates: usize,
     pub resolves: usize,
+    /// Messages shown as a suspicious-sender warning instead of a to-do,
+    /// marked when an action was known (or dismissed) from them.
+    pub warnings: Vec<String>,
     /// Each batch's closing message: the model's account of what it did.
     pub summaries: Vec<String>,
 }
@@ -197,9 +200,28 @@ async fn evaluate_channel(
             };
             for message in &batch {
                 match staged::run(pool, llm, scope, &ctx, message, Some(&mut calls)).await {
-                    Ok(summary) => report
-                        .summaries
-                        .push(format!("{}: {summary}", channel.name)),
+                    Ok(outcome) => {
+                        if let Some(warning) = outcome.warning {
+                            let known = reference
+                                .values()
+                                .find(|(_, _, evidence)| evidence.contains(&message.external_id))
+                                .map_or("", |(_, dismissed, _)| {
+                                    if *dismissed {
+                                        " [dismissed action]"
+                                    } else {
+                                        " [known action]"
+                                    }
+                                });
+                            report.warnings.push(format!(
+                                "{}{known}: {} — {warning}",
+                                channel.name,
+                                message.subject.as_deref().unwrap_or("(no subject)")
+                            ));
+                        }
+                        report
+                            .summaries
+                            .push(format!("{}: {}", channel.name, outcome.summary));
+                    }
                     Err(e) => report.errors.push(format!("{}: {e:#}", channel.name)),
                 }
             }
@@ -393,6 +415,14 @@ mod tests {
             &[
                 message("ask", "Review", "Can you review the budget by Friday?"),
                 message("news", "Digest", "Ten crates you should know about."),
+                SeedMessage {
+                    external_id: "phish",
+                    author_email: "no-reply@suporte5.ux6qrc.com",
+                    author_name: "Bradesco Net Empresas",
+                    subject: "Atualização necessária",
+                    body: "Confirme seus dados para evitar o bloqueio.",
+                    recipients: &[],
+                },
             ],
         )
         .await?;
@@ -416,9 +446,12 @@ mod tests {
             mock::no_tools("Ana asks the user to review the budget by Friday."),
             mock::no_tools("1"),
             mock::record_action("Review the budget", "high", &["ask"]),
-            mock::no_tools("notification"),
+            // Marketing skips the verdict.
+            mock::no_tools("marketing"),
             mock::no_tools("Ten crates newsletter."),
-            mock::no_tools("0"),
+            // A new domain under an unrelated name: a warning, no verdict.
+            mock::no_tools("account"),
+            mock::no_tools("Bradesco asks the user to confirm their data."),
         ]);
         let now = chrono::Utc::now().timestamp();
         let report = evaluate(
@@ -436,7 +469,13 @@ mod tests {
         assert_eq!(report.found, vec!["Review the budget"]);
         assert!(report.invented.is_empty());
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert_eq!(report.summaries.len(), 2);
+        assert_eq!(report.summaries.len(), 3);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("ux6qrc.com"),
+            "{}",
+            report.warnings[0]
+        );
         assert_eq!(fetch_actions(&pool).await?.len(), 1);
         Ok(())
     }
