@@ -49,7 +49,7 @@ pub fn ActionsPage() -> impl IntoView {
         <Suspense fallback=|| view! {
             <div class="body">
                 <div class="list">
-                    <div class="list-head"><span class="h">"Open actions"</span></div>
+                    <div class="list-head"><span class="h">"Open to-dos"</span></div>
                 </div>
                 <div class="reading"><div class="reading-empty">"Loading\u{2026}"</div></div>
             </div>
@@ -219,10 +219,10 @@ fn ActionsMasterDetail(
     view! {
         <div class="body">
             <div class="list">
-                <div class="list-head"><span class="h">"Open actions"</span></div>
+                <div class="list-head"><span class="h">"Open to-dos"</span></div>
                 <SuggestedResolutions />
                 {if is_empty {
-                    view! { <div class="list-empty">"No active actions."</div> }.into_any()
+                    view! { <div class="list-empty">"No open to-dos."</div> }.into_any()
                 } else {
                     view! {
                         <For
@@ -265,7 +265,7 @@ fn ActionsMasterDetail(
                             view! { <ActionDetail action=a refetch=refetch /> }.into_any()
                         }
                         None => view! {
-                            <div class="reading-empty">"Select an action to see its detail."</div>
+                            <div class="reading-empty">"Select a to-do to see its detail."</div>
                         }
                         .into_any(),
                     }
@@ -732,7 +732,7 @@ fn FeedbackModal(
 ) -> impl IntoView {
     let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
     let prompt = match kind {
-        FeedbackKind::Dismissed => "Why isn't this an action item? (optional)",
+        FeedbackKind::Dismissed => "Why isn't this a to-do? (optional)",
         FeedbackKind::WrongAutoClaim => {
             "What made this a wrong auto-claim? Leave blank if there's nothing to teach."
         }
@@ -861,7 +861,7 @@ pub fn StatusPanel() -> impl IntoView {
                         "status-toast status-toast-ok"
                     };
                     let headline = format!(
-                        "Synced {} source(s) · {} new message(s) · {} action(s){}",
+                        "Synced {} source(s) · {} new message(s) · {} to-do(s){}",
                         o.sources_synced,
                         o.messages_ingested,
                         o.actions_created,
@@ -1084,7 +1084,7 @@ fn MessageListRow(
             <span class="subj">{subject}</span>
             <span class="snip">{snippet}</span>
             {has_action.then(|| view! {
-                <span class="tags"><span class="pill action">"\u{25CE} action"</span></span>
+                <span class="tags"><span class="pill action">"\u{25CE} to-do"</span></span>
             })}
         </div>
     }
@@ -1197,7 +1197,7 @@ fn ExtractedAction(
 
     view! {
         <div class="extracted">
-            <div class="ex-head">"\u{25CE} mnemis extracted an action"</div>
+            <div class="ex-head">"\u{25CE} mnemis found a to-do"</div>
             <div class="ex-title">{action.title.clone()}</div>
             <div class="ex-meta">
                 <span class=conf_class>{conf_label}</span>
@@ -2123,7 +2123,7 @@ fn ActionInlineChat(action_id: i64) -> impl IntoView {
     view! {
         <div class="action-chat">
             <div class="action-chat-head">
-                "\u{25C8} Chat about this action"
+                "\u{25C8} Chat about this to-do"
                 {move || chat_id.get().map(|id| view! {
                     <A href=format!("/chats/{id}") attr:class="action-chat-pop">
                         "Open in Chats \u{2197}"
@@ -2135,7 +2135,7 @@ fn ActionInlineChat(action_id: i64) -> impl IntoView {
                     {move || turns.get().map(|res| match res {
                         Ok(rows) if rows.is_empty() && !is_active.get() => view! {
                             <div class="action-chat-empty">
-                                "No chat yet \u{2014} send a message to start one grounded in this action."
+                                "No chat yet \u{2014} send a message to start one grounded in this to-do."
                             </div>
                         }.into_any(),
                         Ok(rows) => view! {
@@ -2181,7 +2181,7 @@ fn ActionInlineChat(action_id: i64) -> impl IntoView {
             <div class="chat-input">
                 <textarea
                     node_ref=input_ref
-                    placeholder="Ask mnemis about this action\u{2026}"
+                    placeholder="Ask mnemis about this to-do\u{2026}"
                     on:keydown=on_keydown
                 />
                 <button
@@ -2449,7 +2449,7 @@ fn ChatsList(rows: Vec<ChatDto>, refresh: RwSignal<u32>) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty">
-                "No chats yet. Start one, or use \u{201c}Talk about this\u{201d} on an action or message."
+                "No chats yet. Start one, or use \u{201c}Talk about this\u{201d} on a to-do or message."
             </div>
         }
         .into_any();
@@ -2778,7 +2778,7 @@ pub fn ChatDetail() -> impl IntoView {
                 // the message can't actually go out until the turn finishes.
                 <textarea
                     node_ref=input_ref
-                    placeholder="Ask about your actions or messages\u{2026}"
+                    placeholder="Ask about your to-dos or messages\u{2026}"
                     on:keydown=on_keydown
                 />
                 // Send becomes Stop while this chat's turn is in flight, so the

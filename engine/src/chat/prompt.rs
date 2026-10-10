@@ -24,17 +24,18 @@ pub struct RenderInputs {
 pub fn render(inputs: &RenderInputs) -> String {
     let mut out = String::new();
     out.push_str(
-        "You are mnemis's assistant — a helper inside the user's personal action-tracking app. \
-         You help them understand and manage their messages and action items.\n\n\
+        "You are mnemis's assistant — a helper inside the user's personal to-do app. \
+         You help them understand and manage their messages and to-dos.\n\n\
          You have tools to search, list by date, and read the user's ingested messages (across \
-         every source) and to look up, create, update, and resolve their action items. For \
+         every source) and to look up, create, update, and resolve their to-dos (the tools call \
+         them actions; say to-do to the user). For \
          \"what came in recently / in the last N days\" questions, use list_messages with a \
          since date rather than trying to search for a date. Ground every claim in \
          what the tools actually return, and cite message external_ids when you explain why \
-         something is (or isn't) an action.\n\n\
+         something is (or isn't) a to-do.\n\n\
          When the user explicitly asks you to track, complete, or change something, act on it — \
          use high confidence so the change applies immediately. When you are merely suggesting \
-         something, use medium or low confidence so the user can confirm it. Never invent actions \
+         something, use medium or low confidence so the user can confirm it. Never invent to-dos \
          or evidence; if you can't find support for a claim, say so plainly.\n\n",
     );
 
@@ -50,8 +51,8 @@ pub fn render(inputs: &RenderInputs) -> String {
 
     if let Some(rules) = inputs.memory_rules.as_deref() {
         out.push_str(
-            "\nWhat they have taught you about which messages are (and aren't) action items \
-             for them — apply it when you judge or create actions:\n",
+            "\nWhat they have taught you about which messages are (and aren't) to-dos \
+             for them — apply it when you judge or create to-dos:\n",
         );
         out.push_str(rules.trim());
         out.push('\n');
@@ -112,7 +113,7 @@ pub async fn seed_label(pool: &SqlitePool, chat_id: i64) -> Result<Option<String
                 .bind(id)
                 .fetch_optional(pool)
                 .await?;
-            Ok(r.map(|(title,)| format!("action A-{id} \u{00b7} {title}")))
+            Ok(r.map(|(title,)| format!("to-do \u{00b7} {title}")))
         }
         "message" => {
             let r: Option<(Option<String>, Option<String>)> = sqlx::query_as(
@@ -286,7 +287,7 @@ mod tests {
 
         let chat = create_chat(&pool, Some("action"), Some(aid)).await.unwrap();
         let label = seed_label(&pool, chat).await.unwrap().unwrap();
-        assert!(label.contains(&format!("action A-{aid}")), "got: {label}");
+        assert!(label.starts_with("to-do \u{00b7} "), "got: {label}");
         assert!(label.contains("Renew the cert"), "got: {label}");
 
         // A blank chat has no seed label.

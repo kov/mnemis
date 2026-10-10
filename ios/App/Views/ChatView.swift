@@ -276,8 +276,8 @@ private struct ToolCallView: View {
         switch tool {
         case "search_messages": "Searched messages"
         case "fetch_messages": "Read messages"
-        case "get_action": "Looked up an action"
-        case "list_actions": "Listed actions"
+        case "get_action": "Looked up a to-do"
+        case "list_actions": "Listed to-dos"
         case "list_messages": "Listed messages"
         case "search_conversation": "Searched this conversation"
         case "recall_turns": "Recalled earlier messages"

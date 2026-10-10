@@ -21,7 +21,7 @@ struct ChatListView: View {
                 ContentUnavailableView(
                     "No chats",
                     systemImage: "bubble.left.and.text.bubble.right",
-                    description: Text("Ask about your mail and actions, or use “Talk about this” on an action.")
+                    description: Text("Ask about your mail and to-dos, or use “Talk about this” on a to-do.")
                 )
             }
         }

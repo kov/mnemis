@@ -51,7 +51,7 @@ private struct SplitLayout: View {
                 get: { Optional(model.selectedTab) },
                 set: { if let tab = $0 { model.selectedTab = tab } }
             )) {
-                Label("Actions", systemImage: "checklist")
+                Label("To-dos", systemImage: "checklist")
                     .badge(model.actions.count)
                     .tag(AppTab.actions)
                 Label("Chats", systemImage: "bubble.left.and.text.bubble.right")
@@ -76,7 +76,7 @@ private struct CompactLayout: View {
     var body: some View {
         @Bindable var model = model
         TabView(selection: $model.selectedTab) {
-            Tab("Actions", systemImage: "checklist", value: AppTab.actions) {
+            Tab("To-dos", systemImage: "checklist", value: AppTab.actions) {
                 ActionsStack(showsSettings: true)
             }
             .badge(model.actions.count)
@@ -98,7 +98,7 @@ private struct ActionsStack: View {
         @Bindable var model = model
         NavigationStack {
             ActionListView(selection: $model.actionSelection)
-                .navigationTitle("Actions")
+                .navigationTitle("To-dos")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if showsSettings { SettingsItem() }

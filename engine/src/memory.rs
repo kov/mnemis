@@ -61,7 +61,7 @@ pub async fn save_rules(pool: &SqlitePool, content: &str) -> Result<()> {
 }
 
 const MERGE_SYSTEM: &str = "You maintain a short list of rules that tell an assistant which \
-    of the user's emails and messages are action items for them and which are not. The rules are \
+    of the user's emails and messages are to-dos for them and which are not. The rules are \
     learned from the user's feedback on items the assistant got wrong.\n\n\
     You are given the current rules and new feedback. Rewrite the rules so they include what the \
     feedback teaches:\n\
@@ -148,7 +148,7 @@ fn merge_request(
     out.push_str("# New feedback\n");
     out.push_str(match kind {
         FeedbackKind::Dismissed => {
-            "The assistant surfaced this as an action item; the user dismissed it as not one.\n"
+            "The assistant surfaced this as a to-do; the user dismissed it as not one.\n"
         }
         FeedbackKind::WrongAutoClaim => {
             "The assistant auto-claimed this for the user; the user says it shouldn't have.\n"

@@ -77,7 +77,7 @@ struct ActionDetailView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Color(.systemGroupedBackground))
-        .navigationTitle("Action")
+        .navigationTitle("To-do")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: action.id) { await loadMessage() }
     }

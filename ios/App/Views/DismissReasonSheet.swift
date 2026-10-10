@@ -21,7 +21,7 @@ struct DismissReasonSheet: View {
                         .lineLimit(3...8)
                         .focused($focused)
                 } header: {
-                    Text("Why isn't this an action item?")
+                    Text("Why isn't this a to-do?")
                 } footer: {
                     Text("Optional. mnemis turns your reason into a rule it follows from now on — see Settings → Memory.")
                 }

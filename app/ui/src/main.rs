@@ -856,7 +856,7 @@ fn Sidebar() -> impl IntoView {
             <div class="side-scroll">
                 <nav class="nav side-nav">
                     <div class="side-label">"Smart views"</div>
-                    <A href="/" attr:class="side-item"><span class="ico">"\u{25CE}"</span>"Actions"</A>
+                    <A href="/" attr:class="side-item"><span class="ico">"\u{25CE}"</span>"To-dos"</A>
                     <A href="/inbox" attr:class="side-item"><span class="ico">"\u{2709}"</span>"Inbox"</A>
                     <A href="/chats" attr:class="side-item"><span class="ico">"\u{25C8}"</span>"Chats"</A>
                     <A href="/settings" attr:class="side-item"><span class="ico">"\u{2699}"</span>"Settings"</A>
@@ -912,7 +912,7 @@ fn Toolbar() -> impl IntoView {
     let title = move || {
         let p = location.pathname.get();
         if p == "/" {
-            "Actions"
+            "To-dos"
         } else if p.starts_with("/inbox") {
             "Inbox"
         } else if p.starts_with("/chats") {

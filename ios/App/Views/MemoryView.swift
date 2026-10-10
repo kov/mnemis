@@ -16,7 +16,7 @@ struct MemoryView: View {
                     .frame(minHeight: 240)
                     .overlay(alignment: .topLeading) {
                         if loaded && rules.isEmpty {
-                            Text("Nothing yet. When you dismiss an action and say why, mnemis writes a rule here.")
+                            Text("Nothing yet. When you dismiss a to-do and say why, mnemis writes a rule here.")
                                 .font(.callout)
                                 .foregroundStyle(.tertiary)
                                 .padding(.top, 8)
