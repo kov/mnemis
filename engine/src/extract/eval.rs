@@ -16,8 +16,8 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 
 use super::{
-    DryCall, ExtractionScope, batch_system_prompt, load_channel, load_existing_actions,
-    load_user_profile_for, load_window, run_agent_loop, split_into_batches,
+    DryCall, ExtractionScope, batch_system_prompt, load_channel, load_existing_actions, load_rows,
+    load_user_profile_for, run_agent_loop, split_into_batches,
 };
 use crate::llm::LlmTransport;
 
@@ -38,26 +38,39 @@ pub struct EvalReport {
     pub dismissed: Vec<String>,
     pub updates: usize,
     pub resolves: usize,
+    /// Each batch's closing message: the model's account of what it did.
+    pub summaries: Vec<String>,
 }
 
-/// Evaluate over up to `max_messages` of the newest messages posted in the
-/// last `days` days, from unmuted channels.
+/// Evaluate over the messages of unmuted channels posted in `[from, to)`
+/// (unix seconds): every one an action was recorded from, plus `others` more,
+/// picked by a fixed scramble of their ids so repeated runs see the same set.
 pub async fn evaluate(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
     window_char_budget: usize,
     idle_timeout: Duration,
-    days: i64,
-    max_messages: i64,
+    from: i64,
+    to: i64,
+    others: i64,
 ) -> Result<EvalReport> {
     let started = Instant::now();
-    let since = chrono::Utc::now().timestamp() - days * 86_400;
     let picked: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT m.id, m.channel_id FROM messages m JOIN channels c ON c.id = m.channel_id \
-         WHERE m.posted_at >= ? AND c.muted = 0 ORDER BY m.posted_at DESC LIMIT ?",
+        "WITH candidates AS ( \
+             SELECT m.id, m.channel_id, \
+                 EXISTS (SELECT 1 FROM action_evidence ae \
+                         WHERE ae.message_id = m.id AND ae.kind = 'source') AS cited \
+             FROM messages m JOIN channels c ON c.id = m.channel_id \
+             WHERE m.posted_at >= ? AND m.posted_at < ? AND c.muted = 0) \
+         SELECT id, channel_id FROM candidates WHERE cited \
+         UNION \
+         SELECT id, channel_id FROM ( \
+             SELECT id, channel_id FROM candidates WHERE NOT cited \
+             ORDER BY (id * 2654435761) % 4294967296 LIMIT ?)",
     )
-    .bind(since)
-    .bind(max_messages)
+    .bind(from)
+    .bind(to)
+    .bind(others)
     .fetch_all(pool)
     .await
     .context("picking messages to evaluate")?;
@@ -96,7 +109,7 @@ async fn evaluate_channel(
     let profile = load_user_profile_for(pool, &channel.source_kind).await?;
     let memory_rules = crate::memory::rules(pool).await?;
     let first = ids.iter().min().copied().unwrap_or(0);
-    let mut rows = load_window(pool, channel_id, Some(first - 1)).await?;
+    let mut rows = load_rows(pool, channel_id, first - 1, i64::MAX).await?;
     rows.retain(|m| ids.contains(&m.id));
     report.messages += rows.len();
 
@@ -137,16 +150,35 @@ async fn evaluate_channel(
         channel_id,
     };
     let mut calls: Vec<DryCall> = Vec::new();
-    let mut queue: std::collections::VecDeque<_> =
-        split_into_batches(rows, window_char_budget).into();
+    // A day's mail at a time, as frequent syncs would see it, so each batch
+    // is judged as of its own day.
+    let mut days: BTreeMap<i64, Vec<_>> = BTreeMap::new();
+    for row in rows {
+        days.entry(row.posted_at.div_euclid(86_400))
+            .or_default()
+            .push(row);
+    }
+    let mut queue: std::collections::VecDeque<_> = days
+        .into_values()
+        .flat_map(|day| split_into_batches(day, window_char_budget))
+        .collect();
     while let Some(batch) = queue.pop_front() {
         report.batches += 1;
+        // As if extraction ran just after the newest of these arrived, so
+        // old deadlines aren't judged as long past.
+        let now = batch
+            .iter()
+            .map(|m| m.posted_at)
+            .max()
+            .and_then(|t| chrono::DateTime::from_timestamp(t + 600, 0))
+            .unwrap_or_else(chrono::Utc::now);
         let prompt = batch_system_prompt(
             &channel,
             &profile,
             memory_rules.as_deref(),
             &batch,
             &existing,
+            now,
         );
         let outcome = run_agent_loop(
             pool,
@@ -159,6 +191,11 @@ async fn evaluate_channel(
             Some(&mut calls),
         )
         .await;
+        if let Ok((_, Some(summary))) = &outcome {
+            report
+                .summaries
+                .push(format!("{}: {summary}", channel.name));
+        }
         if let Err(e) = outcome {
             let chain = format!("{e:#}");
             if crate::agent::is_context_overflow(&chain) && batch.len() > 1 {
@@ -284,8 +321,19 @@ mod tests {
             mock::record_action("Buy things on sale", "medium", &["promo"]),
             mock::no_tools("Recorded three."),
         ]);
-        let report = evaluate(&pool, &llm, 100_000, Duration::from_secs(5), 1, 10).await?;
+        let now = chrono::Utc::now().timestamp();
+        let report = evaluate(
+            &pool,
+            &llm,
+            100_000,
+            Duration::from_secs(5),
+            now - 3600,
+            now + 3600,
+            1,
+        )
+        .await?;
 
+        // The three cited messages, and one of the rest.
         assert_eq!(report.messages, 4);
         assert_eq!(report.reference, 2);
         assert_eq!(report.found, vec!["Review the budget"]);

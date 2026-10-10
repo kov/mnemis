@@ -588,13 +588,15 @@ impl Engine {
         .await
     }
 
-    /// Development tool: score the configured LLM's extraction over up to
-    /// `max_messages` messages from the last `days` days, without writing
-    /// anything (see `extract::eval`). Returns the report as JSON.
+    /// Development tool: score the configured LLM's extraction over the
+    /// messages posted in `[from, to)` (unix seconds) that actions were
+    /// recorded from, plus `others` more, without writing anything (see
+    /// `extract::eval`). Returns the report as JSON.
     pub async fn evaluate_extraction(
         &self,
-        days: i64,
-        max_messages: i64,
+        from: i64,
+        to: i64,
+        others: i64,
     ) -> Result<String, MnemisError> {
         let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
             message: "No LLM configured. Set it up in Settings.".into(),
@@ -606,8 +608,9 @@ impl Engine {
                 &stack.llm,
                 stack.window_char_budget,
                 stack.idle_timeout,
-                days,
-                max_messages,
+                from,
+                to,
+                others,
             )
             .await?;
             Ok(serde_json::to_string_pretty(&report)?)

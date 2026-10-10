@@ -68,13 +68,21 @@ final class AppModel {
                 await refreshChats()
                 print("[MnemisAsk] deleted chat \(doomed)")
             }
-            // `-MnemisEval days:max` scores extraction on recent mail with the
-            // current LLM, writing nothing.
+            // `-MnemisEval 2026-07-20:2026-08-21:50` scores extraction with
+            // the current LLM over the mail of those dates that actions came
+            // from, plus 50 other messages, writing nothing.
             if let spec = UserDefaults.standard.string(forKey: "MnemisEval") {
-                let parts = spec.split(separator: ":").compactMap { Int64($0) }
+                let parts = spec.split(separator: ":").map(String.init)
+                let day = Date.ISO8601FormatStyle().year().month().day()
                 do {
+                    guard parts.count == 3, let others = Int64(parts[2]) else {
+                        throw MnemisError.Failed(message: "expected from:to:others")
+                    }
                     let report = try await engine.evaluateExtraction(
-                        days: parts.first ?? 14, maxMessages: parts.count > 1 ? parts[1] : 40)
+                        from: Int64(try day.parse(parts[0]).timeIntervalSince1970),
+                        to: Int64(try day.parse(parts[1]).timeIntervalSince1970),
+                        others: others
+                    )
                     print("[MnemisEval] \(report)")
                 } catch {
                     print("[MnemisEval] failed: \(error)")
@@ -332,6 +340,12 @@ final class AppModel {
     /// `Application Support/mnemis`: the database, config.toml and traces.
     /// Not visible in Files, and backed up with the device.
     static var dataDirectory: URL {
-        URL.applicationSupportDirectory.appending(path: "mnemis", directoryHint: .isDirectory)
+        var name = "mnemis"
+        #if DEBUG
+        // `-MnemisDataDir <name>` opens another data directory (say, a copy
+        // of a desktop database to evaluate against).
+        name = UserDefaults.standard.string(forKey: "MnemisDataDir") ?? name
+        #endif
+        return URL.applicationSupportDirectory.appending(path: name, directoryHint: .isDirectory)
     }
 }

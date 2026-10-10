@@ -279,7 +279,8 @@ async fn extract_one_batch(
     // against) actions an earlier batch in this same sync just recorded.
     let existing = load_existing_actions(pool, channel_id).await?;
 
-    let system_prompt = batch_system_prompt(channel, profile, memory_rules, batch, &existing);
+    let system_prompt =
+        batch_system_prompt(channel, profile, memory_rules, batch, &existing, Utc::now());
 
     let scope = ExtractionScope {
         source_id: channel.source_id,
@@ -366,14 +367,16 @@ async fn extract_one_batch(
     }
 }
 
-/// The extractor's system prompt for one batch: its messages as metadata, plus
-/// the user's profile, learned rules and the channel's existing actions.
+/// The extractor's system prompt for one batch, as of `now`: its messages as
+/// metadata, plus the user's profile, learned rules and the channel's existing
+/// actions.
 fn batch_system_prompt(
     channel: &ChannelInfo,
     profile: &UserProfile,
     memory_rules: Option<&str>,
     batch: &[WindowRow],
     existing: &[ExistingAction],
+    now: DateTime<Utc>,
 ) -> String {
     let window: Vec<WindowMessage> = batch
         .iter()
@@ -392,7 +395,7 @@ fn batch_system_prompt(
         user_display_name: profile.display_name.as_deref().unwrap_or("(unknown)"),
         user_identifiers: &profile.identifiers,
         custom_prompt: profile.custom_prompt.as_deref(),
-        current_time: Utc::now(),
+        current_time: now,
         existing_actions: existing,
         memory_rules,
         window: &window,
@@ -450,11 +453,21 @@ struct WindowRow {
     recipients: Vec<Recipient>,
 }
 
-#[allow(clippy::type_complexity)]
 async fn load_window(
     pool: &SqlitePool,
     channel_id: i64,
     watermark: Option<i64>,
+) -> Result<Vec<WindowRow>> {
+    load_rows(pool, channel_id, watermark.unwrap_or(0), WINDOW_LIMIT).await
+}
+
+/// Up to `limit` of the channel's messages after id `after`, oldest first.
+#[allow(clippy::type_complexity)]
+async fn load_rows(
+    pool: &SqlitePool,
+    channel_id: i64,
+    after: i64,
+    limit: i64,
 ) -> Result<Vec<WindowRow>> {
     let rows: Vec<(
         i64,
@@ -473,8 +486,8 @@ async fn load_window(
              ORDER BY m.id ASC LIMIT ?",
     )
     .bind(channel_id)
-    .bind(watermark.unwrap_or(0))
-    .bind(WINDOW_LIMIT)
+    .bind(after)
+    .bind(limit)
     .fetch_all(pool)
     .await
     .context("loading window")?;
