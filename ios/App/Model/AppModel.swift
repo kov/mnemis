@@ -62,6 +62,15 @@ final class AppModel {
             }
             // `-MnemisAsk "…"` starts a chat with that question, logging the
             // engine's events, so the model can be exercised without taps.
+            // `-MnemisDeleteChat <id>` deletes a chat left over from a run.
+            if let doomed = Int64(UserDefaults.standard.string(forKey: "MnemisDeleteChat") ?? "") {
+                try? await engine.deleteChat(chatId: doomed)
+                await refreshChats()
+                print("[MnemisAsk] deleted chat \(doomed)")
+            }
+            // `-MnemisAskStop <s>` presses Stop that many seconds in, then
+            // `-MnemisAskNext "…"` follows up; `-MnemisAskDelete YES`
+            // deletes the chat afterwards.
             if let question = UserDefaults.standard.string(forKey: "MnemisAsk") {
                 await ask(question, engine: engine)
             }
@@ -100,23 +109,51 @@ final class AppModel {
     }
 
     private func ask(_ question: String, engine: Engine) async {
+        let defaults = UserDefaults.standard
         do {
             let id = try await engine.createChat(seededFromKind: nil, seededFromId: nil)
             await refreshChats()
-            let (events, continuation) = AsyncStream.makeStream(of: ChatEvent.self)
-            let logger = Task {
-                for await event in events { print("[MnemisAsk] \(event)") }
+            if let stopAfter = defaults.object(forKey: "MnemisAskStop") as? Double ?? Double(defaults.string(forKey: "MnemisAskStop") ?? "") {
+                Task {
+                    try? await Task.sleep(for: .seconds(stopAfter))
+                    print("[MnemisAsk] pressing Stop")
+                    engine.cancelChatMessage(chatId: id)
+                }
             }
-            try await engine.sendChatMessage(chatId: id, text: question, listener: ChatEventRelay(continuation))
-            continuation.finish()
-            await logger.value
-            print("[MnemisAsk] finished")
+            do {
+                try await send(question, chat: id, engine: engine)
+                if let next = defaults.string(forKey: "MnemisAskNext") {
+                    try await send(next, chat: id, engine: engine)
+                }
+            } catch {
+                print("[MnemisAsk] failed: \(error)")
+            }
+            if defaults.bool(forKey: "MnemisAskDelete") {
+                try await engine.deleteChat(chatId: id)
+                print("[MnemisAsk] deleted the chat")
+            } else {
+                open(URL(string: "mnemis://chat/\(id)")!)
+            }
             await refreshChats()
-            open(URL(string: "mnemis://chat/\(id)")!)
         } catch {
             print("[MnemisAsk] failed: \(error)")
             report(error)
         }
+    }
+
+    private func send(_ text: String, chat id: Int64, engine: Engine) async throws {
+        let (events, continuation) = AsyncStream.makeStream(of: ChatEvent.self)
+        let logger = Task {
+            for await event in events { print("[MnemisAsk] \(event)") }
+        }
+        let started = Date()
+        defer {
+            continuation.finish()
+            print("[MnemisAsk] send finished after \(Int(Date().timeIntervalSince(started)))s")
+        }
+        try await engine.sendChatMessage(chatId: id, text: text, listener: ChatEventRelay(continuation))
+        continuation.finish()
+        await logger.value
     }
     #endif
 

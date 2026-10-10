@@ -94,6 +94,12 @@ final class AppleIntelligence: AppleModel, @unchecked Sendable {
                 return error.localizedDescription
             }
         }
+        // The on-device model reports an over-long prompt with an internal
+        // error type ("Provided N tokens, but the maximum allowed is M").
+        let text = String(describing: error)
+        if text.contains("maximum allowed is") || text.contains("context window") {
+            return "Prompt too long for the model's max context window: \(error.localizedDescription)"
+        }
         #if MNEMIS_PCC
         if let error = error as? PrivateCloudComputeLanguageModel.Error {
             switch error {
@@ -211,6 +217,9 @@ private struct Turn {
         } catch let error as LanguageModelSession.ToolCallError where error.underlyingError is CapturedCall {
             // The model asked for tools; the engine runs them.
         }
+        #if DEBUG
+        print("[AppleIntelligence] input tokens \(session.usage.input.totalTokenCount), output \(session.usage.output.totalTokenCount), cancelled \(Task.isCancelled)")
+        #endif
 
         var output: [[String: Any]] = []
         if !text.isEmpty {
