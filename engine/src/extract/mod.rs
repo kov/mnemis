@@ -9,6 +9,7 @@ use crate::agent;
 use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 use crate::source::Recipient;
 
+pub mod eval;
 pub mod prompt;
 pub mod tools;
 pub mod trace;
@@ -278,30 +279,7 @@ async fn extract_one_batch(
     // against) actions an earlier batch in this same sync just recorded.
     let existing = load_existing_actions(pool, channel_id).await?;
 
-    let window_for_prompt: Vec<WindowMessage> = batch
-        .iter()
-        .map(|m| WindowMessage {
-            external_id: m.external_id.clone(),
-            posted_at: DateTime::<Utc>::from_timestamp(m.posted_at, 0).unwrap_or_else(Utc::now),
-            author: m.author_display.clone().unwrap_or_else(|| "?".to_string()),
-            recipients: m.recipients.clone(),
-            subject: m.subject.clone(),
-            snippet: tools::snippet(&m.body, SNIPPET_CHARS),
-        })
-        .collect();
-
-    let inputs = PromptInputs {
-        source_kind: &channel.source_kind,
-        channel_name: &channel.name,
-        user_display_name: profile.display_name.as_deref().unwrap_or("(unknown)"),
-        user_identifiers: &profile.identifiers,
-        custom_prompt: profile.custom_prompt.as_deref(),
-        current_time: Utc::now(),
-        existing_actions: &existing,
-        memory_rules,
-        window: &window_for_prompt,
-    };
-    let system_prompt = prompt::build(&inputs);
+    let system_prompt = batch_system_prompt(channel, profile, memory_rules, batch, &existing);
 
     let scope = ExtractionScope {
         source_id: channel.source_id,
@@ -324,6 +302,7 @@ async fn extract_one_batch(
         window_char_budget,
         idle_timeout,
         writer.as_mut(),
+        None,
     )
     .await;
 
@@ -385,6 +364,39 @@ async fn extract_one_batch(
             Err(e)
         }
     }
+}
+
+/// The extractor's system prompt for one batch: its messages as metadata, plus
+/// the user's profile, learned rules and the channel's existing actions.
+fn batch_system_prompt(
+    channel: &ChannelInfo,
+    profile: &UserProfile,
+    memory_rules: Option<&str>,
+    batch: &[WindowRow],
+    existing: &[ExistingAction],
+) -> String {
+    let window: Vec<WindowMessage> = batch
+        .iter()
+        .map(|m| WindowMessage {
+            external_id: m.external_id.clone(),
+            posted_at: DateTime::<Utc>::from_timestamp(m.posted_at, 0).unwrap_or_else(Utc::now),
+            author: m.author_display.clone().unwrap_or_else(|| "?".to_string()),
+            recipients: m.recipients.clone(),
+            subject: m.subject.clone(),
+            snippet: tools::snippet(&m.body, SNIPPET_CHARS),
+        })
+        .collect();
+    prompt::build(&PromptInputs {
+        source_kind: &channel.source_kind,
+        channel_name: &channel.name,
+        user_display_name: profile.display_name.as_deref().unwrap_or("(unknown)"),
+        user_identifiers: &profile.identifiers,
+        custom_prompt: profile.custom_prompt.as_deref(),
+        current_time: Utc::now(),
+        existing_actions: existing,
+        memory_rules,
+        window: &window,
+    })
 }
 
 struct ChannelInfo {
@@ -560,6 +572,18 @@ async fn load_user_profile_for(pool: &SqlitePool, source_kind: &str) -> Result<U
     })
 }
 
+/// A call to a tool that changes actions, captured instead of run (see
+/// [`run_agent_loop`]'s `dry`).
+pub(crate) struct DryCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+const MUTATING_TOOLS: [&str; 3] = ["record_action", "update_action", "resolve_action"];
+
+/// Run the extraction agent over one batch. With `dry`, the tools that change
+/// actions only record their calls there (answering as if they had worked) —
+/// for evaluations that must not touch the user's data.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     pool: &SqlitePool,
@@ -569,6 +593,7 @@ async fn run_agent_loop(
     fetch_budget_chars: usize,
     idle_timeout: Duration,
     mut trace: Option<&mut TraceWriter>,
+    mut dry: Option<&mut Vec<DryCall>>,
 ) -> Result<(usize, Option<String>)> {
     let tool_defs = tools::definitions();
     // The full conversation, rebuilt client-side each turn instead of threaded
@@ -691,14 +716,37 @@ async fn run_agent_loop(
 
         for (call_id, name, arguments) in function_calls {
             debug!(name = %name, call_id = %call_id, "dispatching tool");
-            let out = tools::dispatch(
-                pool,
-                scope.tool_scope(),
-                &mut fetch_budget,
-                &name,
-                &arguments,
-            )
-            .await;
+            let out = match dry.as_deref_mut() {
+                Some(calls) if MUTATING_TOOLS.contains(&name.as_str()) => {
+                    calls.push(DryCall {
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                    let recorded = name == "record_action";
+                    let output = if recorded {
+                        serde_json::json!({
+                            "action_id": format!("A-{}", 900_000 + calls.len()),
+                            "status": "recorded",
+                        })
+                    } else {
+                        serde_json::json!({ "status": "ok" })
+                    };
+                    tools::DispatchOutput {
+                        output: output.to_string(),
+                        recorded_action: recorded,
+                    }
+                }
+                _ => {
+                    tools::dispatch(
+                        pool,
+                        scope.tool_scope(),
+                        &mut fetch_budget,
+                        &name,
+                        &arguments,
+                    )
+                    .await
+                }
+            };
             if out.recorded_action {
                 actions_created += 1;
             }

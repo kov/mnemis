@@ -3417,6 +3417,7 @@ dependencies = [
  "async-trait",
  "mnemis-engine",
  "mnemis-types",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",

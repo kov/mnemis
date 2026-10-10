@@ -21,6 +21,7 @@ mnemis-engine = { path = "../engine", default-features = false }
 mnemis-types = { path = "../types" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
+serde_json = "1.0.150"
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }

@@ -68,6 +68,18 @@ final class AppModel {
                 await refreshChats()
                 print("[MnemisAsk] deleted chat \(doomed)")
             }
+            // `-MnemisEval days:max` scores extraction on recent mail with the
+            // current LLM, writing nothing.
+            if let spec = UserDefaults.standard.string(forKey: "MnemisEval") {
+                let parts = spec.split(separator: ":").compactMap { Int64($0) }
+                do {
+                    let report = try await engine.evaluateExtraction(
+                        days: parts.first ?? 14, maxMessages: parts.count > 1 ? parts[1] : 40)
+                    print("[MnemisEval] \(report)")
+                } catch {
+                    print("[MnemisEval] failed: \(error)")
+                }
+            }
             // `-MnemisAskStop <s>` presses Stop that many seconds in, then
             // `-MnemisAskNext "…"` follows up; `-MnemisAskDelete YES`
             // deletes the chat afterwards.
