@@ -15,20 +15,14 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
+use super::prompt::ExistingAction;
 use super::{
-    DryCall, ExtractionScope, batch_system_prompt, load_channel, load_existing_actions, load_rows,
-    load_user_profile_for, run_agent_loop, split_into_batches, staged,
+    DryCall, ExtractionScope, batch_system_prompt, load_channel, load_rows, load_user_profile_for,
+    run_agent_loop, split_into_batches, staged,
 };
 use crate::llm::LlmTransport;
 
-/// How the model is driven.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strategy {
-    /// The production agent loop over a batch's metadata.
-    Agent,
-    /// Per message: summarise, judge 0/1, then record (see `staged`).
-    Staged,
-}
+pub use super::Strategy;
 
 #[derive(Debug, Default, Serialize)]
 pub struct EvalReport {
@@ -47,6 +41,11 @@ pub struct EvalReport {
     pub dismissed: Vec<String>,
     pub updates: usize,
     pub resolves: usize,
+    /// Resolves that close a to-do with a message the user's history
+    /// resolved it with.
+    pub resolved_right: Vec<String>,
+    /// Resolves of a to-do with a message that didn't resolve it.
+    pub resolved_wrong: Vec<String>,
     /// Messages shown as a suspicious-sender warning instead of a to-do,
     /// marked when an action was known (or dismissed) from them.
     pub warnings: Vec<String>,
@@ -55,7 +54,7 @@ pub struct EvalReport {
 }
 
 /// Evaluate over the messages of unmuted channels posted in `[from, to)`
-/// (unix seconds): every one an action was recorded from, plus `others` more,
+/// (unix seconds): every one an action was recorded or resolved from, plus `others` more,
 /// picked by a fixed scramble of their ids so repeated runs see the same set.
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate(
@@ -73,7 +72,7 @@ pub async fn evaluate(
         "WITH candidates AS ( \
              SELECT m.id, m.channel_id, \
                  EXISTS (SELECT 1 FROM action_evidence ae \
-                         WHERE ae.message_id = m.id AND ae.kind = 'source') AS cited \
+                         WHERE ae.message_id = m.id) AS cited \
              FROM messages m JOIN channels c ON c.id = m.channel_id \
              WHERE m.posted_at >= ? AND m.posted_at < ? AND c.muted = 0) \
          SELECT id, channel_id FROM candidates WHERE cited \
@@ -154,12 +153,23 @@ async fn evaluate_channel(
         entry.2.insert(external_id);
     }
 
-    // The prompt may only show actions that predate these messages, or the
-    // answers would be in it.
-    let existing: Vec<_> = load_existing_actions(pool, channel_id)
-        .await?
+    // What each to-do was resolved with, to score resolves.
+    let resolutions: HashSet<(i64, String)> = sqlx::query_as(
+        "SELECT ae.action_id, m.external_id FROM action_evidence ae \
+         JOIN messages m ON m.id = ae.message_id \
+         WHERE ae.kind = 'resolution' AND m.channel_id = ?",
+    )
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await
+    .context("loading resolutions")?
+    .into_iter()
+    .collect();
+    let titles: HashMap<i64, String> = sqlx::query_as("SELECT id, title FROM actions")
+        .fetch_all(pool)
+        .await
+        .context("loading action titles")?
         .into_iter()
-        .filter(|a| !reference.contains_key(&a.id))
         .collect();
 
     let scope = ExtractionScope {
@@ -189,6 +199,11 @@ async fn evaluate_channel(
             .max()
             .and_then(|t| chrono::DateTime::from_timestamp(t + 600, 0))
             .unwrap_or_else(chrono::Utc::now);
+        // The to-dos open on the batch's day, as a sync then would have seen
+        // them; none recorded from this day's mail, or the answers would be
+        // in the prompt.
+        let day = batch[0].posted_at.div_euclid(86_400) * 86_400;
+        let existing = open_on(pool, channel_id, day).await?;
         if strategy == Strategy::Staged {
             let ctx = staged::Context {
                 profile: &profile,
@@ -271,7 +286,28 @@ async fn evaluate_channel(
         let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
         match call.name.as_str() {
             "update_action" => report.updates += 1,
-            "resolve_action" => report.resolves += 1,
+            "resolve_action" => {
+                report.resolves += 1;
+                let id = args["action_id"]
+                    .as_str()
+                    .and_then(|s| s.trim_start_matches("A-").parse::<i64>().ok())
+                    .unwrap_or(0);
+                let title = titles
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("A-{id}"));
+                let right = args["evidence_external_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                    .any(|e| resolutions.contains(&(id, e.to_string())));
+                if right {
+                    report.resolved_right.push(title);
+                } else {
+                    report.resolved_wrong.push(title);
+                }
+            }
             _ => {
                 let title = args["title"].as_str().unwrap_or("(untitled)").to_string();
                 let cited: HashSet<&str> = args["evidence_external_ids"]
@@ -309,12 +345,40 @@ async fn evaluate_channel(
     Ok(())
 }
 
+/// The channel's to-dos that were open at `at` (unix seconds): recorded
+/// from earlier mail, not closed before then, and not dismissed.
+async fn open_on(pool: &SqlitePool, channel_id: i64, at: i64) -> Result<Vec<ExistingAction>> {
+    let rows: Vec<(i64, String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT a.id, a.title, a.details, a.due_at FROM actions a \
+         JOIN action_evidence ae ON ae.action_id = a.id AND ae.kind = 'source' \
+         JOIN messages m ON m.id = ae.message_id \
+         WHERE m.channel_id = ?1 AND a.status != 'dismissed' \
+         AND (a.resolved_at IS NULL OR a.resolved_at >= ?2) \
+         GROUP BY a.id HAVING MIN(m.posted_at) < ?2 \
+         ORDER BY MIN(m.posted_at) DESC LIMIT 50",
+    )
+    .bind(channel_id)
+    .bind(at)
+    .fetch_all(pool)
+    .await
+    .context("loading the to-dos open then")?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, title, details, due_at)| ExistingAction {
+            id,
+            title,
+            details,
+            due_at: due_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::extract::tools;
     use crate::test_util::{
-        MockLlm, SeedMessage, fetch_actions, mock, seed_messages, seed_minimal,
+        MockLlm, SeedMessage, fetch_actions, mock, seed_history, seed_messages, seed_minimal,
     };
 
     fn message<'a>(external_id: &'a str, subject: &'a str, body: &'a str) -> SeedMessage<'a> {
@@ -426,6 +490,7 @@ mod tests {
             ],
         )
         .await?;
+        seed_history(&pool, ctx.channel_id).await?;
         let args = serde_json::json!({
             "title": "Review the budget", "details": "", "confidence": "high", "rationale": "",
             "evidence_external_ids": ["ask"],

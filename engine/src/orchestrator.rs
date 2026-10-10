@@ -325,6 +325,7 @@ async fn sync_one_source_with(
             window_char_budget,
             idle_timeout,
             traces_dir,
+            crate::extract::Strategy::for_budget(window_char_budget),
         )
         .await
         {

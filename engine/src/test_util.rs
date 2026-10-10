@@ -74,6 +74,35 @@ impl LlmTransport for MockLlm {
 
 // ---------- Mock response builders ---------------------------------------
 
+/// Two months of older mail, in a muted folder of `channel_id`'s source so
+/// extraction leaves it alone: enough history for the staged extraction's
+/// sender checks to apply.
+pub async fn seed_history(pool: &sqlx::SqlitePool, channel_id: i64) -> anyhow::Result<()> {
+    let (history,): (i64,) = sqlx::query_as(
+        "INSERT INTO channels (source_id, external_id, name, kind, muted) \
+         SELECT source_id, 'history', 'History', 'mailbox', 1 FROM channels WHERE id = ? \
+         RETURNING id",
+    )
+    .bind(channel_id)
+    .fetch_one(pool)
+    .await?;
+    let channel_id = history;
+    let old = chrono::Utc::now().timestamp() - 60 * 86_400;
+    for i in 0..200 {
+        sqlx::query(
+            "INSERT INTO messages (channel_id, external_id, posted_at, body, body_format, \
+             ingested_at) VALUES (?, ?, ?, 'old', 'text', ?)",
+        )
+        .bind(channel_id)
+        .bind(format!("history-{i}"))
+        .bind(old + i)
+        .bind(old)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 pub mod mock {
     use super::*;
 

@@ -65,6 +65,7 @@ async fn extracts_explicit_ask_into_high_confidence_action() -> Result<()> {
         DEFAULT_WINDOW_CHAR_BUDGET,
         std::time::Duration::from_secs(60),
         None,
+        mnemis_engine::extract::Strategy::Agent,
     )
     .await?;
     assert_eq!(outcome.result, "ok", "expected ok, got {:?}", outcome);
@@ -131,6 +132,7 @@ async fn skips_purely_informational_message() -> Result<()> {
         DEFAULT_WINDOW_CHAR_BUDGET,
         std::time::Duration::from_secs(60),
         None,
+        mnemis_engine::extract::Strategy::Agent,
     )
     .await?;
     assert_eq!(outcome.result, "ok");

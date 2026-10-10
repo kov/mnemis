@@ -1015,5 +1015,6 @@ pub(crate) fn status_label(s: ActionStatus) -> &'static str {
         ActionStatus::Done => "done",
         ActionStatus::Cancelled => "cancelled",
         ActionStatus::Dismissed => "dismissed",
+        ActionStatus::Suspicious => "suspicious",
     }
 }

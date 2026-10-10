@@ -657,6 +657,7 @@ pub enum ActionStatus {
     Done,
     Cancelled,
     Dismissed,
+    Suspicious,
 }
 
 #[uniffi::remote(Enum)]

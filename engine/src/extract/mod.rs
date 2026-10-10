@@ -81,6 +81,29 @@ pub fn window_char_budget_for(max_context_tokens: usize) -> usize {
 /// Equals [`window_char_budget_for`]\([`DEFAULT_MAX_CONTEXT_TOKENS`]\).
 pub const DEFAULT_WINDOW_CHAR_BUDGET: usize = DEFAULT_MAX_CONTEXT_TOKENS / 4 * CHARS_PER_TOKEN;
 
+/// How the model is driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// The agent loop over a batch's metadata.
+    Agent,
+    /// Per message: classify, summarise, judge 0/1, then record (see
+    /// `staged`).
+    Staged,
+}
+
+impl Strategy {
+    /// Staged for models with a small context (Apple's on-device model has
+    /// 8k), which lose the thread in the agent loop and overflow it; the
+    /// agent loop otherwise.
+    pub fn for_budget(window_char_budget: usize) -> Self {
+        if window_char_budget < window_char_budget_for(16_384) {
+            Self::Staged
+        } else {
+            Self::Agent
+        }
+    }
+}
+
 /// What a single batch attempt resolved to. `Overflow` means the agent hit
 /// the server's context limit and the batch is splittable — the caller
 /// halves it and retries — so no `extraction_runs` row is written for the
@@ -111,6 +134,7 @@ pub async fn extract_for_channel(
     window_char_budget: usize,
     idle_timeout: Duration,
     traces_dir: Option<&Path>,
+    strategy: Strategy,
 ) -> Result<ExtractionOutcome> {
     let channel = load_channel(pool, channel_id).await?;
     let watermark = load_watermark(pool, channel_id).await?;
@@ -167,20 +191,39 @@ pub async fn extract_for_channel(
     let mut last_up_to = watermark;
 
     while let Some(batch) = queue.pop_front() {
-        let result = extract_one_batch(
-            pool,
-            llm,
-            &channel,
-            channel_id,
-            model_name,
-            &profile,
-            memory_rules.as_deref(),
-            &batch,
-            window_char_budget,
-            idle_timeout,
-            traces_dir,
-        )
-        .await
+        let result = match strategy {
+            Strategy::Agent => {
+                extract_one_batch(
+                    pool,
+                    llm,
+                    &channel,
+                    channel_id,
+                    model_name,
+                    &profile,
+                    memory_rules.as_deref(),
+                    &batch,
+                    window_char_budget,
+                    idle_timeout,
+                    traces_dir,
+                )
+                .await
+            }
+            Strategy::Staged => {
+                extract_one_batch_staged(
+                    pool,
+                    llm,
+                    &channel,
+                    channel_id,
+                    model_name,
+                    &profile,
+                    memory_rules.as_deref(),
+                    &batch,
+                    window_char_budget,
+                    idle_timeout,
+                )
+                .await
+            }
+        }
         .map_err(|e| e.context(format!("channel {channel_id}")))?;
         match result {
             BatchResult::Done {
@@ -366,6 +409,92 @@ async fn extract_one_batch(
             Err(e)
         }
     }
+}
+
+/// Run one batch the staged way, a message at a time (see `staged`), storing
+/// suspicious senders' messages as warnings. Records one `extraction_runs`
+/// row for the batch; when a message fails, the messages before it are
+/// recorded as done so they aren't extracted twice, and the error is
+/// returned.
+#[allow(clippy::too_many_arguments)]
+async fn extract_one_batch_staged(
+    pool: &SqlitePool,
+    llm: &dyn LlmTransport,
+    channel: &ChannelInfo,
+    channel_id: i64,
+    model_name: &str,
+    profile: &UserProfile,
+    memory_rules: Option<&str>,
+    batch: &[WindowRow],
+    window_char_budget: usize,
+    idle_timeout: Duration,
+) -> Result<BatchResult> {
+    let scope = ExtractionScope {
+        source_id: channel.source_id,
+        channel_id,
+    };
+    let mut actions = 0;
+    let mut done_up_to = None;
+    for message in batch {
+        // Reloaded per message, so what one recorded is there for the next
+        // to update instead of duplicating.
+        let existing = load_existing_actions(pool, channel_id).await?;
+        let ctx = staged::Context {
+            profile,
+            memory_rules,
+            existing: &existing,
+            now: Utc::now(),
+            body_chars: window_char_budget,
+            idle_timeout,
+        };
+        match staged::run(pool, llm, scope, &ctx, message, None).await {
+            Ok(outcome) => {
+                debug!(channel_id, "{}", outcome.summary);
+                actions += outcome.actions;
+                if let Some(warning) = outcome.warning {
+                    let title = message
+                        .subject
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("Suspicious email");
+                    let details = format!("⚠️ {warning}.\n\n{}", outcome.gist);
+                    crate::mutations::record_suspicious(pool, message.id, title, &details).await?;
+                }
+                done_up_to = Some(message.id);
+            }
+            Err(e) => {
+                let chain = format!("{e:#}");
+                warn!(error = %chain, channel_id, "staged extraction failed");
+                if done_up_to.is_some() {
+                    record_run(
+                        pool, channel_id, done_up_to, model_name, "ok", actions, 0, None,
+                    )
+                    .await?;
+                }
+                record_run(
+                    pool,
+                    channel_id,
+                    batch.last().map(|m| m.id),
+                    model_name,
+                    "error",
+                    0,
+                    0,
+                    Some(chain),
+                )
+                .await?;
+                return Err(e);
+            }
+        }
+    }
+    record_run(
+        pool, channel_id, done_up_to, model_name, "ok", actions, 0, None,
+    )
+    .await?;
+    Ok(BatchResult::Done {
+        actions,
+        summary: None,
+        up_to: done_up_to,
+    })
 }
 
 /// The extractor's system prompt for one batch, as of `now`: its messages as
@@ -1206,6 +1335,7 @@ mod tests {
             1,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await
         .expect("multi-batch extraction should succeed");
@@ -1247,6 +1377,7 @@ mod tests {
             1,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await;
         assert!(result.is_err(), "a failing batch should bubble an error");
@@ -1317,6 +1448,7 @@ mod tests {
             DEFAULT_WINDOW_CHAR_BUDGET,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await
         .expect("split-and-retry should recover");
@@ -1382,6 +1514,7 @@ mod tests {
             DEFAULT_WINDOW_CHAR_BUDGET,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await
         .expect("a transient stall should be retried, not surfaced");
@@ -1437,6 +1570,7 @@ mod tests {
             DEFAULT_WINDOW_CHAR_BUDGET,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await
         .expect("loop should finish");
@@ -1492,6 +1626,7 @@ mod tests {
             DEFAULT_WINDOW_CHAR_BUDGET,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await;
         assert!(result.is_err(), "an unsplittable overflow should surface");
@@ -1527,6 +1662,7 @@ mod tests {
             DEFAULT_WINDOW_CHAR_BUDGET,
             Duration::from_secs(60),
             None,
+            Strategy::Agent,
         )
         .await;
         let err = result.expect_err("extract_for_channel should return Err when the agent fails");
@@ -1846,6 +1982,80 @@ mod tests {
         assert_eq!(status, "pending");
         assert_eq!(actor, "agent_queued");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_extraction_records_to_dos_and_stores_warnings() -> Result<()> {
+        use crate::test_util::{
+            MockLlm, SeedMessage, mock, seed_history, seed_messages, seed_minimal,
+        };
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let ctx = seed_minimal(&pool).await?;
+        seed_messages(
+            &pool,
+            ctx.source_id,
+            ctx.channel_id,
+            &[
+                SeedMessage {
+                    external_id: "ask",
+                    author_email: "ana@example.com",
+                    author_name: "Ana",
+                    subject: "Budget",
+                    body: "Can you review the budget by Friday?",
+                    recipients: &[],
+                },
+                SeedMessage {
+                    external_id: "phish",
+                    author_email: "no-reply@suporte5.ux6qrc.com",
+                    author_name: "Bradesco Net Empresas",
+                    subject: "Atualização necessária",
+                    body: "Confirme seus dados para evitar o bloqueio.",
+                    recipients: &[],
+                },
+            ],
+        )
+        .await?;
+        seed_history(&pool, ctx.channel_id).await?;
+        let llm = MockLlm::new(vec![
+            mock::no_tools("personal"),
+            mock::no_tools("Ana asks the user to review the budget by Friday."),
+            mock::no_tools("1"),
+            mock::record_action("Review the budget", "high", &["ask"]),
+            mock::no_tools("account"),
+            mock::no_tools("Bradesco asks the user to confirm their data."),
+        ]);
+        let outcome = extract_for_channel(
+            &pool,
+            &llm,
+            ctx.channel_id,
+            "on-device",
+            window_char_budget_for(8_192),
+            Duration::from_secs(5),
+            None,
+            Strategy::Staged,
+        )
+        .await?;
+        assert_eq!(outcome.actions_created, 1);
+
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT title, status, details FROM actions ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        // Ana is new to this database too, so her to-do carries the warning.
+        assert_eq!(rows[0].0, "Review the budget");
+        assert!(rows[0].2.as_deref().unwrap_or("").contains("example.com"));
+        assert_eq!(rows[1].0, "Atualização necessária");
+        assert_eq!(rows[1].1, "suspicious");
+        assert!(rows[1].2.as_deref().unwrap_or("").contains("ux6qrc.com"));
+        // The window is done: a second sync has nothing left to extract.
+        let rows = load_rows(&pool, ctx.channel_id, 0, 1_000).await?;
+        assert_eq!(
+            load_watermark(&pool, ctx.channel_id).await?,
+            rows.last().map(|m| m.id)
+        );
         Ok(())
     }
 }

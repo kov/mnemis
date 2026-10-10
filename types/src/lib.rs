@@ -56,6 +56,9 @@ pub enum ActionStatus {
     Done,
     Cancelled,
     Dismissed,
+    /// From a sender that looks like an impostor: shown as a warning, not a
+    /// to-do, until the user accepts it (→ pending) or dismisses it.
+    Suspicious,
 }
 
 impl ActionStatus {
@@ -67,6 +70,7 @@ impl ActionStatus {
             "done" => Some(Self::Done),
             "cancelled" => Some(Self::Cancelled),
             "dismissed" => Some(Self::Dismissed),
+            "suspicious" => Some(Self::Suspicious),
             _ => None,
         }
     }

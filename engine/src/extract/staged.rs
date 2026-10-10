@@ -2,7 +2,9 @@
 //! that lose the thread in the agent loop: per message, classify it (marketing
 //! and spam are dropped), summarise it (no tools), decide from both whether
 //! it needs the user to act (a 0 or 1), and only then record the action from
-//! the summary with a narrow tool set.
+//! the summary with a narrow tool set. A message that needs nothing new is
+//! checked against the open to-dos instead: when it shows one done (a payment
+//! received, a vote cast), resolving it is suggested for the user to confirm.
 //!
 //! Whether the sender looks like an impostor is decided in code, from
 //! signals the model can't judge: a domain the user has never had mail from,
@@ -45,6 +47,12 @@ const IGNORED_KINDS: [&str; 2] = ["marketing", "spam"];
 /// The kinds `KIND_SYSTEM` offers.
 const KINDS: [&str; 5] = ["personal", "account", "notification", "marketing", "spam"];
 
+/// "New to the user" means something only against enough history: until the
+/// database holds this many earlier messages, spanning `HISTORY_DAYS`, no
+/// sender is judged (on a fresh install, every one is new).
+const HISTORY_MESSAGES: i64 = 200;
+const HISTORY_DAYS: i64 = 30;
+
 /// Link domains named in a warning.
 const WARNING_LINKS: usize = 3;
 
@@ -69,6 +77,10 @@ pub(super) struct Outcome {
     /// Set when the sender is suspicious enough that the message is shown as
     /// a warning instead of a to-do.
     pub warning: Option<String>,
+    /// To-dos recorded.
+    pub actions: usize,
+    /// The model's summary of the message.
+    pub gist: String,
 }
 
 pub(super) async fn run(
@@ -106,6 +118,8 @@ pub(super) async fn run(
     let quiet = |what: &str| Outcome {
         summary: format!("{}: {kind}, {what} — {summary}", message.external_id),
         warning: None,
+        actions: 0,
+        gist: summary.clone(),
     };
     if IGNORED_KINDS.contains(&kind) {
         return Ok(quiet("not actionable"));
@@ -115,13 +129,35 @@ pub(super) async fn run(
         return Ok(Outcome {
             summary: format!("{}: {kind}, warning only — {summary}", message.external_id),
             warning: Some(suspicion.warning()),
+            actions: 0,
+            gist: summary,
         });
     }
     let digest = format!("{headers}Kind: {kind}\nSummary: {summary}\n");
 
     let verdict = text_of(&send(llm, &relevance_system(ctx), digest.clone(), &[], &stream).await?);
     if !verdict.trim_start().starts_with('1') {
-        return Ok(quiet("not actionable"));
+        let Some(open) = resolves(llm, ctx, message, kind, &digest, &stream).await? else {
+            return Ok(quiet("not actionable"));
+        };
+        let args = serde_json::json!({
+            "action_id": format!("A-{}", open.id),
+            "status": "done",
+            // Only suggested: the user confirms what a small model concludes.
+            "confidence": "medium",
+            "rationale": summary.chars().take(200).collect::<String>(),
+            "evidence_external_ids": [message.external_id],
+        });
+        dispatch_or_capture(
+            pool,
+            scope,
+            &mut tools::FetchBudget::new(0),
+            dry.as_deref_mut(),
+            "resolve_action",
+            &args.to_string(),
+        )
+        .await;
+        return Ok(quiet(&format!("resolves A-{} {}", open.id, open.title)));
     }
     let caution = (!suspicion.signals.is_empty()).then(|| suspicion.warning());
 
@@ -200,7 +236,97 @@ pub(super) async fn run(
     } else {
         ""
     };
-    Ok(quiet(&format!("{actions} recorded{flag}")))
+    Ok(Outcome {
+        actions,
+        ..quiet(&format!("{actions} recorded{flag}"))
+    })
+}
+
+/// The open to-do the message shows done or no longer needed, if any. Only
+/// account mail and notifications confirm things, and only to-dos that share
+/// a distinctive word with the message (a name, a ticker, an order number)
+/// are offered: given the whole list, the small model picks one for almost
+/// any email.
+async fn resolves<'a>(
+    llm: &dyn LlmTransport,
+    ctx: &'a Context<'_>,
+    message: &WindowRow,
+    kind: &str,
+    digest: &str,
+    stream: &agent::StreamCtx,
+) -> Result<Option<&'a ExistingAction>> {
+    if kind != "account" && kind != "notification" {
+        return Ok(None);
+    }
+    let text = format!(
+        "{} {}",
+        message.subject.as_deref().unwrap_or(""),
+        message.body
+    )
+    .to_lowercase();
+    let candidates: Vec<&ExistingAction> = ctx
+        .existing
+        .iter()
+        .filter(|a| {
+            // A to-do that names a number (an order, a contract) is only
+            // about mail carrying that number.
+            let (numbers, names): (Vec<String>, Vec<String>) =
+                distinctive_words(&a.title).partition(|w| w.chars().any(|c| c.is_ascii_digit()));
+            if numbers.is_empty() {
+                names.iter().any(|w| text.contains(w))
+            } else {
+                numbers.iter().any(|w| text.contains(w))
+            }
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut system = format!(
+        "These are the open to-dos of {}. Does the email below show that one of them is \
+         done or no longer needed: paid, voted, signed, delivered, picked up, confirmed, or \
+         cancelled? Only an email about that very to-do counts, not one on a similar \
+         subject.\n\n",
+        who(ctx)
+    );
+    for (n, action) in candidates.iter().enumerate() {
+        system.push_str(&format!("{}. {}\n", n + 1, action.title));
+    }
+    system.push_str("\nReply with the to-do's number, or 0 when none is done.");
+    let reply = text_of(&send(llm, &system, digest.to_string(), &[], stream).await?);
+    let n: usize = reply
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|w| !w.is_empty())
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(0);
+    let Some(chosen) = n.checked_sub(1).and_then(|i| candidates.get(i).copied()) else {
+        return Ok(None);
+    };
+    // Picking from a list, the model reaches for the nearest subject; asked
+    // about the one to-do alone, it tells "same company" from "this is done".
+    let check = format!(
+        "The user has this to-do: \"{}\". Does the email below show that this very to-do \
+         is done or no longer needed? An email from the same company about something else \
+         does not count. Reply with the single digit 1 or 0.",
+        chosen.title
+    );
+    let verdict = text_of(&send(llm, &check, digest.to_string(), &[], stream).await?);
+    Ok(verdict.trim_start().starts_with('1').then_some(chosen))
+}
+
+/// The words of a to-do title that name something, lowercased: those with
+/// a digit ("KNSC11", "#702-7145333") or capitalised past the first word
+/// ("Amazon", "Tesouro"), three characters or more.
+fn distinctive_words(title: &str) -> impl Iterator<Item = String> + '_ {
+    title
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|w| w.chars().count() >= 3)
+        .enumerate()
+        .filter(|(i, w)| {
+            w.chars().any(|c| c.is_ascii_digit())
+                || (*i > 0 && w.chars().next().is_some_and(char::is_uppercase))
+        })
+        .map(|(_, w)| w.to_lowercase())
 }
 
 /// Why a sender looks like an impostor; empty when it doesn't.
@@ -233,6 +359,17 @@ async fn suspicion(pool: &SqlitePool, message: &WindowRow) -> Result<Suspicion> 
     else {
         return Ok(found);
     };
+    let (history, oldest): (i64, Option<i64>) =
+        sqlx::query_as("SELECT COUNT(*), MIN(posted_at) FROM messages WHERE posted_at < ?")
+            .bind(message.posted_at)
+            .fetch_one(pool)
+            .await
+            .context("measuring history")?;
+    if history < HISTORY_MESSAGES
+        || oldest.is_none_or(|t| t > message.posted_at - HISTORY_DAYS * 86_400)
+    {
+        return Ok(found);
+    }
     let domain = registrable(&host);
     let (earlier,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM messages m JOIN people p ON p.id = m.author_id \
@@ -460,7 +597,21 @@ fn action_system(ctx: &Context<'_>, external_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{name_unrelated_to_host, parse_kind, with_caution};
+    use super::{distinctive_words, name_unrelated_to_host, parse_kind, with_caution};
+
+    #[test]
+    fn picks_the_words_that_name_something() {
+        let words: Vec<String> =
+            distinctive_words("Garantir saldo na Itaú CV para investimento Tesouro Direto")
+                .collect();
+        assert_eq!(words, ["itaú", "tesouro", "direto"]);
+        let words: Vec<String> =
+            distinctive_words("Update Amazon payment method for order #702-7145333").collect();
+        assert_eq!(words, ["amazon", "702-7145333"]);
+        let words: Vec<String> =
+            distinctive_words("Exercise subscription right for KNSC11").collect();
+        assert_eq!(words, ["knsc11"]);
+    }
 
     #[test]
     fn tells_names_that_belong_to_their_host() {

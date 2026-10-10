@@ -233,14 +233,17 @@ pub async fn extract(cfg: &Config, channel_id: i64) -> Result<()> {
     let pool = db::open(&cfg.db_path()).await?;
     let llm = build_llm(cfg).await?;
     let traces = cfg.traces_dir();
+    let window_char_budget =
+        mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens());
     let outcome = extract_for_channel(
         &pool,
         &llm,
         channel_id,
         &cfg.llm.chat_model,
-        mnemis_engine::extract::window_char_budget_for(cfg.llm.resolved_max_context_tokens()),
+        window_char_budget,
         std::time::Duration::from_secs(cfg.llm.resolved_chat_idle_timeout_secs()),
         Some(&traces),
+        mnemis_engine::extract::Strategy::for_budget(window_char_budget),
     )
     .await?;
     println!(

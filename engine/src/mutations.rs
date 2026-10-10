@@ -124,6 +124,49 @@ pub async fn update_action_status(
     Ok(())
 }
 
+/// Record a message from a suspicious sender as a warning: an action with
+/// status `suspicious` citing the message, for the user to accept as a to-do
+/// or dismiss. Returns its id.
+pub async fn record_suspicious(
+    pool: &SqlitePool,
+    message_id: i64,
+    title: &str,
+    details: &str,
+) -> Result<i64> {
+    let now = Utc::now().timestamp();
+    let mut tx = pool.begin().await.context("begin tx")?;
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO actions (title, details, confidence, rationale, status, extracted_at) \
+         VALUES (?, ?, 'low', 'suspicious sender', 'suspicious', ?) RETURNING id",
+    )
+    .bind(title)
+    .bind(details)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    .context("inserting warning")?;
+    sqlx::query(
+        "INSERT INTO action_evidence (action_id, message_id, kind, is_primary) \
+         VALUES (?, ?, 'source', 1)",
+    )
+    .bind(id)
+    .bind(message_id)
+    .execute(&mut *tx)
+    .await
+    .context("inserting warning evidence")?;
+    sqlx::query(
+        "INSERT INTO action_events (action_id, event_kind, actor, occurred_at) \
+         VALUES (?, 'created', 'agent_auto', ?)",
+    )
+    .bind(id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("inserting warning event")?;
+    tx.commit().await.context("commit tx")?;
+    Ok(id)
+}
+
 /// Set (or change) an action's due date, turning it into a reminder. A new
 /// reminder gets created on the next CalDAV sync (the reconcile create path
 /// keys off `due_at`); an action that's already a reminder is marked `dirty`
@@ -262,12 +305,15 @@ fn status_str(s: ActionStatus) -> &'static str {
         ActionStatus::Done => "done",
         ActionStatus::Cancelled => "cancelled",
         ActionStatus::Dismissed => "dismissed",
+        ActionStatus::Suspicious => "suspicious",
     }
 }
 
 fn event_kind_for(from: ActionStatus, to: ActionStatus) -> Result<&'static str> {
     use ActionStatus::*;
     let kind = match (from, to) {
+        // Taking a warning as a real to-do.
+        (Suspicious, Pending | Claimed) => "accepted",
         // Reopening a resolved action.
         (Done | Cancelled | Dismissed, Pending | Claimed) => "unresolved",
         // Undoing a claim (manual or auto). Distinct from `unresolved` so
