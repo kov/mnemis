@@ -15,6 +15,8 @@ const MAX_MESSAGE_LIMIT: i64 = 200;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ActionFilter {
     /// If true, include actions with status `done`/`cancelled`/`dismissed`.
+    /// Open ones (pending, claimed) and warnings (`suspicious`) are always
+    /// included.
     pub include_resolved: bool,
 }
 
@@ -41,7 +43,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          LEFT JOIN messages m ON m.id = ae.message_id \
          LEFT JOIN channels c ON c.id = m.channel_id \
          LEFT JOIN sources s ON s.id = c.source_id \
-         WHERE a.status IN ('pending', 'auto_claimed', 'claimed') \
+         WHERE a.status IN ('pending', 'auto_claimed', 'claimed', 'suspicious') \
          GROUP BY a.id \
          ORDER BY a.extracted_at DESC"
     };

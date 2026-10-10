@@ -189,11 +189,16 @@ fn ActionsMasterDetail(
     selected: RwSignal<Option<i64>>,
     refetch: Arc<dyn Fn() + Send + Sync>,
 ) -> impl IntoView {
-    // High/medium-confidence actions show up front; low-confidence ones hide
-    // behind a revealer (they're noisier and usually not worth surfacing).
-    let (low, rest): (Vec<_>, Vec<_>) = rows
+    // Warnings (mail from impostor-looking senders) get their own group up
+    // top. High/medium-confidence to-dos show up front; low-confidence ones
+    // hide behind a revealer (they're noisier and usually not worth
+    // surfacing).
+    let (warnings, todos): (Vec<_>, Vec<_>) = rows
         .iter()
         .cloned()
+        .partition(|a| matches!(a.status, ActionStatus::Suspicious));
+    let (low, rest): (Vec<_>, Vec<_>) = todos
+        .into_iter()
         .partition(|a| matches!(a.confidence, Confidence::Low));
 
     // Auto-select the first action on initial load so the reading pane isn't
@@ -211,6 +216,8 @@ fn ActionsMasterDetail(
     let show_low = RwSignal::new(false);
     let low_count = low.len();
     let is_empty = rest.is_empty() && low.is_empty();
+    let has_warnings = !warnings.is_empty();
+    let warnings_sv = StoredValue::new(warnings);
     let rest_sv = StoredValue::new(rest);
     let low_sv = StoredValue::new(low);
     let rows_sv = StoredValue::new(rows);
@@ -221,6 +228,17 @@ fn ActionsMasterDetail(
             <div class="list">
                 <div class="list-head"><span class="h">"Open to-dos"</span></div>
                 <SuggestedResolutions />
+                {has_warnings.then(|| view! {
+                    <div class="list-subhead">"Suspicious emails"</div>
+                    <For
+                        each=move || warnings_sv.get_value()
+                        key=|a| a.id
+                        children=move |a: ActionDto| view! {
+                            <ActionListRow action=a selected=selected />
+                        }
+                    />
+                    <div class="list-subhead">"To-dos"</div>
+                })}
                 {if is_empty {
                     view! { <div class="list-empty">"No open to-dos."</div> }.into_any()
                 } else {
@@ -299,6 +317,7 @@ fn ActionListRow(action: ActionDto, selected: RwSignal<Option<i64>>) -> impl Int
         .source_posted_at
         .map(|t| (email_short_date(t), email_full_date(t)));
     let title = action.title.clone();
+    let is_warning = matches!(action.status, ActionStatus::Suspicious);
 
     let is_selected = move || selected.get() == Some(id);
     let on_click = move |_| selected.set(Some(id));
@@ -309,7 +328,11 @@ fn ActionListRow(action: ActionDto, selected: RwSignal<Option<i64>>) -> impl Int
                 <div class="a-title">{title}</div>
                 <div class="a-meta">{format!("{source} · {channel} · {evidence} evidence")}</div>
                 <div class="a-tags">
-                    <span class=conf_class>{conf_label}</span>
+                    {if is_warning {
+                        view! { <span class="pill warn">"\u{26A0} looks like phishing"</span> }.into_any()
+                    } else {
+                        view! { <span class=conf_class>{conf_label}</span> }.into_any()
+                    }}
                     {sent.map(|(short, full)| view! {
                         <span class="pill" data-field="email-date" title=format!("Email sent {full}")>
                             {format!("\u{2709} {short}")}
@@ -579,6 +602,9 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
     let trigger_dismiss = trigger_status.clone();
     let trigger_unclaim = trigger_status.clone();
     let trigger_reopen = trigger_status.clone();
+    let trigger_accept = trigger_status.clone();
+    let trigger_discard = trigger_status.clone();
+    let is_warning = matches!(current_status, ActionStatus::Suspicious);
 
     // Reminder state: a synced/dirty/needs_review badge that shows the due date
     // (or "pending" when a due date is set but not yet synced), plus a
@@ -600,7 +626,10 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
         });
     let can_remind = !matches!(
         current_status,
-        ActionStatus::Done | ActionStatus::Cancelled | ActionStatus::Dismissed
+        ActionStatus::Done
+            | ActionStatus::Cancelled
+            | ActionStatus::Dismissed
+            | ActionStatus::Suspicious
     );
     let remind_label = if due_at.is_some() {
         "Change date"
@@ -612,8 +641,15 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
         <div class="read-wrap">
             <div class="read-subject">{title}</div>
             <div class="a-tags action-detail-tags">
-                <span class=conf_class>{conf_label}</span>
-                <span class="badge">{status}</span>
+                {if is_warning {
+                    view! { <span class="pill warn">"\u{26A0} looks like phishing"</span> }.into_any()
+                } else {
+                    view! {
+                        <span class=conf_class>{conf_label}</span>
+                        <span class="badge">{status}</span>
+                    }
+                    .into_any()
+                }}
                 {badge.map(|(label, warn)| view! {
                     <span class="reminder-badge" class:reminder-warn=warn>{label}</span>
                 })}
@@ -625,6 +661,12 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
             </div>
             {source_message_id.map(|message_id| view! { <SourceEmail message_id=message_id /> })}
             <div class="action-actions">
+                // A warning is taken as a to-do or dropped; dropping it has
+                // nothing to teach, so no feedback modal.
+                {is_warning.then(|| view! {
+                    <button class="btn btn-secondary" on:click=move |_| trigger_accept(ActionStatus::Pending, None)>"It's a to-do"</button>
+                    <button class="btn btn-primary" on:click=move |_| trigger_discard(ActionStatus::Dismissed, None)>"Dismiss"</button>
+                })}
                 {show_button(current_status, ActionStatus::Claimed).then(|| view! {
                     <button class="btn btn-secondary" on:click=move |_| trigger_claim(ActionStatus::Claimed, None)>"Claim"</button>
                 })}

@@ -305,6 +305,14 @@ html, body {
   font-weight: 600;
   font-size: var(--fs-13);
 }
+.list-subhead {
+  padding: 8px 14px 4px;
+  color: var(--fg-muted);
+  font-size: var(--fs-11);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 .list-empty {
   padding: 24px 16px;
   color: var(--fg-muted);
@@ -382,6 +390,10 @@ html, body {
 .pill.action {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.pill.warn {
+  color: var(--medium);
+  border-color: color-mix(in srgb, var(--medium) 50%, transparent);
 }
 .pill.high {
   color: var(--high);

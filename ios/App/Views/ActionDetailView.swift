@@ -5,14 +5,22 @@ struct ActionDetailView: View {
     let action: ActionDto
     @State private var message: MessageDetailDto?
 
+    private var isWarning: Bool { action.status == .suspicious }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Card {
-                    HStack(spacing: 6) {
-                        ConfidenceBadge(confidence: action.confidence)
-                        if let due = action.dueAt {
-                            DueBadge(due: due)
+                    if isWarning {
+                        Label("Looks like phishing", systemImage: "exclamationmark.triangle.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.orange)
+                    } else {
+                        HStack(spacing: 6) {
+                            ConfidenceBadge(confidence: action.confidence)
+                            if let due = action.dueAt {
+                                DueBadge(due: due)
+                            }
                         }
                     }
                     Text(action.title)
@@ -25,26 +33,38 @@ struct ActionDetailView: View {
                     }
                 }
 
-                GlassEffectContainer(spacing: 10) {
-                    // One row when it fits; otherwise Done and Dismiss share a
-                    // row and "Talk about this" takes the next.
-                    ViewThatFits(in: .horizontal) {
+                if isWarning {
+                    GlassEffectContainer(spacing: 10) {
                         HStack(spacing: 10) {
-                            doneButton
-                            talkButton
-                            dismissButton
+                            acceptButton
+                            discardButton
                         }
-                        VStack(spacing: 10) {
+                        .controlSize(.large)
+                        .labelStyle(.titleAndIcon)
+                        .font(.subheadline.weight(.semibold))
+                    }
+                } else {
+                    GlassEffectContainer(spacing: 10) {
+                        // One row when it fits; otherwise Done and Dismiss share a
+                        // row and "Talk about this" takes the next.
+                        ViewThatFits(in: .horizontal) {
                             HStack(spacing: 10) {
                                 doneButton
+                                talkButton
                                 dismissButton
                             }
-                            talkButton
+                            VStack(spacing: 10) {
+                                HStack(spacing: 10) {
+                                    doneButton
+                                    dismissButton
+                                }
+                                talkButton
+                            }
                         }
+                        .controlSize(.large)
+                        .labelStyle(.titleAndIcon)
+                        .font(.subheadline.weight(.semibold))
                     }
-                    .controlSize(.large)
-                    .labelStyle(.titleAndIcon)
-                    .font(.subheadline.weight(.semibold))
                 }
 
                 if let message {
@@ -77,7 +97,7 @@ struct ActionDetailView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Color(.systemGroupedBackground))
-        .navigationTitle("To-do")
+        .navigationTitle(isWarning ? "Suspicious email" : "To-do")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: action.id) { await loadMessage() }
     }
@@ -87,6 +107,30 @@ struct ActionDetailView: View {
             Task { await model.setStatus(action, to: .done) }
         } label: {
             Label("Done", systemImage: "checkmark")
+                .lineLimit(1)
+                .fixedSize()
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glassProminent)
+    }
+
+    private var acceptButton: some View {
+        Button {
+            Task { await model.accept(action) }
+        } label: {
+            Label("It's a to-do", systemImage: "checklist")
+                .lineLimit(1)
+                .fixedSize()
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glass)
+    }
+
+    private var discardButton: some View {
+        Button {
+            Task { await model.discard(action) }
+        } label: {
+            Label("Dismiss", systemImage: "xmark")
                 .lineLimit(1)
                 .fixedSize()
                 .frame(maxWidth: .infinity)

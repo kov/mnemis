@@ -52,7 +52,7 @@ private struct SplitLayout: View {
                 set: { if let tab = $0 { model.selectedTab = tab } }
             )) {
                 Label("To-dos", systemImage: "checklist")
-                    .badge(model.actions.count)
+                    .badge(model.todos.count)
                     .tag(AppTab.actions)
                 Label("Chats", systemImage: "bubble.left.and.text.bubble.right")
                     .tag(AppTab.chat)
@@ -79,7 +79,7 @@ private struct CompactLayout: View {
             Tab("To-dos", systemImage: "checklist", value: AppTab.actions) {
                 ActionsStack(showsSettings: true)
             }
-            .badge(model.actions.count)
+            .badge(model.todos.count)
             Tab("Chats", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
                 ChatsStack(showsSettings: true)
             }
@@ -210,21 +210,49 @@ struct ActionListView: View {
                     .foregroundStyle(.secondary)
                 }
             }
-            ForEach(model.actions, id: \.id) { action in
-                ActionRow(action: action)
-                    .tag(action.id)
-                    .swipeActions(edge: .leading) {
-                        Button("Done", systemImage: "checkmark") {
-                            Task { await model.setStatus(action, to: .done) }
-                        }
-                        .tint(.green)
+            if !model.warnings.isEmpty {
+                Section {
+                    ForEach(model.warnings, id: \.id) { warning in
+                        WarningRow(warning: warning)
+                            .tag(warning.id)
+                            .swipeActions(edge: .leading) {
+                                Button("To-do", systemImage: "checklist") {
+                                    Task { await model.accept(warning) }
+                                }
+                                .tint(.blue)
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button("Dismiss", systemImage: "xmark") {
+                                    Task { await model.discard(warning) }
+                                }
+                                .tint(.gray)
+                            }
                     }
-                    .swipeActions(edge: .trailing) {
-                        Button("Dismiss", systemImage: "xmark") {
-                            Task { await model.dismiss(action) }
+                } header: {
+                    Text("Suspicious emails")
+                }
+            }
+            Section {
+                ForEach(model.todos, id: \.id) { action in
+                    ActionRow(action: action)
+                        .tag(action.id)
+                        .swipeActions(edge: .leading) {
+                            Button("Done", systemImage: "checkmark") {
+                                Task { await model.setStatus(action, to: .done) }
+                            }
+                            .tint(.green)
                         }
-                        .tint(.gray)
-                    }
+                        .swipeActions(edge: .trailing) {
+                            Button("Dismiss", systemImage: "xmark") {
+                                Task { await model.dismiss(action) }
+                            }
+                            .tint(.gray)
+                        }
+                }
+            } header: {
+                if !model.warnings.isEmpty && !model.todos.isEmpty {
+                    Text("To-dos")
+                }
             }
         }
         .overlay {
@@ -255,6 +283,37 @@ struct ActionRow: View {
                 }
                 Spacer(minLength: 0)
                 if let posted = action.sourcePostedAt {
+                    Text(Date.fromUnix(posted), format: .relative(presentation: .named))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+struct WarningRow: View {
+    let warning: ActionDto
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(warning.title)
+                    .font(.body.weight(.medium))
+                    .lineLimit(2)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+            HStack(spacing: 6) {
+                Text("Looks like phishing")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if let posted = warning.sourcePostedAt {
                     Text(Date.fromUnix(posted), format: .relative(presentation: .named))
                         .font(.caption)
                         .foregroundStyle(.secondary)

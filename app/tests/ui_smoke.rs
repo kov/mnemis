@@ -2501,6 +2501,108 @@ async fn action_inline_chat_resumes_seeded_conversation() -> Result<()> {
     Ok(())
 }
 
+/// A warning (a message from an impostor-looking sender) sits in its own
+/// group above the to-dos, and "It's a to-do" turns it into a pending one.
+#[tokio::test(flavor = "current_thread")]
+async fn warnings_show_apart_and_can_become_to_dos() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-warnings.db");
+    let warning_id = {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO user_profile (id, display_name, updated_at) VALUES (1, 'Tester', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO actions (title, details, confidence, rationale, status, extracted_at) \
+             VALUES ('Renew the TLS cert', 'x', 'high', 'r', 'pending', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO actions (title, details, confidence, rationale, status, extracted_at) \
+             VALUES ('Incident Notification', 'Suspicious sender: the first email from \
+             balaguer.cat', 'low', 'suspicious sender', 'suspicious', ?) RETURNING id",
+        )
+        .bind(now + 1)
+        .fetch_one(&pool)
+        .await?;
+        pool.close().await;
+        id
+    };
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    let row = format!(".arow[data-action-id='{warning_id}']");
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(&row))
+        .await
+        .context("waiting for the warning row")?;
+    let list = client
+        .find(Locator::Css(".list"))
+        .await?
+        .text()
+        .await?
+        .to_lowercase();
+    assert!(list.contains("suspicious emails"), "list: {list}");
+    assert!(list.contains("looks like phishing"), "list: {list}");
+    assert!(list.contains("renew the tls cert"), "list: {list}");
+
+    client.find(Locator::Css(&row)).await?.click().await?;
+    let accept = client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::XPath(
+            "//button[normalize-space()=\"It's a to-do\"]",
+        ))
+        .await
+        .context("waiting for the warning's buttons")?;
+    accept.click().await?;
+
+    let mut grouped = true;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let list = client
+            .find(Locator::Css(".list"))
+            .await?
+            .text()
+            .await
+            .unwrap_or_default()
+            .to_lowercase();
+        if !list.contains("suspicious emails") {
+            grouped = false;
+            break;
+        }
+    }
+    assert!(
+        !grouped,
+        "the accepted warning should leave the warnings group"
+    );
+    client.close().await.ok();
+
+    let pool = mnemis_engine::db::open(&db_path).await?;
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM actions WHERE id = ?")
+        .bind(warning_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "pending");
+    Ok(())
+}
+
 async fn seed(pool: &SqlitePool) -> Result<()> {
     let now = Utc::now().timestamp();
 

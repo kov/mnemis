@@ -62,6 +62,12 @@ final class AppModel {
             }
             // `-MnemisAsk "…"` starts a chat with that question, logging the
             // engine's events, so the model can be exercised without taps.
+            // `-MnemisOpen mnemis://…` follows a deep link once loaded, without
+            // the system's "Open in mnemis?" prompt.
+            if let link = UserDefaults.standard.string(forKey: "MnemisOpen"), let url = URL(string: link) {
+                await refresh()
+                open(url)
+            }
             // `-MnemisDeleteChat <id>` deletes a chat left over from a run.
             if let doomed = Int64(UserDefaults.standard.string(forKey: "MnemisDeleteChat") ?? "") {
                 try? await engine.deleteChat(chatId: doomed)
@@ -289,6 +295,23 @@ final class AppModel {
     }
 
     /// Dismiss at once, like the desktop, then ask why; the answer is optional.
+    /// Open to-dos, without warnings.
+    var todos: [ActionDto] { actions.filter { $0.status != .suspicious } }
+
+    /// Messages from impostor-looking senders, held back as warnings.
+    var warnings: [ActionDto] { actions.filter { $0.status == .suspicious } }
+
+    /// Take a warning as a real to-do.
+    func accept(_ warning: ActionDto) async {
+        await setStatus(warning, to: .pending)
+    }
+
+    /// Drop a warning. Unlike dismissing a to-do, there's no rule to learn.
+    func discard(_ warning: ActionDto) async {
+        await setStatus(warning, to: .dismissed)
+        if actionSelection == warning.id { actionSelection = nil }
+    }
+
     func dismiss(_ action: ActionDto) async {
         await setStatus(action, to: .dismissed)
         if actionSelection == action.id { actionSelection = nil }
