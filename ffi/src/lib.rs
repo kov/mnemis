@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Once, RwLock};
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use mnemis_engine::embed::{Embedder, NoEmbedder};
-use mnemis_engine::llm::LlmBackend;
+use mnemis_engine::llm::{ForeignClient, ForeignLlm, LlmBackend};
 use mnemis_engine::source::SourceId;
 use mnemis_engine::{chat, config, db, memory, mutations, orchestrator, queries, settings};
 use mnemis_types::{
@@ -57,6 +59,12 @@ pub enum MnemisError {
     Failed { message: String },
 }
 
+impl From<uniffi::UnexpectedUniFFICallbackError> for MnemisError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        MnemisError::Failed { message: e.reason }
+    }
+}
+
 impl From<anyhow::Error> for MnemisError {
     fn from(e: anyhow::Error) -> Self {
         MnemisError::Failed {
@@ -75,16 +83,69 @@ struct LlmStack {
 }
 
 impl LlmStack {
-    async fn build(cfg: &config::Config) -> anyhow::Result<Self> {
+    async fn build(
+        cfg: &config::Config,
+        apple: Option<&Arc<dyn AppleModel>>,
+    ) -> anyhow::Result<Self> {
+        let mut max_context_tokens = cfg.llm.resolved_max_context_tokens();
+        let llm = match cfg.llm.provider {
+            LlmProvider::AppleIntelligence => {
+                let apple = apple
+                    .context("Apple Intelligence isn't available on this device")?
+                    .clone();
+                let model = cfg.llm.chat_model.clone();
+                if cfg.llm.max_context_tokens.is_none() {
+                    max_context_tokens = apple.context_size(model.clone()).await? as usize;
+                }
+                LlmBackend::Foreign(ForeignClient::new(Arc::new(AppleTransport(apple)), model))
+            }
+            _ => LlmBackend::from_config(&cfg.llm).await?,
+        };
         Ok(LlmStack {
-            llm: LlmBackend::from_config(&cfg.llm).await?,
+            llm,
             chat_model: cfg.llm.chat_model.clone(),
-            window_char_budget: mnemis_engine::extract::window_char_budget_for(
-                cfg.llm.resolved_max_context_tokens(),
-            ),
-            max_context_tokens: cfg.llm.resolved_max_context_tokens(),
+            window_char_budget: mnemis_engine::extract::window_char_budget_for(max_context_tokens),
+            max_context_tokens,
             idle_timeout: Duration::from_secs(cfg.llm.resolved_chat_idle_timeout_secs()),
         })
+    }
+}
+
+/// Apple's Foundation Models, implemented in Swift: one model turn per
+/// `respond` (see [`ForeignLlm`] for the request and reply JSON), with the
+/// assistant's text pushed to `sink` as it is generated.
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait AppleModel: Send + Sync {
+    async fn respond(&self, request: String, sink: Arc<TextSink>) -> Result<String, MnemisError>;
+    /// The context window, in tokens, of `model` (a `chat_model` value).
+    async fn context_size(&self, model: String) -> Result<u64, MnemisError>;
+}
+
+/// Where an [`AppleModel`] streams the text it generates.
+#[derive(uniffi::Object)]
+pub struct TextSink(tokio::sync::mpsc::UnboundedSender<String>);
+
+#[uniffi::export]
+impl TextSink {
+    pub fn push(&self, text: String) {
+        let _ = self.0.send(text);
+    }
+}
+
+struct AppleTransport(Arc<dyn AppleModel>);
+
+#[async_trait::async_trait]
+impl ForeignLlm for AppleTransport {
+    async fn respond(
+        &self,
+        request: String,
+        deltas: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<String> {
+        self.0
+            .respond(request, Arc::new(TextSink(deltas)))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -93,6 +154,7 @@ pub struct Engine {
     pool: SqlitePool,
     data_dir: PathBuf,
     llm: RwLock<Option<Arc<LlmStack>>>,
+    apple: Option<Arc<dyn AppleModel>>,
     /// Stop handles for in-flight chat sends, by chat id (one send per chat).
     chat_cancels: Mutex<HashMap<i64, CancellationToken>>,
 }
@@ -123,9 +185,13 @@ impl Engine {
 #[uniffi::export]
 impl Engine {
     /// Open (creating if needed) the database and config under `data_dir`,
-    /// the app's Application Support directory.
+    /// the app's Application Support directory. `apple` is the Apple
+    /// Intelligence bridge, when the device has it.
     #[uniffi::constructor]
-    pub async fn open(data_dir: String) -> Result<Arc<Self>, MnemisError> {
+    pub async fn open(
+        data_dir: String,
+        apple: Option<Arc<dyn AppleModel>>,
+    ) -> Result<Arc<Self>, MnemisError> {
         init_logging();
         let data_dir = PathBuf::from(data_dir);
         run(async move {
@@ -135,7 +201,7 @@ impl Engine {
             // A missing or unusable LLM config leaves the app usable read-only;
             // only sync needs it.
             let llm = match config::load(Some(&data_dir.join("config.toml"))) {
-                Ok(cfg) => match LlmStack::build(&cfg).await {
+                Ok(cfg) => match LlmStack::build(&cfg, apple.as_ref()).await {
                     Ok(stack) => Some(Arc::new(stack)),
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "LLM not usable");
@@ -148,6 +214,7 @@ impl Engine {
                 pool,
                 data_dir,
                 llm: RwLock::new(llm),
+                apple,
                 chat_cancels: Mutex::new(HashMap::new()),
             }))
         })
@@ -365,7 +432,7 @@ impl Engine {
                     thinking_level: Some(cfg.thinking_level),
                 },
             )?;
-            match LlmStack::build(&config::load(Some(&path))?).await {
+            match LlmStack::build(&config::load(Some(&path))?, engine.apple.as_ref()).await {
                 Ok(stack) => {
                     engine.set_llm(Some(Arc::new(stack)));
                     Ok(())
@@ -575,6 +642,7 @@ pub enum ThinkingLevel {
 pub enum LlmProvider {
     OpenaiResponses,
     Anthropic,
+    AppleIntelligence,
 }
 
 #[uniffi::remote(Record)]

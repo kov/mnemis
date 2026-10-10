@@ -1531,7 +1531,7 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
                 prop:value=move || base_url.get()
                 placeholder=move || match provider.get() {
                     LlmProvider::Anthropic => "https://api.anthropic.com/v1 (default)",
-                    LlmProvider::OpenaiResponses => "http://localhost:1234/v1",
+                    LlmProvider::OpenaiResponses | LlmProvider::AppleIntelligence => "http://localhost:1234/v1",
                 }
             />
             <label>"Chat model"</label>
@@ -1541,7 +1541,7 @@ fn LlmForm(initial: LlmConfigDto) -> impl IntoView {
                 prop:value=move || chat.get()
                 placeholder=move || match provider.get() {
                     LlmProvider::Anthropic => "claude-sonnet-5-5",
-                    LlmProvider::OpenaiResponses => "",
+                    LlmProvider::OpenaiResponses | LlmProvider::AppleIntelligence => "",
                 }
             />
             <div style:display=move || {

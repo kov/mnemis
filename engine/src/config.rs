@@ -59,6 +59,9 @@ pub struct LlmSection {
 /// Default working-context cap for Claude (see `resolved_max_context_tokens`).
 pub const DEFAULT_ANTHROPIC_CONTEXT_TOKENS: usize = 200_000;
 
+/// The on-device Apple model's context window (iOS 27).
+pub const DEFAULT_APPLE_CONTEXT_TOKENS: usize = 8_192;
+
 impl LlmSection {
     /// Resolve the configured server context window, falling back to the
     /// engine default when unset.
@@ -68,6 +71,8 @@ impl LlmSection {
             // Claude's window is far larger; this is a cost cap — every agent
             // step resends the conversation — not the model's limit.
             LlmProvider::Anthropic => DEFAULT_ANTHROPIC_CONTEXT_TOKENS,
+            // The iOS app replaces this with the model's own window.
+            LlmProvider::AppleIntelligence => DEFAULT_APPLE_CONTEXT_TOKENS,
         })
     }
 

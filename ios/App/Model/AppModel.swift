@@ -40,7 +40,12 @@ final class AppModel {
     func start() async {
         guard engine == nil else { return }
         do {
-            engine = try await Engine.open(dataDir: Self.dataDirectory.path)
+            let engine = try await Engine.open(
+                dataDir: Self.dataDirectory.path,
+                apple: AppleIntelligence()
+            )
+            self.engine = engine
+            try await defaultToAppleIntelligence(engine)
             await refresh()
             #if DEBUG
             // `-MnemisOpenURL mnemis://…` at launch opens that screen, so the
@@ -50,10 +55,85 @@ final class AppModel {
                let url = URL(string: link) {
                 open(url)
             }
+            // `-MnemisLLM provider:model` switches the LLM (e.g.
+            // `apple-intelligence:on-device`), logging the one it replaces.
+            if let choice = UserDefaults.standard.string(forKey: "MnemisLLM") {
+                await switchLLM(choice, engine: engine)
+            }
+            // `-MnemisAsk "…"` starts a chat with that question, logging the
+            // engine's events, so the model can be exercised without taps.
+            if let question = UserDefaults.standard.string(forKey: "MnemisAsk") {
+                await ask(question, engine: engine)
+            }
             #endif
         } catch {
             report(error)
         }
+    }
+
+    #if DEBUG
+    private func switchLLM(_ choice: String, engine: Engine) async {
+        let parts = choice.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return }
+        do {
+            let llm = try await engine.llmConfig()
+            print("[MnemisLLM] was \(llm.provider):\(llm.chatModel)")
+            let provider: LlmProvider = switch parts[0] {
+            case "apple-intelligence": .appleIntelligence
+            case "anthropic": .anthropic
+            default: .openaiResponses
+            }
+            try await engine.saveLlmConfig(cfg: LlmConfigDto(
+                provider: provider,
+                baseUrl: provider == .openaiResponses ? llm.baseUrl : "",
+                chatModel: parts[1],
+                bearerToken: llm.bearerToken,
+                thinkingLevel: llm.thinkingLevel,
+                anthropicApiKey: nil,
+                anthropicApiKeySet: llm.anthropicApiKeySet,
+                configPath: ""
+            ))
+            print("[MnemisLLM] now \(choice)")
+        } catch {
+            print("[MnemisLLM] failed: \(error)")
+        }
+    }
+
+    private func ask(_ question: String, engine: Engine) async {
+        do {
+            let id = try await engine.createChat(seededFromKind: nil, seededFromId: nil)
+            await refreshChats()
+            let (events, continuation) = AsyncStream.makeStream(of: ChatEvent.self)
+            let logger = Task {
+                for await event in events { print("[MnemisAsk] \(event)") }
+            }
+            try await engine.sendChatMessage(chatId: id, text: question, listener: ChatEventRelay(continuation))
+            continuation.finish()
+            await logger.value
+            print("[MnemisAsk] finished")
+            await refreshChats()
+            open(URL(string: "mnemis://chat/\(id)")!)
+        } catch {
+            print("[MnemisAsk] failed: \(error)")
+            report(error)
+        }
+    }
+    #endif
+
+    /// A fresh install uses the on-device model, when the device has one.
+    private func defaultToAppleIntelligence(_ engine: Engine) async throws {
+        let llm = try await engine.llmConfig()
+        guard llm.chatModel.isEmpty, AppleIntelligence.onDeviceAvailable else { return }
+        try await engine.saveLlmConfig(cfg: LlmConfigDto(
+            provider: .appleIntelligence,
+            baseUrl: "",
+            chatModel: AppleIntelligence.onDevice,
+            bearerToken: nil,
+            thinkingLevel: llm.thinkingLevel,
+            anthropicApiKey: nil,
+            anthropicApiKeySet: llm.anthropicApiKeySet,
+            configPath: ""
+        ))
     }
 
     func refresh() async {

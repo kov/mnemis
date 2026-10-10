@@ -54,7 +54,7 @@ MNEMIS_DB_PATH=/path/to/mnemis.db ./target/debug/mnemis-app
 ```
 cargo xtask build-ios                # engine xcframework + Swift bindings → ios/build/
 xcodebuild -project ios/Mnemis.xcodeproj -scheme Mnemis \
-    -destination 'platform=iOS Simulator,name=iPhone 17' build
+    -destination 'platform=iOS Simulator,name=iPhone 18 Pro' build
 ```
 
 Re-run `build-ios` whenever the engine or `ffi/` changes; Xcode won't build

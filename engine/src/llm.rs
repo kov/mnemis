@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -545,12 +546,123 @@ where
     }
 }
 
+/// A model the engine can't reach by itself: the iOS app's Apple Intelligence
+/// bridge. One call is one model turn. `request` is JSON `{model, instructions,
+/// input, tools}` in this module's Responses shapes ([`InputItem`],
+/// [`ToolDef`]); the reply is a [`ResponsesResponse`] as JSON. Assistant text
+/// is pushed to `deltas` as it is generated. Dropping the future cancels the
+/// turn.
+#[async_trait]
+pub trait ForeignLlm: Send + Sync {
+    async fn respond(&self, request: String, deltas: UnboundedSender<String>) -> Result<String>;
+}
+
+/// [`LlmTransport`] over a [`ForeignLlm`]. Both sends stream: the deltas reset
+/// the idle timeout and feed live rendering, and Stop drops the foreign turn.
+#[derive(Clone)]
+pub struct ForeignClient {
+    inner: Arc<dyn ForeignLlm>,
+    model: String,
+}
+
+impl ForeignClient {
+    pub fn new(inner: Arc<dyn ForeignLlm>, model: impl Into<String>) -> Self {
+        Self {
+            inner,
+            model: model.into(),
+        }
+    }
+
+    async fn turn(
+        &self,
+        instructions: &str,
+        input: Vec<InputItem>,
+        tools: &[ToolDef],
+        idle_timeout: Duration,
+        cancel: CancellationToken,
+        deltas: Option<UnboundedSender<String>>,
+    ) -> Result<ResponsesResponse> {
+        let request = serde_json::json!({
+            "model": self.model,
+            "instructions": instructions,
+            "input": without_provider_thinking(input),
+            "tools": tools,
+        })
+        .to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let call = self.inner.respond(request, tx);
+        tokio::pin!(call);
+        let mut acc = String::new();
+        let forward = |d: String, acc: &mut String| {
+            acc.push_str(&d);
+            if let Some(out) = &deltas {
+                let _ = out.send(d);
+            }
+        };
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(cancelled_response(acc)),
+                reply = &mut call => {
+                    while let Ok(d) = rx.try_recv() {
+                        forward(d, &mut acc);
+                    }
+                    let text = reply?;
+                    return serde_json::from_str(&text)
+                        .with_context(|| format!("failed to parse the model's reply: {text}"));
+                }
+                Some(d) = rx.recv() => forward(d, &mut acc),
+                _ = tokio::time::sleep(idle_timeout) => bail!(
+                    "LLM response stalled: no output for {}s",
+                    idle_timeout.as_secs()
+                ),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl LlmTransport for ForeignClient {
+    async fn send(
+        &self,
+        instructions: &str,
+        input: Vec<InputItem>,
+        tools: &[ToolDef],
+        _previous_response_id: Option<&str>,
+    ) -> Result<ResponsesResponse> {
+        self.turn(
+            instructions,
+            input,
+            tools,
+            Duration::from_secs(DEFAULT_CHAT_IDLE_TIMEOUT_SECS),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+    }
+
+    async fn send_stream(
+        &self,
+        instructions: &str,
+        input: Vec<InputItem>,
+        tools: &[ToolDef],
+        _previous_response_id: Option<&str>,
+        idle_timeout: Duration,
+        cancel: CancellationToken,
+        deltas: Option<UnboundedSender<String>>,
+    ) -> Result<ResponsesResponse> {
+        self.turn(instructions, input, tools, idle_timeout, cancel, deltas)
+            .await
+    }
+}
+
 /// The configured LLM transport. An enum rather than a trait object so callers
 /// keep a cheap `Clone` (the app hot-swaps it on settings saves).
 #[derive(Clone)]
 pub enum LlmBackend {
     Responses(LlmClient),
     Anthropic(crate::anthropic::AnthropicClient),
+    Foreign(ForeignClient),
 }
 
 impl LlmBackend {
@@ -582,6 +694,9 @@ impl LlmBackend {
                     .with_idle_timeout(cfg.resolved_chat_idle_timeout_secs()),
                 )
             }
+            LlmProvider::AppleIntelligence => {
+                bail!("Apple Intelligence is only available in the iOS app")
+            }
         })
     }
 
@@ -589,6 +704,7 @@ impl LlmBackend {
         match self {
             LlmBackend::Responses(c) => c,
             LlmBackend::Anthropic(c) => c,
+            LlmBackend::Foreign(c) => c,
         }
     }
 }
@@ -854,6 +970,143 @@ mod tests {
             },
             other => panic!("expected message, got {other:?}"),
         }
+    }
+
+    /// Streams `text` in two deltas, then replies with it; records the request.
+    struct ScriptedForeign {
+        text: String,
+        hang: bool,
+        request: std::sync::Mutex<Option<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl ForeignLlm for ScriptedForeign {
+        async fn respond(
+            &self,
+            request: String,
+            deltas: UnboundedSender<String>,
+        ) -> Result<String> {
+            *self.request.lock().unwrap() = serde_json::from_str(&request).ok();
+            let (a, b) = self.text.split_at(self.text.len() / 2);
+            let _ = deltas.send(a.to_string());
+            if self.hang {
+                futures::future::pending::<()>().await;
+            }
+            let _ = deltas.send(b.to_string());
+            Ok(serde_json::json!({
+                "id": "",
+                "status": "completed",
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": self.text}]},
+                    {"type": "function_call", "call_id": "c1", "name": "list_actions", "arguments": "{}"}
+                ]
+            })
+            .to_string())
+        }
+    }
+
+    fn scripted(text: &str, hang: bool) -> Arc<ScriptedForeign> {
+        Arc::new(ScriptedForeign {
+            text: text.to_string(),
+            hang,
+            request: std::sync::Mutex::new(None),
+        })
+    }
+
+    #[tokio::test]
+    async fn foreign_client_relays_the_turn_and_its_deltas() {
+        let foreign = scripted("Hello, world", false);
+        let client = ForeignClient::new(foreign.clone(), "on-device");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let tools = [ToolDef::function(
+            "list_actions".into(),
+            "List actions".into(),
+            serde_json::json!({"type": "object"}),
+        )];
+        let resp = client
+            .send_stream(
+                "be brief",
+                vec![
+                    InputItem::Message {
+                        role: Role::User,
+                        content: "hi".into(),
+                    },
+                    InputItem::Thinking {
+                        block: serde_json::json!({"type": "thinking"}),
+                    },
+                ],
+                &tools,
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+                Some(tx),
+            )
+            .await
+            .expect("the turn completes");
+
+        assert!(
+            matches!(&resp.output[1], OutputItem::FunctionCall { name, .. } if name == "list_actions")
+        );
+        let mut streamed = String::new();
+        while let Ok(d) = rx.try_recv() {
+            streamed.push_str(&d);
+        }
+        assert_eq!(streamed, "Hello, world");
+
+        let request = foreign.request.lock().unwrap().clone().unwrap();
+        assert_eq!(request["model"], "on-device");
+        assert_eq!(request["instructions"], "be brief");
+        assert_eq!(request["tools"][0]["name"], "list_actions");
+        // Claude's signed thinking means nothing to another model.
+        assert_eq!(request["input"].as_array().unwrap().len(), 1);
+        assert_eq!(request["input"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn foreign_client_stop_keeps_the_partial_text() {
+        let client = ForeignClient::new(scripted("Hello, world", true), "on-device");
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stop = cancel.clone();
+        let handle = tokio::spawn(async move {
+            client
+                .send_stream(
+                    "",
+                    vec![],
+                    &[],
+                    None,
+                    Duration::from_secs(30),
+                    stop,
+                    Some(tx),
+                )
+                .await
+        });
+        assert_eq!(rx.recv().await.as_deref(), Some("Hello,"));
+        cancel.cancel();
+        let resp = handle.await.unwrap().expect("Stop is a clean end");
+        assert_eq!(resp.status, "cancelled");
+        assert!(
+            matches!(&resp.output[0], OutputItem::Message { content } if matches!(&content[0], ContentItem::OutputText { text } if text == "Hello,"))
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_client_times_out_a_silent_turn() {
+        let client = ForeignClient::new(scripted("Hello, world", true), "on-device");
+        let err = client
+            .send_stream(
+                "",
+                vec![],
+                &[],
+                None,
+                Duration::from_millis(50),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        // Classified as a transient stall, so the agent loops retry it.
+        assert!(crate::agent::is_transient_stall(&format!("{err:#}")));
     }
 
     /// End-to-end over a real socket: the live `LlmClient::send_stream` (reqwest

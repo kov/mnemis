@@ -40,13 +40,25 @@ struct SettingsView: View {
 
                 Section {
                     Picker("Provider", selection: $provider) {
+                        Text("Apple Intelligence").tag(LlmProvider.appleIntelligence)
                         Text("Claude").tag(LlmProvider.anthropic)
                         Text("OpenAI Responses (omlx, …)").tag(LlmProvider.openaiResponses)
                     }
-                    TextField("Model", text: $chatModel)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                    if provider == .appleIntelligence {
+                        Picker("Model", selection: $chatModel) {
+                            Text("On device").tag(AppleIntelligence.onDevice)
+                            if AppleIntelligence.privateCloudAvailable || chatModel == AppleIntelligence.privateCloud {
+                                Text("Private Cloud Compute").tag(AppleIntelligence.privateCloud)
+                            }
+                        }
+                    } else {
+                        TextField("Model", text: $chatModel)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
                     switch provider {
+                    case .appleIntelligence:
+                        EmptyView()
                     case .anthropic:
                         SecureField(apiKeySet ? "API key (saved)" : "API key", text: $apiKey)
                             .textContentType(.password)
@@ -57,17 +69,28 @@ struct SettingsView: View {
                             .autocorrectionDisabled()
                         SecureField("Bearer token (optional)", text: $bearerToken)
                     }
-                    Picker("Thinking", selection: $thinkingLevel) {
-                        Text("Low").tag(ThinkingLevel.low)
-                        Text("Medium").tag(ThinkingLevel.medium)
-                        Text("High").tag(ThinkingLevel.high)
-                        Text("Extra high").tag(ThinkingLevel.extraHigh)
+                    if provider != .appleIntelligence {
+                        Picker("Thinking", selection: $thinkingLevel) {
+                            Text("Low").tag(ThinkingLevel.low)
+                            Text("Medium").tag(ThinkingLevel.medium)
+                            Text("High").tag(ThinkingLevel.high)
+                            Text("Extra high").tag(ThinkingLevel.extraHigh)
+                        }
                     }
                 } header: {
                     Text("Language model")
                 } footer: {
-                    if provider == .anthropic {
+                    switch provider {
+                    case .appleIntelligence:
+                        if AppleIntelligence.onDeviceAvailable {
+                            Text("Your mail never leaves this device.")
+                        } else {
+                            Text("Turn on Apple Intelligence in Settings to use it here.")
+                        }
+                    case .anthropic:
                         Text("The key is kept in this device's Keychain. You can fill it from the Passwords app.")
+                    case .openaiResponses:
+                        EmptyView()
                     }
                 }
 
@@ -110,7 +133,7 @@ struct SettingsView: View {
             .onChange(of: provider) { old, new in
                 // Swap the model's placeholder default along with the provider,
                 // but never overwrite one the user typed.
-                if chatModel.isEmpty || chatModel == Self.defaultModel(old) {
+                if chatModel.isEmpty || chatModel == Self.defaultModel(old) || old == .appleIntelligence || new == .appleIntelligence {
                     chatModel = Self.defaultModel(new)
                 }
             }
@@ -119,6 +142,7 @@ struct SettingsView: View {
 
     static func defaultModel(_ provider: LlmProvider) -> String {
         switch provider {
+        case .appleIntelligence: AppleIntelligence.onDevice
         case .anthropic: "claude-sonnet-5-5"
         case .openaiResponses: ""
         }
@@ -137,9 +161,9 @@ struct SettingsView: View {
 
             let llm = try await engine.llmConfig()
             if llm.chatModel.isEmpty {
-                // Nothing saved yet: start from Claude.
-                provider = .anthropic
-                chatModel = Self.defaultModel(.anthropic)
+                // Nothing saved yet: start from the on-device model, else Claude.
+                provider = AppleIntelligence.onDeviceAvailable ? .appleIntelligence : .anthropic
+                chatModel = Self.defaultModel(provider)
             } else {
                 provider = llm.provider
                 chatModel = llm.chatModel

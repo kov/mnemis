@@ -375,15 +375,25 @@ pub enum LlmProvider {
     OpenaiResponses,
     /// Claude via the Anthropic Messages API.
     Anthropic,
+    /// Apple's Foundation Models, on device or on Private Cloud Compute. Only
+    /// the iOS app can reach them; `chat_model` picks which
+    /// ([`APPLE_ON_DEVICE`] or [`APPLE_PRIVATE_CLOUD`]).
+    AppleIntelligence,
 }
 
+/// `chat_model` values for [`LlmProvider::AppleIntelligence`].
+pub const APPLE_ON_DEVICE: &str = "on-device";
+pub const APPLE_PRIVATE_CLOUD: &str = "private-cloud-compute";
+
 impl LlmProvider {
+    /// The providers the desktop app can use (Apple Intelligence is iOS-only).
     pub const ALL: [LlmProvider; 2] = [LlmProvider::OpenaiResponses, LlmProvider::Anthropic];
 
     pub fn as_str(self) -> &'static str {
         match self {
             LlmProvider::OpenaiResponses => "openai-responses",
             LlmProvider::Anthropic => "anthropic",
+            LlmProvider::AppleIntelligence => "apple-intelligence",
         }
     }
 
@@ -391,12 +401,14 @@ impl LlmProvider {
         match self {
             LlmProvider::OpenaiResponses => "OpenAI Responses API (omlx, …)",
             LlmProvider::Anthropic => "Claude (Anthropic API)",
+            LlmProvider::AppleIntelligence => "Apple Intelligence",
         }
     }
 
     pub fn from_wire(s: &str) -> LlmProvider {
         match s {
             "anthropic" => LlmProvider::Anthropic,
+            "apple-intelligence" => LlmProvider::AppleIntelligence,
             _ => LlmProvider::OpenaiResponses,
         }
     }
