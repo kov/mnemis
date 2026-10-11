@@ -1109,6 +1109,7 @@ pub struct ThreadSummaryDto {
     pub flagged: bool,
     pub todo_count: i64,
     pub account: String,
+    pub misdated: Option<String>,
 }
 
 #[uniffi::remote(Record)]
@@ -1128,6 +1129,7 @@ pub struct ThreadMessageDto {
     pub folders: Vec<String>,
     pub downloaded: bool,
     pub from_me: bool,
+    pub misdated: Option<String>,
 }
 
 #[uniffi::remote(Record)]

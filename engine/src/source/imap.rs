@@ -174,7 +174,7 @@ impl Source for ImapSource {
                 sorted.sort_unstable();
                 let uid_set = compress_uid_set(&sorted);
                 let fetches: Vec<_> = session
-                    .uid_fetch(&uid_set, "(UID FLAGS BODY.PEEK[])")
+                    .uid_fetch(&uid_set, "(UID FLAGS INTERNALDATE BODY.PEEK[])")
                     .await?
                     .try_collect()
                     .await?;
@@ -182,13 +182,17 @@ impl Source for ImapSource {
                 fetches
                     .iter()
                     .filter_map(|fetch| {
-                        imported(
+                        let mut m = imported(
                             fetch.body().unwrap_or_default(),
                             fetch.uid.unwrap_or(0),
                             server_validity,
                             parse_flags(fetch.flags().map(|f| format!("{f:?}"))),
                             false,
-                        )
+                        )?;
+                        if let Some(mail) = m.mail.as_mut() {
+                            mail.received_at = fetch.internal_date().map(|d| d.with_timezone(&Utc));
+                        }
+                        Some(m)
                     })
                     .collect()
             }
@@ -221,12 +225,12 @@ impl Source for ImapSource {
         let uid = find_uid(&mut session, message_external_id).await?;
 
         let fetches: Vec<_> = session
-            .uid_fetch(&uid.to_string(), "(UID FLAGS BODY.PEEK[])")
+            .uid_fetch(&uid.to_string(), "(UID FLAGS INTERNALDATE BODY.PEEK[])")
             .await?
             .try_collect()
             .await?;
         let fetch = fetches.first().context("no fetch result")?;
-        let message = imported(
+        let mut message = imported(
             fetch.body().unwrap_or_default(),
             uid,
             server_validity,
@@ -234,6 +238,9 @@ impl Source for ImapSource {
             false,
         )
         .context("failed to parse message")?;
+        if let Some(mail) = message.mail.as_mut() {
+            mail.received_at = fetch.internal_date().map(|d| d.with_timezone(&Utc));
+        }
         let _ = session.logout().await;
         Ok(message)
     }
@@ -310,6 +317,8 @@ pub(crate) fn imported(
             size: raw.as_ref().map(|r| r.len() as u32),
             has_attachments,
             headers_only,
+            // The fetch knows it, not the message; callers fill it in.
+            received_at: None,
         }),
         raw,
     })
@@ -496,7 +505,7 @@ impl crate::mail::sync::MailServer for ImapMailSession {
             .session
             .uid_fetch(
                 compress_uid_set(&sorted),
-                "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])",
+                "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])",
             )
             .await?
             .try_collect()
@@ -509,6 +518,7 @@ impl crate::mail::sync::MailServer for ImapMailSession {
                     flags: parse_flags(f.flags().map(|f| format!("{f:?}"))),
                     size: f.size,
                     header: f.header()?.to_vec(),
+                    received_at: f.internal_date().map(|d| d.with_timezone(&Utc)),
                 })
             })
             .collect())
@@ -519,7 +529,10 @@ impl crate::mail::sync::MailServer for ImapMailSession {
         sorted.sort_unstable();
         let fetches: Vec<_> = self
             .session
-            .uid_fetch(compress_uid_set(&sorted), "(UID FLAGS BODY.PEEK[])")
+            .uid_fetch(
+                compress_uid_set(&sorted),
+                "(UID FLAGS INTERNALDATE BODY.PEEK[])",
+            )
             .await?
             .try_collect()
             .await?;
@@ -530,8 +543,24 @@ impl crate::mail::sync::MailServer for ImapMailSession {
                     uid: f.uid?,
                     flags: parse_flags(f.flags().map(|f| format!("{f:?}"))),
                     raw: f.body()?.to_vec(),
+                    received_at: f.internal_date().map(|d| d.with_timezone(&Utc)),
                 })
             })
+            .collect())
+    }
+
+    async fn received(&mut self, uids: &[u32]) -> Result<Vec<(u32, DateTime<Utc>)>> {
+        let mut sorted = uids.to_vec();
+        sorted.sort_unstable();
+        let fetches: Vec<_> = self
+            .session
+            .uid_fetch(compress_uid_set(&sorted), "(UID INTERNALDATE)")
+            .await?
+            .try_collect()
+            .await?;
+        Ok(fetches
+            .iter()
+            .filter_map(|f| Some((f.uid?, f.internal_date().map(|d| d.with_timezone(&Utc))?)))
             .collect())
     }
 

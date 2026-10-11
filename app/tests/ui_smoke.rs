@@ -309,6 +309,18 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         badge_count, 1,
         "expected exactly 1 open to-do pill in the inbox, got {badge_count}. text: {inbox_text}"
     );
+    // Only the FYI's date is forged.
+    let misdated = client
+        .execute(
+            r#"return String(document.querySelectorAll('.list .trow .pill.misdated').length);"#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        misdated.as_str(),
+        Some("1"),
+        "expected one suspicious-date pill. text: {inbox_text}"
+    );
 
     // Open the to-do-less thread. Its full message isn't downloaded (and
     // can't be: no server), so the stored text shows, with a note saying so;
@@ -333,6 +345,7 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         .execute(
             r#"return JSON.stringify({
                 note: !!document.querySelector('[data-field="not-downloaded"]'),
+                warning: document.querySelector('.msg-card.open .msg-warning')?.textContent || '',
                 srcdoc: document.querySelector('iframe.msg-frame').getAttribute('srcdoc') || '',
                 sandbox: document.querySelector('iframe.msg-frame').getAttribute('sandbox'),
                 height: document.querySelector('iframe.msg-frame').getAttribute('height'),
@@ -352,6 +365,13 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     assert_eq!(
         shown["note"], true,
         "the not-downloaded note shows: {shown}"
+    );
+    assert!(
+        shown["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("30 days after it arrived"),
+        "the forged date is called out: {shown}"
     );
     assert!(
         shown["srcdoc"]
@@ -2970,16 +2990,18 @@ async fn seed(pool: &SqlitePool) -> Result<()> {
     .await?;
 
     // Third message with no linked action; lets the inbox test confirm the
-    // 'action' badge is per-message rather than always-on.
+    // 'action' badge is per-message rather than always-on. Its Date claims a
+    // month after it arrived, so it shows as suspicious.
     sqlx::query(
         "INSERT INTO messages \
-            (channel_id, external_id, author_id, posted_at, subject, body, body_format, ingested_at, flags) \
-         VALUES (?, 'msg-fyi', ?, ?, 'FYI no action needed', 'Just sharing.', 'text', ?, 0)",
+            (channel_id, external_id, author_id, posted_at, subject, body, body_format, ingested_at, flags, received_at) \
+         VALUES (?, 'msg-fyi', ?, ?, 'FYI no action needed', 'Just sharing.', 'text', ?, 0, ?)",
     )
     .bind(channel_id)
     .bind(author_id)
     .bind(now - 60)
     .bind(now - 60)
+    .bind(now - 60 - 30 * 86_400)
     .execute(pool)
     .await?;
 

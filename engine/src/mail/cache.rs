@@ -261,7 +261,14 @@ pub(crate) async fn fetch_into_cache(
         .messages(uids)
         .await?
         .into_iter()
-        .filter_map(|m| crate::source::imap::imported(&m.raw, m.uid, uidvalidity, m.flags, false))
+        .filter_map(|m| {
+            let mut message =
+                crate::source::imap::imported(&m.raw, m.uid, uidvalidity, m.flags, false)?;
+            if let Some(mail) = message.mail.as_mut() {
+                mail.received_at = m.received_at;
+            }
+            Some(message)
+        })
         .collect();
     crate::ingest::ingest_for_reading(pool, SourceId(source_id), channel_id, &messages).await?;
     Ok(messages.len())

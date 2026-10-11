@@ -37,6 +37,46 @@ pub struct FolderStatus {
     pub highest_modseq: Option<u64>,
 }
 
+/// Record when the server received the folder's mail stored without it
+/// (before arrival times were kept): what tells a forged Date header, see
+/// [`super::misdated`]. A few bytes a message, once.
+async fn fill_received(
+    pool: &SqlitePool,
+    server: &mut dyn MailServer,
+    channel_id: i64,
+    uidvalidity: u32,
+) -> Result<()> {
+    let undated: Vec<u32> = sqlx::query_scalar::<_, i64>(
+        "SELECT uid FROM messages WHERE channel_id = ? AND uidvalidity = ? \
+           AND uid IS NOT NULL AND received_at IS NULL AND removed_at IS NULL",
+    )
+    .bind(channel_id)
+    .bind(uidvalidity as i64)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|u| u as u32)
+    .collect();
+    for chunk in undated.chunks(500) {
+        let received = server.received(chunk).await?;
+        let mut tx = pool.begin().await?;
+        for (uid, at) in received {
+            sqlx::query(
+                "UPDATE messages SET received_at = ? \
+                 WHERE channel_id = ? AND uidvalidity = ? AND uid = ?",
+            )
+            .bind(at.timestamp())
+            .bind(channel_id)
+            .bind(uidvalidity as i64)
+            .bind(uid as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
 /// One message's headers, as fetched.
 #[derive(Debug, Clone)]
 pub struct FetchedHeaders {
@@ -44,6 +84,7 @@ pub struct FetchedHeaders {
     pub flags: u32,
     pub size: Option<u32>,
     pub header: Vec<u8>,
+    pub received_at: Option<DateTime<Utc>>,
 }
 
 /// One whole message, as fetched.
@@ -52,6 +93,7 @@ pub struct FetchedMessage {
     pub uid: u32,
     pub flags: u32,
     pub raw: Vec<u8>,
+    pub received_at: Option<DateTime<Utc>>,
 }
 
 /// An account's mail server, one session.
@@ -67,6 +109,8 @@ pub trait MailServer: Send {
     /// `(uid, flags)` of the mail whose flags changed since `modseq`, or of
     /// all mail when `None`.
     async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>>;
+    /// When the server received each of `uids` in the open folder.
+    async fn received(&mut self, uids: &[u32]) -> Result<Vec<(u32, DateTime<Utc>)>>;
     /// Mark mail in the open folder read or unread.
     async fn store_seen(&mut self, uids: &[u32], seen: bool) -> Result<()>;
     /// UIDs in the open folder matching `criteria`, searched by the server.
@@ -183,6 +227,10 @@ pub async fn sync_folder(
         };
     }
 
+    if !empty {
+        fill_received(pool, server, channel_id, status.uidvalidity).await?;
+    }
+
     // With change tracking, the same MODSEQ, UIDNEXT and message count mean
     // nothing arrived, left or changed flags since the last sync.
     if status.highest_modseq.is_some()
@@ -262,6 +310,7 @@ pub async fn sync_folder(
                 )?;
                 if let Some(mail) = m.mail.as_mut() {
                     mail.size = h.size;
+                    mail.received_at = h.received_at;
                 }
                 Some(m)
             })
@@ -326,6 +375,8 @@ pub(crate) mod tests {
         pub id: String,
         pub subject: String,
         pub date: DateTime<Utc>,
+        /// When the server got it; the Date header's time when None.
+        pub received: Option<DateTime<Utc>>,
         pub flags: u32,
         pub modseq: u64,
     }
@@ -370,6 +421,7 @@ pub(crate) mod tests {
                     id: id.to_string(),
                     subject: subject.to_string(),
                     date: Utc::now() - Duration::days(age_days),
+                    received: None,
                     flags: 0,
                     modseq: 1,
                 },
@@ -429,6 +481,7 @@ pub(crate) mod tests {
                         flags: m.flags,
                         size: Some(1000),
                         header: header(m),
+                        received_at: Some(m.received.unwrap_or(m.date)),
                     })
                 })
                 .collect())
@@ -448,6 +501,7 @@ pub(crate) mod tests {
                         uid: *u,
                         flags: m.flags,
                         raw,
+                        received_at: Some(m.received.unwrap_or(m.date)),
                     })
                 })
                 .collect())
@@ -484,6 +538,17 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|(_, m)| changed_since.is_none_or(|s| m.modseq > s))
                 .map(|(u, m)| (*u, m.flags))
+                .collect())
+        }
+
+        async fn received(&mut self, uids: &[u32]) -> Result<Vec<(u32, DateTime<Utc>)>> {
+            anyhow::ensure!(!self.offline, "offline");
+            Ok(uids
+                .iter()
+                .filter_map(|u| {
+                    let m = self.current().messages.get(u)?;
+                    Some((*u, m.received.unwrap_or(m.date)))
+                })
                 .collect())
         }
 
@@ -556,6 +621,56 @@ pub(crate) mod tests {
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM messages")
             .fetch_one(pool)
             .await?)
+    }
+
+    #[tokio::test]
+    async fn stores_when_mail_arrived_and_fills_it_in_for_older_rows() -> Result<()> {
+        let (_tmp, pool, source_id) = setup().await?;
+        folder(&pool, source_id, "Archive", true).await?;
+        // With change tracking, so the second sync finds the folder unchanged.
+        let mut server = FakeServer {
+            condstore: true,
+            ..Default::default()
+        };
+        server.add("Archive", 1, "forged@x", "You won", -120);
+        server
+            .folder("Archive")
+            .messages
+            .get_mut(&1)
+            .unwrap()
+            .received = Some(Utc::now() - Duration::days(1));
+        server.add("Archive", 2, "fine@x", "Lunch", 3);
+        let misdated = |pool: SqlitePool| async move {
+            let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+                "SELECT external_id, posted_at, received_at FROM messages ORDER BY external_id",
+            )
+            .fetch_all(&pool)
+            .await?;
+            anyhow::Ok(
+                rows.into_iter()
+                    .map(|(id, posted, received)| (id, crate::mail::misdated(posted, received)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let expected = vec![
+            ("fine@x".to_string(), None),
+            (
+                "forged@x".to_string(),
+                Some("dated 4 months after it arrived".to_string()),
+            ),
+        ];
+
+        sync_folders(&pool, &mut server, source_id).await?;
+        assert_eq!(misdated(pool.clone()).await?, expected);
+
+        // Rows stored before arrival times were kept get them on the next sync.
+        sqlx::query("UPDATE messages SET received_at = NULL")
+            .execute(&pool)
+            .await?;
+        let second = sync_folders(&pool, &mut server, source_id).await?;
+        assert_eq!(second.unchanged, 1);
+        assert_eq!(misdated(pool.clone()).await?, expected);
+        Ok(())
     }
 
     #[tokio::test]

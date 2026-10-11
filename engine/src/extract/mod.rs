@@ -518,6 +518,7 @@ fn batch_system_prompt(
             recipients: m.recipients.clone(),
             subject: m.subject.clone(),
             snippet: tools::snippet(&m.body, SNIPPET_CHARS),
+            misdated: crate::mail::misdated(m.posted_at, m.received_at),
         })
         .collect();
     prompt::build(&PromptInputs {
@@ -586,6 +587,8 @@ struct WindowRow {
     recipients: Vec<Recipient>,
     /// Where the message's links lead; empty when not known.
     links: Vec<crate::source::links::Link>,
+    /// When the server received it, if known.
+    received_at: Option<i64>,
 }
 
 async fn load_window(
@@ -614,9 +617,10 @@ async fn load_rows(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<i64>,
     )> = sqlx::query_as(
         "SELECT m.id, m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
-             p.external_id, m.recipients_json, m.links_json \
+             p.external_id, m.recipients_json, m.links_json, m.received_at \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              WHERE m.channel_id = ? AND m.id > ? AND m.reader_only = 0 \
@@ -641,6 +645,7 @@ async fn load_rows(
                 author_address,
                 recipients_json,
                 links_json,
+                received_at,
             )| {
                 // Tolerate NULL / malformed recipients_json — recipients are a
                 // triage hint, never load-bearing for correctness.
@@ -661,6 +666,7 @@ async fn load_rows(
                         .as_deref()
                         .and_then(|s| serde_json::from_str(s).ok())
                         .unwrap_or_default(),
+                    received_at,
                 }
             },
         )
@@ -1304,6 +1310,7 @@ mod tests {
             author_address: None,
             links: Vec::new(),
             recipients: Vec::new(),
+            received_at: None,
         }
     }
 

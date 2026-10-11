@@ -132,6 +132,7 @@ pub async fn search_server(
                     )?;
                     if let Some(mail) = m.mail.as_mut() {
                         mail.size = h.size;
+                        mail.received_at = h.received_at;
                     }
                     Some(m)
                 })

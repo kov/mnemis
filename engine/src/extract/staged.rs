@@ -10,7 +10,8 @@
 //! signals the model can't judge: a domain the user has never had mail from,
 //! and a sender name that has nothing to do with that domain. A new domain
 //! records the to-do with a warning; with the name on top, the message is a
-//! warning only. The name alone means nothing: mailing services, bots and
+//! warning only. A Date header far from the mail's arrival (see
+//! `mail::misdated`) is one more signal, whatever the domain. The name alone means nothing: mailing services, bots and
 //! people at their employer's domain make it common in genuine mail.
 
 use std::time::Duration;
@@ -348,7 +349,10 @@ impl Suspicion {
 
 async fn suspicion(pool: &SqlitePool, message: &WindowRow) -> Result<Suspicion> {
     let mut found = Suspicion {
-        signals: Vec::new(),
+        signals: crate::mail::misdated(message.posted_at, message.received_at)
+            .map(|why| format!("its date is forged ({why})"))
+            .into_iter()
+            .collect(),
         links: Vec::new(),
     };
     let Some(host) = message
@@ -598,6 +602,32 @@ fn action_system(ctx: &Context<'_>, external_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{distinctive_words, name_unrelated_to_host, parse_kind, with_caution};
+
+    #[tokio::test]
+    async fn a_forged_date_is_a_signal_whatever_the_sender() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let pool = crate::db::open(&tmp.path().join("t.db")).await?;
+        crate::db::migrate(&pool).await?;
+        let arrived = 1_790_000_000;
+        let message = super::WindowRow {
+            id: 1,
+            external_id: "x".into(),
+            posted_at: arrived + 120 * 86_400,
+            subject: None,
+            body: String::new(),
+            author_display: Some("Ana".into()),
+            author_address: Some("ana@example.com".into()),
+            recipients: Vec::new(),
+            links: Vec::new(),
+            received_at: Some(arrived),
+        };
+        let found = super::suspicion(&pool, &message).await?;
+        assert_eq!(
+            found.signals,
+            ["its date is forged (dated 4 months after it arrived)"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn picks_the_words_that_name_something() {

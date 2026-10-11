@@ -669,6 +669,10 @@ pub struct ThreadSummaryDto {
     /// Open to-dos that came from its mail.
     pub todo_count: i64,
     pub account: String,
+    /// Why the latest message's date looks forged ("dated 4 months after it
+    /// arrived"), a phishing sign; None when it doesn't.
+    #[serde(default)]
+    pub misdated: Option<String>,
 }
 
 /// One message of a thread.
@@ -693,6 +697,9 @@ pub struct ThreadMessageDto {
     pub downloaded: bool,
     /// Written by the user.
     pub from_me: bool,
+    /// Why its date looks forged, a phishing sign; None when it doesn't.
+    #[serde(default)]
+    pub misdated: Option<String>,
 }
 
 /// An open to-do that came from a thread's mail.

@@ -380,9 +380,10 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
         String,
         Option<String>,
         Option<String>,
+        Option<i64>,
     )> = sqlx::query_as(
         "SELECT m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
-             m.recipients_json \
+             m.recipients_json, m.received_at \
              FROM messages m LEFT JOIN people p ON p.id = m.author_id \
              WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT 100",
     )
@@ -396,8 +397,9 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     let window: Vec<prompt::WindowMessage> = rows
         .into_iter()
         .map(
-            |(external_id, posted_at, subject, body, author, recipients_json)| {
+            |(external_id, posted_at, subject, body, author, recipients_json, received_at)| {
                 prompt::WindowMessage {
+                    misdated: mnemis_engine::mail::misdated(posted_at, received_at),
                     external_id,
                     posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
                         .unwrap_or_else(Utc::now),

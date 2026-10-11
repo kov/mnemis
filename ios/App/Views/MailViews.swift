@@ -208,8 +208,12 @@ struct ThreadRow: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                if thread.todoCount > 0 || thread.hasAttachments || thread.flagged {
+                if thread.todoCount > 0 || thread.hasAttachments || thread.flagged || thread.misdated != nil {
                     HStack(spacing: 6) {
+                        if let why = thread.misdated {
+                            Badge(text: "Suspicious date", systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                                .accessibilityHint("Likely phishing: \(why)")
+                        }
                         if thread.todoCount > 0 {
                             Badge(text: "\(thread.todoCount) to-do", systemImage: "checklist", tint: .blue)
                         }
@@ -371,6 +375,12 @@ private struct MessageCard: View {
                     Text(recipients)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let why = message.misdated {
+                    Label("Likely phishing: its date is forged (\(why)).", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 tools

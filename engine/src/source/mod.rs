@@ -90,6 +90,8 @@ pub struct MailMeta {
     pub has_attachments: bool,
     /// Only the headers were fetched; `body` is empty.
     pub headers_only: bool,
+    /// When the server received it (IMAP INTERNALDATE).
+    pub received_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]

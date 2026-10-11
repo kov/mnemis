@@ -313,8 +313,17 @@ fn ThreadRow(thread: ThreadSummaryDto, selected: RwSignal<Option<i64>>) -> impl 
             <span class="when">{crate::components::email_short_date(thread.latest_at)}</span>
             <span class="subj">{subject}</span>
             <span class="snip">{thread.snippet.clone()}</span>
-            {(thread.todo_count > 0 || thread.has_attachments || thread.flagged).then(|| view! {
+            {(thread.todo_count > 0
+                || thread.has_attachments
+                || thread.flagged
+                || thread.misdated.is_some())
+            .then(|| view! {
                 <span class="tags">
+                    {thread.misdated.clone().map(|why| view! {
+                        <span class="pill warn misdated" title=format!("Likely phishing: {why}")>
+                            "\u{26A0} Suspicious date"
+                        </span>
+                    })}
                     {(thread.todo_count > 0).then(|| view! {
                         <span class="pill action">{format!("\u{25CE} {} to-do", thread.todo_count)}</span>
                     })}
@@ -502,6 +511,7 @@ fn MessageCard(
     };
     let folders = msg.folders.join(", ");
     let snippet = msg.snippet.clone();
+    let misdated = msg.misdated.clone();
 
     view! {
         <div class="msg-card" class:open=expanded class:unread=move || !seen.get()
@@ -520,6 +530,9 @@ fn MessageCard(
             </div>
             <Show when=expanded fallback=|| ()>
                 {(!recipients.is_empty()).then(|| view! { <div class="msg-to">{recipients.clone()}</div> })}
+                {misdated.clone().map(|why| view! {
+                    <div class="msg-warning">{format!("\u{26A0} Likely phishing: its date is forged ({why}).")}</div>
+                })}
                 <div class="msg-tools">
                     <button class="btn btn-ghost btn-sm btn-icon" data-action="reply" title="Reply"
                         on:click=move |_| compose(DraftKind::Reply, Some(id))>{icon(REPLY)}</button>

@@ -33,6 +33,32 @@ pub mod sync;
 pub mod thread;
 pub mod view;
 
+/// How far after its arrival a Date header may claim before it reads as
+/// forged: clock and time-zone slips stay well within a day, while phishing
+/// dates itself months ahead, pinned to the top of a list sorted by date.
+const MISDATED_AHEAD: i64 = 86_400;
+/// How far before its arrival: bulk senders stamp a campaign when it's
+/// written and deliver it over days (newsletters measured up to 3.4 days
+/// late), and list moderation holds mail for days more.
+const MISDATED_BACK: i64 = 7 * 86_400;
+
+/// Why a message's date looks forged ("dated 4 months after it arrived"), or
+/// None when it's close enough to its arrival or the arrival isn't known.
+pub fn misdated(posted_at: i64, received_at: Option<i64>) -> Option<String> {
+    let gap = posted_at - received_at?;
+    if (-MISDATED_BACK..=MISDATED_AHEAD).contains(&gap) {
+        return None;
+    }
+    let days = gap.abs() / 86_400;
+    let span = match days {
+        ..60 => format!("{days} days"),
+        60..730 => format!("{} months", days / 30),
+        _ => format!("{} years", days / 365),
+    };
+    let side = if gap > 0 { "after" } else { "before" };
+    Some(format!("dated {span} {side} it arrived"))
+}
+
 /// How long composing waits for the original's headers before going on
 /// without them.
 const ORIGINAL_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -992,6 +1018,35 @@ async fn send_inner(pool: &SqlitePool, postbox: &dyn Postbox, id: i64) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_date_far_from_arrival_reads_as_forged() {
+        let arrived = 1_790_000_000;
+        assert_eq!(misdated(arrived + 3_600, Some(arrived)), None, "clock slip");
+        assert_eq!(misdated(arrived - 80_000, Some(arrived)), None);
+        assert_eq!(misdated(arrived, None), None, "arrival unknown");
+        assert_eq!(
+            misdated(arrived + 125 * 86_400, Some(arrived)).as_deref(),
+            Some("dated 4 months after it arrived")
+        );
+        assert_eq!(
+            misdated(arrived - 3 * 86_400, Some(arrived)),
+            None,
+            "a newsletter delivered late"
+        );
+        assert_eq!(
+            misdated(arrived + 3 * 86_400, Some(arrived)).as_deref(),
+            Some("dated 3 days after it arrived")
+        );
+        assert_eq!(
+            misdated(arrived - 25 * 86_400, Some(arrived)).as_deref(),
+            Some("dated 25 days before it arrived")
+        );
+        assert_eq!(
+            misdated(arrived - 800 * 86_400, Some(arrived)).as_deref(),
+            Some("dated 2 years before it arrived")
+        );
+    }
+
     use super::*;
     use std::sync::Mutex;
     use tempfile::TempDir;

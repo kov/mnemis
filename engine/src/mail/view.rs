@@ -151,7 +151,19 @@ pub async fn threads(
         MailScope::Mailbox { channel_id } => (false, Some(channel_id)),
     };
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, i64, i64, i64, bool, bool, i64, Option<String>, Option<String>)> =
+    let rows: Vec<(
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        bool,
+        bool,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    )> =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "WITH scoped AS ( \
                  SELECT DISTINCT m.thread_id FROM messages m JOIN channels c ON c.id = m.channel_id \
@@ -171,6 +183,8 @@ pub async fn threads(
                     (SELECT l2.subject FROM live l2 WHERE l2.thread_id = t.id \
                      ORDER BY l2.posted_at DESC LIMIT 1), \
                     (SELECT l2.body FROM live l2 WHERE l2.thread_id = t.id \
+                     ORDER BY l2.posted_at DESC LIMIT 1), \
+                    (SELECT l2.received_at FROM live l2 WHERE l2.thread_id = t.id \
                      ORDER BY l2.posted_at DESC LIMIT 1) \
              FROM live l JOIN mail_threads t ON t.id = l.thread_id \
              JOIN sources s ON s.id = t.source_id \
@@ -229,6 +243,7 @@ pub async fn threads(
                 todos,
                 subject,
                 body,
+                received_at,
             )| {
                 ThreadSummaryDto {
                     thread_id,
@@ -242,6 +257,7 @@ pub async fn threads(
                     flagged,
                     todo_count: todos,
                     account,
+                    misdated: super::misdated(latest_at, received_at),
                 }
             },
         )
@@ -264,11 +280,13 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
         bool,
         String,
         bool,
+        Option<i64>,
     )> = sqlx::query_as(
         "SELECT m.id, m.external_id, p.display_name, p.external_id, m.recipients_json, \
                 m.posted_at, m.subject, m.body, m.flags, m.has_attachments, c.name, \
                 EXISTS (SELECT 1 FROM cache.mail_raw r \
-                        WHERE r.source_id = c.source_id AND r.external_id = m.external_id) \
+                        WHERE r.source_id = c.source_id AND r.external_id = m.external_id), \
+                m.received_at \
          FROM messages m JOIN channels c ON c.id = m.channel_id \
          LEFT JOIN people p ON p.id = m.author_id \
          WHERE m.thread_id = ? AND m.removed_at IS NULL \
@@ -295,6 +313,7 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
         attachments,
         folder,
         downloaded,
+        received_at,
     ) in rows
     {
         let folder = leaf(&crate::source::imap_utf7::decode_mailbox_name(&folder)).to_string();
@@ -322,11 +341,14 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
                 .collect()
         };
         by_id.insert(external_id, messages.len());
+        let from_me = address
+            .as_deref()
+            .is_some_and(|a| mine.contains(&a.to_lowercase()));
         messages.push(ThreadMessageDto {
             message_id: id,
-            from_me: address
-                .as_deref()
-                .is_some_and(|a| mine.contains(&a.to_lowercase())),
+            from_me,
+            // The user's own mail is theirs, whatever its copies say.
+            misdated: super::misdated(posted_at, received_at).filter(|_| !from_me),
             from_name: name,
             from_address: address.filter(|a| a.contains('@')),
             to: shown("to"),
