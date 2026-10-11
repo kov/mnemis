@@ -239,6 +239,7 @@ async fn sync_reader(
                 new = c.new,
                 flag_changes = c.flag_changes,
                 removed = c.removed,
+                unchanged = c.unchanged,
                 fetched,
                 evicted,
                 secs = started.elapsed().as_secs(),

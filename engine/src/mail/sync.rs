@@ -76,6 +76,10 @@ pub trait MailServer: Send {
 struct MailState {
     uidvalidity: Option<u32>,
     modseq: Option<u64>,
+    #[serde(default)]
+    uidnext: Option<u32>,
+    #[serde(default)]
+    exists: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +88,8 @@ pub struct SyncCounts {
     pub new: usize,
     pub flag_changes: usize,
     pub removed: usize,
+    /// Folders the server showed unchanged since the last sync.
+    pub unchanged: usize,
     pub errors: Vec<String>,
 }
 
@@ -131,6 +137,7 @@ pub async fn sync_folders(
                 counts.new += c.new;
                 counts.flag_changes += c.flag_changes;
                 counts.removed += c.removed;
+                counts.unchanged += c.unchanged;
             }
             Err(e) => {
                 warn!(error = %format!("{e:#}"), folder, "mail sync: folder failed");
@@ -170,8 +177,19 @@ pub async fn sync_folder(
             .await?;
         state = MailState {
             uidvalidity: Some(status.uidvalidity),
-            modseq: None,
+            ..Default::default()
         };
+    }
+
+    // With change tracking, the same MODSEQ, UIDNEXT and message count mean
+    // nothing arrived, left or changed flags since the last sync.
+    if status.highest_modseq.is_some()
+        && state.modseq == status.highest_modseq
+        && state.uidnext == Some(status.uidnext)
+        && state.exists == Some(status.exists)
+    {
+        counts.unchanged = 1;
+        return Ok(counts);
     }
 
     let known: HashSet<u32> = sqlx::query_scalar::<_, i64>(
@@ -277,6 +295,8 @@ pub async fn sync_folder(
         counts.flag_changes += changed.rows_affected() as usize;
     }
     state.modseq = status.highest_modseq;
+    state.uidnext = Some(status.uidnext);
+    state.exists = Some(status.exists);
     sqlx::query("UPDATE channels SET mail_state = ? WHERE id = ?")
         .bind(serde_json::to_string(&state)?)
         .bind(channel_id)
@@ -326,6 +346,8 @@ pub(crate) mod tests {
         pub offline: bool,
         /// UIDs of every whole message fetched.
         pub fetched: Vec<u32>,
+        /// UID searches run.
+        pub searches: usize,
         pub open: String,
     }
 
@@ -384,6 +406,7 @@ pub(crate) mod tests {
         }
 
         async fn uids(&mut self, since: Option<DateTime<Utc>>) -> Result<Vec<u32>> {
+            self.searches += 1;
             Ok(self
                 .current()
                 .messages
@@ -529,6 +552,19 @@ pub(crate) mod tests {
         let (uid, _, _, reader_only, has_body) = row(&pool, "a@x").await?;
         assert_eq!(uid, Some(2));
         assert!(reader_only && !has_body, "headers only, never for to-dos");
+
+        // Nothing changed on the server: the folder isn't searched again.
+        server.searches = 0;
+        let idle = sync_folder(
+            &pool,
+            &mut server,
+            source_id,
+            archive,
+            "Archive",
+            Utc::now(),
+        )
+        .await?;
+        assert_eq!((idle.unchanged, server.searches), (1, 0));
 
         // Read elsewhere, and another one deleted.
         let m = server.folder("Archive").messages.get_mut(&2).unwrap();
