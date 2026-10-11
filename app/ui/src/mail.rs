@@ -574,10 +574,11 @@ fn ToDoButton(message_id: i64) -> impl IntoView {
         });
     };
     view! {
-        <button class="btn btn-ghost btn-sm" data-action="to-do" title="Make this email a to-do"
+        <button class="btn btn-ghost btn-sm btn-icon" class:working=move || working.get()
+            data-action="to-do"
+            title=move || if working.get() { "Writing a to-do\u{2026}" } else { "Make this email a to-do" }
             disabled=move || working.get() on:click=on_click>
             {icon(TODO)}
-            {move || if working.get() { " Writing to-do\u{2026}" } else { " To-do" }}
         </button>
         {move || error.get().map(|e| view! {
             <span class="msg-error" title=e.clone()>"Couldn't make a to-do"</span>

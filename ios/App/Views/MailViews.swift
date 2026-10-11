@@ -415,14 +415,12 @@ private struct MessageCard: View {
                 Task { await makeToDo() }
             } label: {
                 if makingToDo {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("To-do")
-                    }
+                    ProgressView().controlSize(.small)
                 } else {
-                    Label("To-do", systemImage: "checklist")
+                    Label("To-do", systemImage: "checklist").labelStyle(.iconOnly)
                 }
             }
+            .accessibilityLabel("Make this email a to-do")
             .disabled(makingToDo)
             Spacer(minLength: 0)
             Menu {
