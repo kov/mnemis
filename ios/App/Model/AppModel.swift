@@ -330,6 +330,7 @@ final class AppModel {
         request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
         do {
             try BGTaskScheduler.shared.submit(request)
+            print("[sync] background sync requested")
         } catch {
             print("[sync] background sync not scheduled: \(error)")
         }
@@ -340,6 +341,7 @@ final class AppModel {
     /// so it waits for the next launch). iOS gives this about 30 seconds.
     func backgroundSync() async {
         Self.scheduleBackgroundSync()
+        print("[sync] background sync starting")
         do {
             let engine = try await openEngine()
             let llm = try await engine.llmConfig()
@@ -348,6 +350,7 @@ final class AppModel {
             } else {
                 await sync(userInitiated: false)
             }
+            print("[sync] background sync done")
         } catch {
             print("[sync] background sync failed: \(error)")
         }
