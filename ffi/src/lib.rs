@@ -371,6 +371,17 @@ impl Engine {
         .await
     }
 
+    /// Fetch what replying to a message needs, ahead of the user tapping
+    /// Reply; call when the email is shown.
+    pub async fn prefetch_original(&self, message_id: i64) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            let postbox = mail::Network { pool: &pool };
+            mail::prefetch_original(&pool, &postbox, message_id).await
+        })
+        .await
+    }
+
     pub async fn get_draft(&self, draft_id: i64) -> Result<DraftDto, MnemisError> {
         let pool = self.pool.clone();
         run(async move { mail::get_draft(&pool, draft_id).await }).await

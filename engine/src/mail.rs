@@ -5,6 +5,9 @@
 //! by [`send_draft`], which the apps call from the user's send button. The
 //! agent has no way to send.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -292,7 +295,7 @@ async fn load_original(pool: &SqlitePool, message_id: i64) -> Result<Original> {
 }
 
 /// Headers of the original that mnemis doesn't store.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct OriginalHeaders {
     reply_to: Vec<(Option<String>, String)>,
     references: Option<String>,
@@ -327,6 +330,60 @@ fn parse_headers(raw: &[u8]) -> OriginalHeaders {
         reply_to,
         references,
     }
+}
+
+/// Fetched headers of originals, by database and message, so a reply
+/// started after [`prefetch_original`] doesn't wait on the server. A fetch
+/// in flight is shared: a reply started meanwhile waits for it.
+type HeaderCell = Arc<tokio::sync::OnceCell<OriginalHeaders>>;
+static HEADERS: LazyLock<Mutex<HashMap<(PathBuf, i64), HeaderCell>>> =
+    LazyLock::new(Default::default);
+/// Entries kept before the cache starts over; one per opened email.
+const HEADER_CACHE_SIZE: usize = 64;
+
+fn header_cell(pool: &SqlitePool, message_id: i64) -> HeaderCell {
+    let key = (
+        pool.connect_options().get_filename().to_path_buf(),
+        message_id,
+    );
+    let mut cache = HEADERS.lock().expect("header cache lock");
+    if cache.len() >= HEADER_CACHE_SIZE && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.entry(key).or_default().clone()
+}
+
+/// The original's Reply-To and References, from the cache or the server;
+/// empty when the server doesn't answer in time.
+async fn original_headers(
+    pool: &SqlitePool,
+    postbox: &dyn Postbox,
+    message_id: i64,
+    original: &Original,
+) -> OriginalHeaders {
+    let cell = header_cell(pool, message_id);
+    let fetch = cell.get_or_try_init(|| async {
+        let raw = postbox
+            .fetch_original(original.source_id, &original.mailbox, &original.external_id)
+            .await?;
+        anyhow::Ok(parse_headers(&raw))
+    });
+    match tokio::time::timeout(ORIGINAL_FETCH_TIMEOUT, fetch).await {
+        Ok(Ok(headers)) => headers.clone(),
+        _ => OriginalHeaders::default(),
+    }
+}
+
+/// Fetch what replying to a message needs ahead of time, for when the user
+/// opens it: the reply then starts without a round trip to the server.
+pub async fn prefetch_original(
+    pool: &SqlitePool,
+    postbox: &dyn Postbox,
+    message_id: i64,
+) -> Result<()> {
+    let original = load_original(pool, message_id).await?;
+    original_headers(pool, postbox, message_id, &original).await;
+    Ok(())
 }
 
 /// Message-IDs are stored without their angle brackets; ids mnemis made up
@@ -468,19 +525,7 @@ pub async fn start_draft(
                 subject = prefixed("Fwd:", &original.subject);
                 body = format!("\n\n{}", forwarded(&original));
             } else {
-                let headers = match tokio::time::timeout(
-                    ORIGINAL_FETCH_TIMEOUT,
-                    postbox.fetch_original(
-                        original.source_id,
-                        &original.mailbox,
-                        &original.external_id,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(raw)) => parse_headers(&raw),
-                    _ => OriginalHeaders::default(),
-                };
+                let headers = original_headers(pool, postbox, message_id, &original).await;
                 let own = own_addresses(pool).await?;
                 let is_own = |a: &str| own.contains(&a.to_lowercase());
                 let mut to_list: Vec<(Option<String>, String)> = headers.reply_to;
@@ -997,6 +1042,29 @@ mod tests {
         assert!(raw.contains("Message-ID: <abc@example.com>"), "{raw}");
         assert!(raw.contains("From: Gustavo <me@example.org>"), "{raw}");
         assert_eq!(*postbox.filed.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_prefetched_original_serves_the_reply_without_the_server() {
+        let (_tmp, pool) = setup().await;
+        let online = Recorder {
+            original: Some(ORIGINAL.as_bytes().to_vec()),
+            ..Default::default()
+        };
+        prefetch_original(&pool, &online, 1).await.unwrap();
+        // Offline now, yet the reply still goes to the Reply-To.
+        let id = start_draft(
+            &pool,
+            &Recorder::default(),
+            DraftKind::Reply,
+            Some(1),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let d = get_draft(&pool, id).await.unwrap();
+        assert_eq!(d.to, "Projeto <projeto@example.com>");
     }
 
     #[tokio::test]

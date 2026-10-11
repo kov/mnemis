@@ -68,6 +68,11 @@ struct SaveDraftArgs<'a> {
 }
 
 #[derive(Serialize)]
+struct MessageIdArgs {
+    message_id: i64,
+}
+
+#[derive(Serialize)]
 struct SourceIdArgs {
     source_id: i64,
 }
@@ -97,6 +102,10 @@ fn compose(kind: DraftKind, message_id: Option<i64>) {
 /// Reply, Reply all and Forward for the email a to-do came from.
 #[component]
 pub fn ReplyButtons(message_id: i64) -> impl IntoView {
+    // So Reply opens without waiting on the server.
+    spawn_local(async move {
+        let _ = run("prefetch_original", MessageIdArgs { message_id }).await;
+    });
     view! {
         <button class="btn btn-secondary" data-action="reply"
             on:click=move |_| compose(DraftKind::Reply, Some(message_id))>"Reply"</button>

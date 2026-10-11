@@ -69,15 +69,12 @@ struct ActionDetailView: View {
 
                 if let message {
                     Card {
-                        HStack {
-                            Label("Original email", systemImage: "envelope")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            // No replying to an impostor from here.
-                            if !isWarning {
-                                replyMenu(message)
-                            }
+                        Label("Original email", systemImage: "envelope")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        // No replying to an impostor from here.
+                        if !isWarning {
+                            replyButtons(message)
                         }
                         if let subject = message.subject {
                             Text(subject).font(.headline)
@@ -170,22 +167,32 @@ struct ActionDetailView: View {
         .tint(.red)
     }
 
-    private func replyMenu(_ message: MessageDetailDto) -> some View {
-        Menu {
+    /// Reply, Reply all and Forward, labelled when they fit, icons otherwise.
+    private func replyButtons(_ message: MessageDetailDto) -> some View {
+        GlassEffectContainer(spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                replyRow(message).labelStyle(.titleAndIcon)
+                replyRow(message).labelStyle(.iconOnly)
+            }
+            .buttonStyle(.glass)
+            .font(.subheadline.weight(.semibold))
+        }
+    }
+
+    private func replyRow(_ message: MessageDetailDto) -> some View {
+        HStack(spacing: 8) {
+            Button("Reply", systemImage: "arrowshape.turn.up.left") {
+                Task { await model.compose(.reply, messageId: message.id) }
+            }
             Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {
                 Task { await model.compose(.replyAll, messageId: message.id) }
             }
             Button("Forward", systemImage: "arrowshape.turn.up.right") {
                 Task { await model.compose(.forward, messageId: message.id) }
             }
-        } label: {
-            Label("Reply", systemImage: "arrowshape.turn.up.left")
-                .font(.subheadline.weight(.semibold))
-        } primaryAction: {
-            Task { await model.compose(.reply, messageId: message.id) }
         }
-        .menuStyle(.button)
-        .buttonStyle(.glass)
+        .lineLimit(1)
+        .fixedSize()
     }
 
     private func loadMessage() async {
@@ -193,6 +200,10 @@ struct ActionDetailView: View {
         guard let engine = model.engine, let id = action.sourceMessageId else { return }
         do {
             message = try await engine.getMessage(messageId: id)
+            if !isWarning {
+                // So Reply opens without waiting on the server.
+                Task { try? await engine.prefetchOriginal(messageId: id) }
+            }
         } catch {
             model.report(error)
         }

@@ -280,6 +280,15 @@ async fn start_draft(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Fetch what replying to a message needs, ahead of the user's Reply.
+#[tauri::command(rename_all = "snake_case")]
+async fn prefetch_original(state: State<'_, AppState>, message_id: i64) -> Result<(), String> {
+    let postbox = mail::Network { pool: &state.pool };
+    mail::prefetch_original(&state.pool, &postbox, message_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn get_draft(state: State<'_, AppState>, draft_id: i64) -> Result<DraftDto, String> {
     mail::get_draft(&state.pool, draft_id)
@@ -870,6 +879,7 @@ fn main() {
             get_smtp_settings,
             save_smtp_settings,
             start_draft,
+            prefetch_original,
             get_draft,
             save_draft,
             send_draft,
