@@ -10,6 +10,7 @@ use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 use crate::source::Recipient;
 
 pub mod eval;
+pub mod manual;
 pub mod prompt;
 mod staged;
 pub mod tools;

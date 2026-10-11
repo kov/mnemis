@@ -376,6 +376,17 @@ async fn mark_seen(
     Ok(())
 }
 
+/// Ask the agent to turn an email into a to-do; returns the new to-do's id.
+#[tauri::command(rename_all = "snake_case")]
+async fn to_do_from_message(state: State<'_, AppState>, message_id: i64) -> Result<i64, String> {
+    let stack = state
+        .current_llm()
+        .ok_or_else(|| "No LLM configured. Set it in Settings → LLM.".to_string())?;
+    mnemis_engine::extract::manual::to_do_from_message(&state.pool, &stack.llm, message_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// Bring the folders up to date for reading, without extracting to-dos;
 /// returns the errors.
 #[tauri::command(rename_all = "snake_case")]
@@ -996,6 +1007,7 @@ fn main() {
             render_message,
             open_attachment,
             mark_seen,
+            to_do_from_message,
             sync_mail,
             get_draft,
             save_draft,

@@ -300,6 +300,19 @@ impl Engine {
         .await
     }
 
+    /// Ask the agent to turn an email into a to-do (one LLM call); returns
+    /// the new to-do's id.
+    pub async fn to_do_from_message(&self, message_id: i64) -> Result<i64, MnemisError> {
+        let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
+            message: "No LLM configured. Choose one in Settings.".into(),
+        })?;
+        let pool = self.pool.clone();
+        run(async move {
+            mnemis_engine::extract::manual::to_do_from_message(&pool, &stack.llm, message_id).await
+        })
+        .await
+    }
+
     /// The rules learned from feedback, `None` until there are any.
     pub async fn memory_rules(&self) -> Result<Option<String>, MnemisError> {
         let pool = self.pool.clone();
