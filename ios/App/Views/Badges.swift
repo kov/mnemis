@@ -7,8 +7,11 @@ struct Badge: View {
     let tint: Color
 
     var body: some View {
-        Label(text, systemImage: systemImage)
-            .labelStyle(.titleAndIcon)
+        // Not a Label: its icon-to-title gap is too wide for a pill.
+        HStack(spacing: 3) {
+            Image(systemName: systemImage)
+            Text(text)
+        }
             .font(.caption.weight(.semibold))
             .lineLimit(1)
             .foregroundStyle(tint)

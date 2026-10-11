@@ -321,7 +321,8 @@ fn ThreadRow(thread: ThreadSummaryDto, selected: RwSignal<Option<i64>>) -> impl 
                 <span class="tags">
                     {thread.misdated.clone().map(|why| view! {
                         <span class="pill warn misdated" title=format!("Likely phishing: {why}")>
-                            "\u{26A0} Suspicious date"
+                            // Text presentation: the emoji glyph is wider.
+                            "\u{26A0}\u{FE0E}"<span>"Suspicious date"</span>
                         </span>
                     })}
                     {(thread.todo_count > 0).then(|| view! {
