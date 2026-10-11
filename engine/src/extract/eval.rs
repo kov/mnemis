@@ -94,17 +94,20 @@ pub async fn evaluate(
 
     let mut report = EvalReport::default();
     for (channel_id, ids) in by_channel {
-        evaluate_channel(
-            pool,
-            llm,
-            window_char_budget,
-            idle_timeout,
-            channel_id,
-            &ids,
-            strategy,
-            &mut report,
-        )
-        .await?;
+        // Erased: left concrete, the nested futures overflow the compiler's
+        // `Send` check in callers.
+        let channel: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> =
+            Box::pin(evaluate_channel(
+                pool,
+                llm,
+                window_char_budget,
+                idle_timeout,
+                channel_id,
+                &ids,
+                strategy,
+                &mut report,
+            ));
+        channel.await?;
     }
     report.secs = started.elapsed().as_secs();
     Ok(report)

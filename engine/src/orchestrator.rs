@@ -81,7 +81,7 @@ pub async fn find_to_dos(
             .await
             .context("listing sources")?;
     for (source_id, source_name) in sources {
-        let counts = extract_source(
+        let counts: Erased<'_, SourceCounts> = Box::pin(extract_source(
             pool,
             source_id,
             &source_name,
@@ -91,8 +91,8 @@ pub async fn find_to_dos(
             window_char_budget,
             idle_timeout,
             traces_dir,
-        )
-        .await?;
+        ));
+        let counts = counts.await?;
         out.embeddings_drained += counts.embeddings_drained;
         out.actions_created += counts.actions_created;
         out.errors.extend(counts.errors);
@@ -153,6 +153,8 @@ async fn extraction_lock(pool: &SqlitePool) -> tokio::sync::OwnedMutexGuard<()> 
         .clone();
     lock.lock_owned().await
 }
+
+type Erased<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Default)]
 struct SourceCounts {
@@ -313,7 +315,9 @@ pub async fn sync_mail_outcome(pool: &SqlitePool) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
     for (source_id, source_name) in sources {
         let _guard = crate::mail::sync::account_lock(pool, source_id).await;
-        let result = async {
+        // Erased, as is each account's extraction: left concrete, the nested
+        // futures overflow the compiler's `Send` check in callers.
+        let result: Erased<'_, SourceCounts> = Box::pin(async {
             let source = build_imap_source(pool, SourceId(source_id)).await?;
             if let Err(e) = discover_channels(pool, &source, source_id).await {
                 warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
@@ -324,8 +328,8 @@ pub async fn sync_mail_outcome(pool: &SqlitePool) -> Result<SyncOutcome> {
                 .errors
                 .extend(sync_reader(pool, &source, source_id, &source_name).await);
             anyhow::Ok(counts)
-        }
-        .await;
+        });
+        let result = result.await;
         match result {
             Ok(counts) => {
                 out.sources_synced += 1;
