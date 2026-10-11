@@ -24,7 +24,7 @@ use crate::extract::extract_for_channel;
 use crate::ingest::ingest_batch;
 use crate::llm::LlmTransport;
 use crate::secrets;
-use crate::source::imap::{ImapConfig, ImapSource};
+use crate::source::imap::{ImapAuth, ImapConfig, ImapSource};
 use crate::source::{Cursor, PollBatch, Source, SourceId};
 
 /// A full sync: [`sync_mail`], then [`find_to_dos`]. `model_name` is
@@ -796,9 +796,17 @@ pub async fn build_imap_source(pool: &SqlitePool, source_id: SourceId) -> Result
         .context("missing username")?
         .to_string();
 
-    let password = secrets::fetch(&config_ref)
-        .await
-        .with_context(|| format!("fetching keychain entry {config_ref}"))?;
+    let auth = if parsed["auth"].as_str() == Some("google") {
+        ImapAuth::Google {
+            refresh_ref: config_ref,
+        }
+    } else {
+        ImapAuth::Password(
+            secrets::fetch(&config_ref)
+                .await
+                .with_context(|| format!("fetching keychain entry {config_ref}"))?,
+        )
+    };
 
     Ok(ImapSource::new(
         source_id,
@@ -806,7 +814,7 @@ pub async fn build_imap_source(pool: &SqlitePool, source_id: SourceId) -> Result
             server,
             port,
             username,
-            password,
+            auth,
         },
     ))
 }

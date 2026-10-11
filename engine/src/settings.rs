@@ -426,27 +426,37 @@ pub async fn add_imap_source(
         .await
         .context("storing IMAP password in keychain")?;
 
+    let conn_json = serde_json::json!({
+        "server": server,
+        "port": port,
+        "username": username,
+    });
+    insert_mail_source(pool, name, &keychain_ref, &conn_json, username).await
+}
+
+/// The rows of a new mail account whose secret is in the keychain already.
+async fn insert_mail_source(
+    pool: &SqlitePool,
+    name: &str,
+    keychain_ref: &str,
+    conn_json: &serde_json::Value,
+    username: &str,
+) -> Result<i64> {
     let now = Utc::now().timestamp();
     let (source_id,): (i64,) = sqlx::query_as(
         "INSERT INTO sources (kind, name, config_ref, created_at) \
          VALUES ('imap', ?, ?, ?) RETURNING id",
     )
     .bind(name)
-    .bind(&keychain_ref)
+    .bind(keychain_ref)
     .bind(now)
     .fetch_one(pool)
     .await
     .context("inserting sources row")?;
 
-    let conn_json = serde_json::json!({
-        "server": server,
-        "port": port,
-        "username": username,
-    })
-    .to_string();
     sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
         .bind(format!("source/{source_id}/imap"))
-        .bind(&conn_json)
+        .bind(conn_json.to_string())
         .execute(pool)
         .await
         .context("storing IMAP connection settings")?;
@@ -463,6 +473,28 @@ pub async fn add_imap_source(
     .await;
 
     Ok(source_id)
+}
+
+/// Register a Google account signed in through [`crate::oauth`]: Gmail's
+/// IMAP with XOAUTH2, the refresh token in the keychain. Returns the new
+/// source id.
+pub async fn add_google_source(
+    pool: &SqlitePool,
+    name: &str,
+    signed_in: &crate::oauth::SignedIn,
+) -> Result<i64> {
+    let email = &signed_in.email;
+    let keychain_ref = format!("google/{email}");
+    secrets::store(&keychain_ref, &signed_in.refresh_token)
+        .await
+        .context("storing the Google sign-in in the keychain")?;
+    let conn_json = serde_json::json!({
+        "server": crate::oauth::IMAP_SERVER,
+        "port": crate::oauth::IMAP_PORT,
+        "username": email,
+        "auth": "google",
+    });
+    insert_mail_source(pool, name, &keychain_ref, &conn_json, email).await
 }
 
 const CALDAV_ACCOUNT_KEY: &str = "caldav/account";

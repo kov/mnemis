@@ -404,6 +404,15 @@ pub async fn add_imap_source(
     serde_wasm_bindgen::from_value::<i64>(raw).map_err(|e| e.to_string())
 }
 
+/// Sign in to Google in the browser and add the account; resolves once the
+/// browser came back (or the sign-in failed or timed out).
+pub async fn add_google_source() -> Result<i64, String> {
+    let raw = invoke("add_google_source", JsValue::from(js_sys::Object::new()))
+        .await
+        .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
+    serde_wasm_bindgen::from_value::<i64>(raw).map_err(|e| e.to_string())
+}
+
 pub async fn delete_source(source_id: i64) -> Result<(), String> {
     let args =
         serde_wasm_bindgen::to_value(&SourceIdArgs { source_id }).map_err(|e| e.to_string())?;

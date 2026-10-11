@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chrono::{Local, TimeZone, Utc};
 use lettre::message::header::{ContentTransferEncoding, ContentType};
 use lettre::message::{Attachment, Body, Mailbox, Mailboxes, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use mnemis_types::{DraftDto, DraftKind, DraftStatus, SmtpSettingsDto};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,14 @@ struct SmtpAccount {
     from_address: String,
     #[serde(default)]
     save_sent: bool,
+}
+
+/// Whether the account signs in with Google rather than a password.
+async fn google_account(pool: &SqlitePool, source_id: i64) -> Result<bool> {
+    let imap = crate::settings::get_setting(pool, &format!("source/{source_id}/imap")).await?;
+    Ok(imap
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .is_some_and(|v| v["auth"].as_str() == Some("google")))
 }
 
 fn smtp_key(source_id: i64) -> String {
@@ -225,31 +233,35 @@ impl Postbox for Network<'_> {
         raw: &[u8],
     ) -> Result<()> {
         let (account, _) = load_account(self.pool, source_id).await?;
-        let password_ref = match &account.password_ref {
-            Some(reference) => reference.clone(),
-            None => {
-                let (config_ref,): (String,) =
-                    sqlx::query_as("SELECT config_ref FROM sources WHERE id = ?")
-                        .bind(source_id)
-                        .fetch_one(self.pool)
-                        .await?;
-                config_ref
-            }
-        };
-        let password = secrets::fetch(&password_ref)
-            .await
-            .with_context(|| format!("fetching keychain entry {password_ref}"))?;
+        let (config_ref,): (String,) =
+            sqlx::query_as("SELECT config_ref FROM sources WHERE id = ?")
+                .bind(source_id)
+                .fetch_one(self.pool)
+                .await?;
         let builder = if account.starttls {
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&account.server)?
         } else {
             AsyncSmtpTransport::<Tokio1Executor>::relay(&account.server)?
         };
-        let transport = builder
-            .port(account.port)
-            .credentials(Credentials::new(account.username.clone(), password))
-            .timeout(Some(SMTP_TIMEOUT))
-            .build();
-        transport
+        let builder = builder.port(account.port).timeout(Some(SMTP_TIMEOUT));
+        let builder = match &account.password_ref {
+            // Google accounts send with the sign-in they read with.
+            None if google_account(self.pool, source_id).await? => {
+                let token = crate::oauth::access_token(&config_ref).await?;
+                builder
+                    .credentials(Credentials::new(account.username.clone(), token))
+                    .authentication(vec![Mechanism::Xoauth2])
+            }
+            reference => {
+                let password_ref = reference.as_ref().unwrap_or(&config_ref);
+                let password = secrets::fetch(password_ref)
+                    .await
+                    .with_context(|| format!("fetching keychain entry {password_ref}"))?;
+                builder.credentials(Credentials::new(account.username.clone(), password))
+            }
+        };
+        builder
+            .build()
             .send_raw(envelope, raw)
             .await
             .with_context(|| format!("sending through {}", account.server))?;

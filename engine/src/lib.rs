@@ -11,6 +11,7 @@ pub mod mail;
 pub mod maintenance;
 pub mod memory;
 pub mod mutations;
+pub mod oauth;
 pub mod orchestrator;
 pub mod queries;
 pub mod secrets;

@@ -18,16 +18,16 @@ use wasm_bindgen::JsCast;
 
 use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
-    ChatStream, ChatUiState, FirstRunTick, SyncTick, add_caldav_account, add_imap_source,
-    cancel_chat_message, confidence_class, confirm_resolution, create_chat, delete_caldav_account,
-    delete_chat, delete_source, discover_source_channels, fetch_actions, fetch_caldav_account,
-    fetch_chat_seed, fetch_chat_turns, fetch_chats, fetch_is_first_run, fetch_llm_config,
-    fetch_message, fetch_pending_resolutions, fetch_seeded_chat, fetch_settings_sources,
-    fetch_status, fetch_user_profile, list_caldav_collections, open_external, promote_to_reminder,
-    reject_resolution, run_sync_caldav, run_sync_now, save_llm_config, save_user_profile,
-    send_chat_message, set_caldav_collection, set_channel_muted, set_channels_muted_bulk,
-    set_chat_archived, set_chat_show_reasoning, set_source_muted, status_label,
-    submit_dismissal_feedback, update_action,
+    ChatStream, ChatUiState, FirstRunTick, SyncTick, add_caldav_account, add_google_source,
+    add_imap_source, cancel_chat_message, confidence_class, confirm_resolution, create_chat,
+    delete_caldav_account, delete_chat, delete_source, discover_source_channels, fetch_actions,
+    fetch_caldav_account, fetch_chat_seed, fetch_chat_turns, fetch_chats, fetch_is_first_run,
+    fetch_llm_config, fetch_message, fetch_pending_resolutions, fetch_seeded_chat,
+    fetch_settings_sources, fetch_status, fetch_user_profile, list_caldav_collections,
+    open_external, promote_to_reminder, reject_resolution, run_sync_caldav, run_sync_now,
+    save_llm_config, save_user_profile, send_chat_message, set_caldav_collection,
+    set_channel_muted, set_channels_muted_bulk, set_chat_archived, set_chat_show_reasoning,
+    set_source_muted, status_label, submit_dismissal_feedback, update_action,
 };
 
 #[component]
@@ -1409,11 +1409,36 @@ pub fn SettingsSources() -> impl IntoView {
     let refetch_for_modal = refetch.clone();
     let add_open = RwSignal::new(false);
     let on_add = move |_| add_open.set(true);
+    // Signing in to Google happens in the browser; this says what's going on.
+    let google: RwSignal<Option<String>> = RwSignal::new(None);
+    let google_busy = RwSignal::new(false);
+    let refetch_for_google = refetch.clone();
+    let on_google = move |_| {
+        let refetch = refetch_for_google.clone();
+        google_busy.set(true);
+        google.set(Some(
+            "Continue in your browser to sign in to Google…".to_string(),
+        ));
+        spawn_local(async move {
+            match add_google_source().await {
+                Ok(_) => {
+                    google.set(None);
+                    refetch();
+                }
+                Err(e) => google.set(Some(e)),
+            }
+            google_busy.set(false);
+        });
+    };
     view! {
         <h1>"Sources"</h1>
         <div class="settings-actions">
             <button class="btn btn-primary" on:click=on_add>"Add IMAP source"</button>
+            <button class="btn" on:click=on_google disabled=move || google_busy.get()>
+                "Add Google account"
+            </button>
         </div>
+        {move || google.get().map(|t| view! { <div class="settings-toast">{t}</div> })}
         <Suspense fallback=|| view! { <div class="loading">"Loading…"</div> }>
             {move || {
                 let refetch = refetch_for_table.clone();

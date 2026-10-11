@@ -254,6 +254,20 @@ async fn add_imap_source(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Add a Google account: sign in in the browser, back to a loopback
+/// address, then store it like any mail account.
+#[tauri::command(rename_all = "snake_case")]
+async fn add_google_source(state: State<'_, AppState>) -> Result<i64, String> {
+    let signed_in = mnemis_engine::oauth::sign_in_desktop(|url| {
+        tauri_plugin_opener::open_url(url, None::<&str>).map_err(anyhow::Error::from)
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    settings::add_google_source(&state.pool, "Gmail", &signed_in)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn get_smtp_settings(
     state: State<'_, AppState>,
@@ -992,6 +1006,7 @@ fn main() {
             set_source_muted,
             delete_source,
             add_imap_source,
+            add_google_source,
             get_smtp_settings,
             save_smtp_settings,
             start_draft,

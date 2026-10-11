@@ -36,7 +36,33 @@ pub struct ImapConfig {
     pub server: String,
     pub port: u16,
     pub username: String,
-    pub password: String,
+    pub auth: ImapAuth,
+}
+
+/// How an account signs in.
+#[derive(Debug, Clone)]
+pub enum ImapAuth {
+    Password(String),
+    /// Google's OAuth (XOAUTH2), from the refresh token the keychain keeps
+    /// under this entry.
+    Google {
+        refresh_ref: String,
+    },
+}
+
+/// Answers XOAUTH2's challenge: the token first; then, when the server
+/// turns it down with a challenge describing why, the empty reply it wants
+/// before its NO.
+struct XOAuth2 {
+    response: Option<String>,
+}
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> String {
+        self.response.take().unwrap_or_default()
+    }
 }
 
 pub struct ImapSource {
@@ -66,12 +92,37 @@ impl ImapSource {
             .read_response()
             .await
             .context("failed to read IMAP greeting")?;
-        let session = client
-            .login(&self.config.username, &self.config.password)
-            .await
-            .map_err(|(err, _)| err)
-            .context("IMAP login failed")?;
-        Ok(session)
+        match &self.config.auth {
+            ImapAuth::Password(password) => client
+                .login(&self.config.username, password)
+                .await
+                .map_err(|(err, _)| err)
+                .context("IMAP login failed"),
+            ImapAuth::Google { refresh_ref } => {
+                let token = crate::oauth::access_token(refresh_ref).await?;
+                let xoauth2 = XOAuth2 {
+                    response: Some(crate::oauth::xoauth2(&self.config.username, &token)),
+                };
+                match client.authenticate("XOAUTH2", xoauth2).await {
+                    Ok(session) => Ok(session),
+                    Err((err, client)) => {
+                        // The cached token may have been revoked early:
+                        // once more with a fresh one.
+                        crate::oauth::forget(refresh_ref);
+                        let token = crate::oauth::access_token(refresh_ref).await?;
+                        let xoauth2 = XOAuth2 {
+                            response: Some(crate::oauth::xoauth2(&self.config.username, &token)),
+                        };
+                        tracing::debug!(error = %err, "XOAUTH2 refused; retrying with a new token");
+                        client
+                            .authenticate("XOAUTH2", xoauth2)
+                            .await
+                            .map_err(|(err, _)| err)
+                            .context("IMAP sign-in with Google failed")
+                    }
+                }
+            }
+        }
     }
 }
 

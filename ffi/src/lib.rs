@@ -161,6 +161,16 @@ pub struct Engine {
     chat_cancels: Mutex<HashMap<i64, CancellationToken>>,
     /// The push watch over every account, while the app is in front.
     watch: Mutex<Option<mnemis_engine::mail::watch::MailWatch>>,
+    /// The Google sign-in the browser is out on.
+    google_sign_in: Mutex<Option<mnemis_engine::oauth::Pending>>,
+}
+
+/// Where to send the browser to sign in to Google.
+#[derive(uniffi::Record)]
+pub struct GoogleSignInStart {
+    pub url: String,
+    /// The scheme Google comes back on, for `ASWebAuthenticationSession`.
+    pub callback_scheme: String,
 }
 
 /// Hears when pushed mail changed, once its folders synced. Implemented in
@@ -239,6 +249,7 @@ impl Engine {
                 apple,
                 chat_cancels: Mutex::new(HashMap::new()),
                 watch: Mutex::new(None),
+                google_sign_in: Mutex::new(None),
             }))
         })
         .await
@@ -365,6 +376,40 @@ impl Engine {
         let pool = self.pool.clone();
         run(async move {
             settings::add_imap_source(&pool, &name, &server, port, &username, &password).await
+        })
+        .await
+    }
+
+    /// Start signing in to Google; finish with what the browser comes back
+    /// with ([`Self::finish_google_sign_in`]).
+    pub fn begin_google_sign_in(&self) -> Result<GoogleSignInStart, MnemisError> {
+        let redirect = mnemis_engine::oauth::app_redirect()?;
+        let (url, pending) = mnemis_engine::oauth::begin(&redirect)?;
+        *self.google_sign_in.lock().expect("sign-in lock") = Some(pending);
+        let callback_scheme = redirect.split(':').next().unwrap_or_default().to_string();
+        Ok(GoogleSignInStart {
+            url,
+            callback_scheme,
+        })
+    }
+
+    /// Finish signing in to Google with the URL the browser came back to,
+    /// and add the account. Returns its source id.
+    pub async fn finish_google_sign_in(
+        &self,
+        callback_url: String,
+        name: String,
+    ) -> Result<i64, MnemisError> {
+        let pending = self
+            .google_sign_in
+            .lock()
+            .expect("sign-in lock")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no Google sign-in under way"))?;
+        let pool = self.pool.clone();
+        run(async move {
+            let signed_in = mnemis_engine::oauth::finish(&pending, &callback_url).await?;
+            settings::add_google_source(&pool, &name, &signed_in).await
         })
         .await
     }

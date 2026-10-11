@@ -14,7 +14,7 @@ local-embed = ["dep:fastembed"]
 mnemis-types = { path = "../types" }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sqlite-vec = "0.1.9"
@@ -43,6 +43,7 @@ uuid = { version = "1.27.0", features = ["v4"] }
 # rustls for both the model download and the ORT binary fetch, matching reqwest.
 fastembed = { version = "7.1.1", optional = true, default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 ammonia = "4.2.3"
+getrandom = "0.4.3"
 
 # Secret storage is OS-keychain-backed, with a per-platform backend behind the
 # `secrets` module's async API. Kept target-specific so neither backend's deps
