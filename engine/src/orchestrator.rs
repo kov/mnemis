@@ -392,6 +392,36 @@ async fn sync_one_source_with(
     Ok(counts)
 }
 
+/// Send queued read/unread changes now, without waiting for a sync: the
+/// apps call this right after the user's change. Returns the errors; the
+/// changes stay queued for the next sync.
+pub async fn push_mail_changes(pool: &SqlitePool) -> Result<Vec<String>> {
+    let sources: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT DISTINCT s.id, s.name FROM sources s \
+         JOIN channels c ON c.source_id = s.id JOIN mail_ops o ON o.channel_id = c.id \
+         ORDER BY s.id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("listing accounts with mail changes")?;
+    let mut errors = Vec::new();
+    for (source_id, source_name) in sources {
+        let _guard = crate::mail::sync::account_lock(pool, source_id).await;
+        let result = async {
+            let source = build_imap_source(pool, SourceId(source_id)).await?;
+            let mut session = source.mail_session().await?;
+            let flushed = crate::mail::ops::flush(pool, &mut session, source_id).await;
+            session.logout().await;
+            flushed
+        }
+        .await;
+        if let Err(e) = result {
+            errors.push(format!("source '{source_name}': {e:#}"));
+        }
+    }
+    Ok(errors)
+}
+
 /// Poll every folder polled for to-dos and ingest what's new, whole: the
 /// extraction candidates.
 async fn poll_channels(

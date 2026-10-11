@@ -26,6 +26,7 @@ use crate::secrets;
 use crate::source::SourceId;
 
 pub mod cache;
+pub mod ops;
 pub mod sync;
 pub mod thread;
 

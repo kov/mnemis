@@ -58,6 +58,8 @@ pub trait MailServer: Send {
     /// `(uid, flags)` of the mail whose flags changed since `modseq`, or of
     /// all mail when `None`.
     async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>>;
+    /// Mark mail in the open folder read or unread.
+    async fn store_seen(&mut self, uids: &[u32], seen: bool) -> Result<()>;
 }
 
 /// What the folder sync last saw, kept in `channels.mail_state`.
@@ -109,6 +111,10 @@ pub async fn sync_folders(
     .await
     .context("listing folders")?;
     let mut counts = SyncCounts::default();
+    // The user's changes go first, so the flags read back include them.
+    if let Err(e) = super::ops::flush(pool, server, source_id).await {
+        counts.errors.push(format!("sending mail changes: {e:#}"));
+    }
     for (channel_id, folder) in channels {
         match sync_folder(pool, server, source_id, channel_id, &folder, Utc::now()).await {
             Ok(c) => {
@@ -305,7 +311,11 @@ pub(crate) mod tests {
     pub(crate) struct FakeServer {
         pub folders: HashMap<String, FakeFolder>,
         pub condstore: bool,
-        open: String,
+        /// Every store: folder, UIDs, read or unread.
+        pub stored: Vec<(String, Vec<u32>, bool)>,
+        /// Fail every store, as when offline.
+        pub offline: bool,
+        pub open: String,
     }
 
     impl FakeServer {
@@ -396,6 +406,27 @@ pub(crate) mod tests {
                 .filter(|(_, m)| changed_since.is_none_or(|s| m.modseq > s))
                 .map(|(u, m)| (*u, m.flags))
                 .collect())
+        }
+
+        async fn store_seen(&mut self, uids: &[u32], seen: bool) -> Result<()> {
+            anyhow::ensure!(!self.offline, "offline");
+            let open = self.open.clone();
+            let folder = self.folders.get_mut(&open).context("no folder open")?;
+            let modseq = folder
+                .messages
+                .values()
+                .map(|m| m.modseq)
+                .max()
+                .unwrap_or(1)
+                + 1;
+            for uid in uids {
+                if let Some(m) = folder.messages.get_mut(uid) {
+                    m.flags = if seen { m.flags | 1 } else { m.flags & !1 };
+                    m.modseq = modseq;
+                }
+            }
+            self.stored.push((open, uids.to_vec(), seen));
+            Ok(())
         }
     }
 

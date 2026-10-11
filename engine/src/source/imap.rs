@@ -128,9 +128,9 @@ impl Source for ImapSource {
     async fn poll(&self, channel_external_id: &str, cursor: Option<&Cursor>) -> Result<PollBatch> {
         let mut session = self.connect().await?;
 
-        // EXAMINE, not SELECT: mnemis is a read-only ingester, so open every
-        // mailbox read-only. This guarantees the server can never mutate flags
-        // (notably the implicit `\Seen` a body FETCH would otherwise set).
+        // EXAMINE, not SELECT: the poll only reads, and a read-only open
+        // guarantees it can never change flags (notably the implicit `\Seen`
+        // a body FETCH would otherwise set).
         let mailbox = session
             .examine(channel_external_id)
             .await
@@ -209,9 +209,9 @@ impl Source for ImapSource {
         message_external_id: &str,
     ) -> Result<ImportedMessage> {
         let mut session = self.connect().await?;
-        // EXAMINE, not SELECT: mnemis is a read-only ingester, so open every
-        // mailbox read-only. This guarantees the server can never mutate flags
-        // (notably the implicit `\Seen` a body FETCH would otherwise set).
+        // EXAMINE, not SELECT: the poll only reads, and a read-only open
+        // guarantees it can never change flags (notably the implicit `\Seen`
+        // a body FETCH would otherwise set).
         let mailbox = session
             .examine(channel_external_id)
             .await
@@ -344,8 +344,8 @@ impl ImapSource {
     }
 
     /// File a copy of mail the user sent in their sent folder, marked read.
-    /// The one write mnemis makes over IMAP, and only when the account asks
-    /// for it: SMTP servers don't all keep what they relay.
+    /// Only when the account asks for it: SMTP servers don't all keep what
+    /// they relay.
     pub async fn append_to_sent(&self, raw: &[u8]) -> Result<()> {
         let mut session = self.connect().await?;
         let names: Vec<_> = session
@@ -512,6 +512,23 @@ impl crate::mail::sync::MailServer for ImapMailSession {
             .iter()
             .filter_map(|f| Some((f.uid?, parse_flags(f.flags().map(|f| format!("{f:?}"))))))
             .collect())
+    }
+
+    async fn store_seen(&mut self, uids: &[u32], seen: bool) -> Result<()> {
+        let mut sorted = uids.to_vec();
+        sorted.sort_unstable();
+        let change = if seen {
+            "+FLAGS.SILENT (\\Seen)"
+        } else {
+            "-FLAGS.SILENT (\\Seen)"
+        };
+        let _: Vec<_> = self
+            .session
+            .uid_store(compress_uid_set(&sorted), change)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(())
     }
 }
 
