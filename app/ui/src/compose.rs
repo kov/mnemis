@@ -97,13 +97,15 @@ fn compose(kind: DraftKind, message_id: Option<i64>) {
     });
 }
 
-/// Reply, Reply all and Forward for the email a to-do came from.
+/// Reply, Reply all and Forward for an email. With `prefetch`, what a reply
+/// needs is fetched ahead, so Reply opens without waiting on the server.
 #[component]
-pub fn ReplyButtons(message_id: i64) -> impl IntoView {
-    // So Reply opens without waiting on the server.
-    spawn_local(async move {
-        let _ = run("prefetch_original", MessageIdArgs { message_id }).await;
-    });
+pub fn ReplyButtons(message_id: i64, #[prop(default = true)] prefetch: bool) -> impl IntoView {
+    if prefetch {
+        spawn_local(async move {
+            let _ = run("prefetch_original", MessageIdArgs { message_id }).await;
+        });
+    }
     view! {
         <button class="btn btn-secondary" data-action="reply"
             on:click=move |_| compose(DraftKind::Reply, Some(message_id))>"Reply"</button>

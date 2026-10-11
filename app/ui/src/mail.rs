@@ -149,27 +149,25 @@ pub fn MailNav() -> impl IntoView {
                 <span class="ico">"\u{2709}"</span>"All Inboxes"
                 {move || unread_badge(inbox_unread())}
             </A>
-            <For
-                each=accounts
-                key=|a| (a.0, a.2.len())
-                children=move |(_, account, folders)| view! {
-                    <div class="side-label side-account">{account}</div>
-                    {folders.into_iter().map(|b| {
-                        let indent = format!("padding-left: {}px", 8 + 12 * depth(&b.path));
-                        view! {
-                            <A href=format!("/mail/{}", b.channel_id)
-                                attr:class="side-item folder"
-                                attr:style=indent
-                                attr:data-mailbox=b.channel_id.to_string()
-                                attr:title=b.path.clone()>
-                                <span class="ico">{role_icon(b.role)}</span>
-                                <span class="folder-name">{b.name.clone()}</span>
-                                {unread_badge(b.unread)}
-                            </A>
-                        }
-                    }).collect_view()}
-                }
-            />
+            // Re-rendered whole on each refresh, so the counts stay current;
+            // it's a few dozen rows.
+            {move || accounts().into_iter().map(|(_, account, folders)| view! {
+                <div class="side-label side-account">{account}</div>
+                {folders.into_iter().map(|b| {
+                    let indent = format!("padding-left: {}px", 8 + 12 * depth(&b.path));
+                    view! {
+                        <A href=format!("/mail/{}", b.channel_id)
+                            attr:class="side-item folder"
+                            attr:style=indent
+                            attr:data-mailbox=b.channel_id.to_string()
+                            attr:title=b.path.clone()>
+                            <span class="ico">{role_icon(b.role)}</span>
+                            <span class="folder-name">{b.name.clone()}</span>
+                            {unread_badge(b.unread)}
+                        </A>
+                    }
+                }).collect_view()}
+            }).collect_view()}
         </div>
     }
 }
@@ -244,7 +242,8 @@ pub fn MailPage(scope: MailScope) -> impl IntoView {
     view! {
         <div class="body mail">
             <div class="list" data-field="thread-list">
-                <Suspense fallback=|| view! { <div class="list-empty">"Loading\u{2026}"</div> }>
+                // Transition, not Suspense: a refresh keeps the list on screen.
+                <Transition fallback=|| view! { <div class="list-empty">"Loading\u{2026}"</div> }>
                     {move || threads.get().map(|res| match res {
                         Ok(rows) if rows.is_empty() => view! {
                             <div class="list-empty">"No mail here in the last 90 days."</div>
@@ -267,7 +266,7 @@ pub fn MailPage(scope: MailScope) -> impl IntoView {
                         }
                         Err(e) => view! { <div class="list-empty">{format!("Error: {e}")}</div> }.into_any(),
                     })}
-                </Suspense>
+                </Transition>
             </div>
             <div class="reading">
                 {move || match selected.get() {
@@ -344,7 +343,7 @@ fn ThreadView(thread_id: i64) -> impl IntoView {
     // them, so a message doesn't fold away as it's marked read.
     let open: RwSignal<Option<Vec<i64>>> = RwSignal::new(None);
     view! {
-        <Suspense fallback=|| view! { <div class="reading-empty">"Loading\u{2026}"</div> }>
+        <Transition fallback=|| view! { <div class="reading-empty">"Loading\u{2026}"</div> }>
             {move || thread.get().map(|res| match res {
                 Ok(t) => {
                     if open.get_untracked().is_none() {
@@ -361,7 +360,7 @@ fn ThreadView(thread_id: i64) -> impl IntoView {
                 }
                 Err(e) => view! { <div class="reading-empty">{format!("Error: {e}")}</div> }.into_any(),
             })}
-        </Suspense>
+        </Transition>
     }
 }
 
@@ -509,7 +508,8 @@ fn MessageCard(
                 {(!recipients.is_empty()).then(|| view! { <div class="msg-to">{recipients.clone()}</div> })}
                 <MessageBody message_id=id downloaded=downloaded />
                 <div class="msg-tools">
-                    <ReplyButtons message_id=id />
+                    // The thread view downloads the mail itself.
+                    <ReplyButtons message_id=id prefetch=false />
                     <TalkAboutButton kind="message" id=id />
                     <span class="spacer"></span>
                     <button class="btn btn-ghost btn-sm" data-action="mark-unread" on:click=mark_unread>
@@ -546,7 +546,7 @@ fn MessageBody(message_id: i64, downloaded: RwSignal<u32>) -> impl IntoView {
     };
     let _resize = window_event_listener(leptos::ev::resize, move |_| fit());
     view! {
-        <Suspense fallback=|| view! { <div class="msg-note">"Loading\u{2026}"</div> }>
+        <Transition fallback=|| view! { <div class="msg-note">"Loading\u{2026}"</div> }>
             {move || rendered.get().map(|res| match res {
                 Ok(r) => {
                     let remote = r.remote_resources;
@@ -591,7 +591,7 @@ fn MessageBody(message_id: i64, downloaded: RwSignal<u32>) -> impl IntoView {
                 }
                 Err(e) => view! { <div class="msg-note">{format!("Couldn't show the message: {e}")}</div> }.into_any(),
             })}
-        </Suspense>
+        </Transition>
     }
 }
 
