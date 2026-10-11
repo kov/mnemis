@@ -92,7 +92,7 @@ struct MailboxListView: View {
                 }
             }
         }
-        .refreshable { await model.syncMail() }
+        .refreshable { await model.syncMail(userInitiated: true) }
         .navigationDestination(for: MailScope.self) { scope in
             ThreadListView(scope: scope)
         }
@@ -140,7 +140,7 @@ struct ThreadListView: View {
                 if model.isSyncingMail { ProgressView() }
             }
         }
-        .refreshable { await model.syncMail() }
+        .refreshable { await model.syncMail(userInitiated: true) }
         .task(id: model.mailVersion) { await reload() }
         .navigationDestination(item: $model.threadSelection) { id in
             ThreadView(threadId: id).id(id)

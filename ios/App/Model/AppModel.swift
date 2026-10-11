@@ -244,8 +244,9 @@ final class AppModel {
     }
 
     /// Mail only: new mail, flags and removals in every folder, without
-    /// looking for to-dos.
-    func syncMail() async {
+    /// looking for to-dos. Errors show when the user asked for it (pull to
+    /// refresh); the launch sync only logs them.
+    func syncMail(userInitiated: Bool = false) async {
         guard let engine, !isSyncingMail, !isSyncing else { return }
         isSyncingMail = true
         defer { isSyncingMail = false }
@@ -253,6 +254,9 @@ final class AppModel {
             let errors = try await engine.syncMail()
             if !errors.isEmpty {
                 print("[mail] sync: \(errors.joined(separator: "; "))")
+                if userInitiated {
+                    errorMessage = errors.joined(separator: "\n")
+                }
             }
             mailboxes = try await engine.mailboxes()
         } catch {
@@ -276,6 +280,9 @@ final class AppModel {
 
     /// Fetching mail ahead only off metered and Low Data networks.
     private func watchNetwork(_ engine: Engine) {
+        // Off until the first path update says otherwise, so a launch on
+        // cellular doesn't fetch ahead before the monitor has spoken.
+        engine.setPrefetchAllowed(allowed: false)
         network.pathUpdateHandler = { path in
             engine.setPrefetchAllowed(allowed: !path.isExpensive && !path.isConstrained)
         }
