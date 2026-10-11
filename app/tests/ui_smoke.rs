@@ -2603,6 +2603,190 @@ async fn warnings_show_apart_and_can_become_to_dos() -> Result<()> {
     Ok(())
 }
 
+/// Reply on a to-do opens the composer addressed to the sender, with the
+/// subject prefixed; Discard closes it. An assistant's draft shows in its chat
+/// as a card that opens the same composer. Nothing is sent.
+#[tokio::test(flavor = "current_thread")]
+async fn reply_from_a_to_do_and_review_an_assistant_draft() -> Result<()> {
+    use mnemis_engine::chat::store;
+
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("ui-smoke-compose.db");
+    let action_id = {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        mnemis_engine::db::migrate(&pool).await?;
+        seed(&pool).await?;
+        let now = Utc::now().timestamp();
+        let chat_id = store::create_chat(&pool, None, None).await?;
+        let ask = "tell Ana I'll review it";
+        store::append_turn(&pool, chat_id, "user", Some(ask), None, None, None).await?;
+        store::ensure_title(&pool, chat_id, ask).await?;
+        let (draft_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO drafts (source_id, kind, chat_id, to_addrs, subject, body, created_by, \
+                                 created_at, updated_at) \
+             VALUES (1, 'reply', ?, 'Ana <ana@example.com>', 'Re: Q3 roadmap draft', \
+                     'I will take a pass tonight.', 'agent', ?, ?) RETURNING id",
+        )
+        .bind(chat_id)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&pool)
+        .await?;
+        let output = format!(r#"{{"draft_id":{draft_id},"status":"shown to the user"}}"#);
+        store::append_turn(
+            &pool,
+            chat_id,
+            "assistant",
+            Some(r#"{"kind":"reply","body":"I will take a pass tonight."}"#),
+            Some("draft_email"),
+            Some("call-1"),
+            None,
+        )
+        .await?;
+        store::append_turn(
+            &pool,
+            chat_id,
+            "tool",
+            Some(&output),
+            Some("draft_email"),
+            Some("call-1"),
+            None,
+        )
+        .await?;
+        let (id,): (i64,) =
+            sqlx::query_as("SELECT id FROM actions WHERE title = 'Review Q3 roadmap'")
+                .fetch_one(&pool)
+                .await?;
+        pool.close().await;
+        id
+    };
+
+    let app_bin = sibling_app_binary()
+        .context("mnemis-app binary missing; run `cargo build -p mnemis-app` before the test")?;
+    let env = HashMap::from([
+        ("MNEMIS_DB_PATH".to_string(), db_path.display().to_string()),
+        ("MNEMIS_DISABLE_LLM".to_string(), "1".to_string()),
+    ]);
+    let harness = Harness::start(HarnessOpts::default(), env).await?;
+    let client = harness.open_session(&app_bin).await?;
+
+    let row = format!(".arow[data-action-id='{action_id}']");
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(&row))
+        .await
+        .context("waiting for the to-do row")?;
+    client.find(Locator::Css(&row)).await?.click().await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("button[data-action='reply']"))
+        .await
+        .context("waiting for the Reply button")?
+        .click()
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(".compose input[data-field='compose-subject']"))
+        .await
+        .context("waiting for the composer")?;
+    let fields = client
+        .execute(
+            "return [document.querySelector('[data-field=compose-to]').value, \
+                     document.querySelector('[data-field=compose-subject]').value, \
+                     document.querySelector('[data-field=compose-body]').value];",
+            vec![],
+        )
+        .await?;
+    let fields = fields.to_string();
+    assert!(fields.contains("ana@example.com"), "fields: {fields}");
+    assert!(fields.contains("Re: Q3 roadmap draft"), "fields: {fields}");
+    assert!(
+        fields.contains("> Can you take a pass by EOD?"),
+        "fields: {fields}"
+    );
+
+    client
+        .find(Locator::Css(".compose button[data-action='discard']"))
+        .await?
+        .click()
+        .await?;
+    let mut closed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if client.find(Locator::Css(".compose")).await.is_err() {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "Discard should close the composer");
+
+    client
+        .execute(
+            r#"document.querySelector('nav.nav a[href="/chats"]').click(); return 'ok';"#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css("a.chat-list-item"))
+        .await
+        .context("waiting for the chat")?
+        .click()
+        .await?;
+    let card = client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(".draft-card"))
+        .await
+        .context("waiting for the draft card")?;
+    let text = card.text().await?.to_lowercase();
+    assert!(text.contains("email draft"), "card: {text}");
+    assert!(text.contains("re: q3 roadmap draft"), "card: {text}");
+    client
+        .find(Locator::Css(
+            ".draft-card button[data-action='review-draft']",
+        ))
+        .await?
+        .click()
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(".compose button[data-action='keep']"))
+        .await
+        .context("an assistant draft can be kept for later")?;
+    let body = client
+        .execute(
+            "return document.querySelector('[data-field=compose-body]').value;",
+            vec![],
+        )
+        .await?;
+    assert!(
+        body.to_string().contains("I will take a pass tonight."),
+        "body: {body}"
+    );
+    client.close().await.ok();
+
+    let pool = mnemis_engine::db::open(&db_path).await?;
+    let statuses: Vec<(String, String)> =
+        sqlx::query_as("SELECT created_by, status FROM drafts ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    assert!(
+        statuses.contains(&("user".into(), "discarded".into())),
+        "drafts: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|(_, s)| s == "sent"),
+        "nothing is sent: {statuses:?}"
+    );
+    Ok(())
+}
+
 async fn seed(pool: &SqlitePool) -> Result<()> {
     let now = Utc::now().timestamp();
 

@@ -106,7 +106,7 @@ struct SettingsView: View {
 
                 Section("Mail accounts") {
                     ForEach(model.sources, id: \.id) { source in
-                        NavigationLink { FoldersView(source: source) } label: {
+                        NavigationLink { AccountView(source: source) } label: {
                             SourceRow(source: source)
                         }
                     }

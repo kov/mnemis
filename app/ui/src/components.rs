@@ -661,6 +661,10 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
             </div>
             {source_message_id.map(|message_id| view! { <SourceEmail message_id=message_id /> })}
             <div class="action-actions">
+                // No replying to an impostor from here.
+                {source_message_id.filter(|_| !is_warning).map(|message_id| view! {
+                    <crate::compose::ReplyButtons message_id=message_id />
+                })}
                 // A warning is taken as a to-do or dropped; dropping it has
                 // nothing to teach, so no feedback modal.
                 {is_warning.then(|| view! {
@@ -1809,6 +1813,7 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
         }
     };
     let on_expand = move |_| expanded.update(|v| *v = !*v);
+    let is_imap = row.kind == "imap";
 
     view! {
         <tr class="source-row" data-source-id=id.to_string()>
@@ -1838,6 +1843,7 @@ fn SourceRowView(row: SourceRowDto, refetch: Arc<dyn Fn() + Send + Sync>) -> imp
                 <td></td>
                 <td colspan="5">
                     <SourceChannels source_id=id />
+                    {is_imap.then(|| view! { <crate::compose::SendingSettings source_id=id /> })}
                 </td>
             </tr>
         </Show>
@@ -2887,7 +2893,12 @@ fn ChatTurnView(turn: ChatTurnDto, show_reasoning: RwSignal<bool>) -> impl IntoV
 
     let body = match (role.as_str(), turn.tool_name.clone()) {
         ("user", _) => view! { <div class="chat-msg chat-user">{content}</div> }.into_any(),
-        ("tool", Some(name)) => tool_disclosure(false, name, content),
+        ("tool", Some(name)) => match crate::compose::draft_id_in(&content) {
+            Some(draft_id) if name == "draft_email" => {
+                view! { <crate::compose::DraftCard draft_id=draft_id /> }.into_any()
+            }
+            _ => tool_disclosure(false, name, content),
+        },
         ("assistant", Some(name)) => tool_disclosure(true, name, content),
         ("assistant", None) if !content.is_empty() => {
             // The model answers in markdown; render it as sanitized HTML so

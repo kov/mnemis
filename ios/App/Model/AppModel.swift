@@ -32,6 +32,10 @@ final class AppModel {
     var pendingDismissal: ActionDto?
     /// A dismissal reason is being merged into memory.
     private(set) var isLearning = false
+    /// The mail being written, while the composer is up.
+    var composing: DraftDto?
+    /// Bumped whenever a draft changes, so views showing one reload it.
+    private(set) var draftsVersion = 0
 
     /// True until an LLM and at least one account are configured — the
     /// actions list shows a setup prompt instead of an empty list.
@@ -294,7 +298,6 @@ final class AppModel {
         await refreshChats()
     }
 
-    /// Dismiss at once, like the desktop, then ask why; the answer is optional.
     /// Open to-dos, without warnings.
     var todos: [ActionDto] { actions.filter { $0.status != .suspicious } }
 
@@ -312,6 +315,7 @@ final class AppModel {
         if actionSelection == warning.id { actionSelection = nil }
     }
 
+    /// Dismiss at once, like the desktop, then ask why; the answer is optional.
     func dismiss(_ action: ActionDto) async {
         await setStatus(action, to: .dismissed)
         if actionSelection == action.id { actionSelection = nil }
@@ -337,8 +341,35 @@ final class AppModel {
         }
     }
 
+    /// Start a mail, prefilled from `messageId` for a reply or forward, and
+    /// open the composer on it.
+    func compose(_ kind: DraftKind, messageId: Int64? = nil) async {
+        guard let engine else { return }
+        do {
+            let id = try await engine.startDraft(kind: kind, messageId: messageId)
+            composing = try await engine.getDraft(draftId: id)
+        } catch {
+            report(error)
+        }
+    }
+
+    /// Open the composer on a draft, such as one the assistant wrote.
+    func openDraft(_ id: Int64) async {
+        guard let engine else { return }
+        do {
+            composing = try await engine.getDraft(draftId: id)
+        } catch {
+            report(error)
+        }
+    }
+
+    func draftChanged() {
+        draftsVersion += 1
+    }
+
     /// Deep links: `mnemis://action/<id>` and `mnemis://chat/<id>` open that
-    /// action or chat (for notifications, and for driving the app in tests).
+    /// action or chat, `mnemis://draft/<id>` the composer on that draft (for
+    /// notifications, and for driving the app in tests).
     func open(_ url: URL) {
         guard url.scheme == "mnemis", let id = Int64(url.lastPathComponent) else { return }
         switch url.host() {
@@ -348,6 +379,8 @@ final class AppModel {
         case "chat":
             selectedTab = .chat
             chatSelection = id
+        case "draft":
+            Task { await openDraft(id) }
         default:
             break
         }

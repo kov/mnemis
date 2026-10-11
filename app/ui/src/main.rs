@@ -14,6 +14,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 mod components;
+mod compose;
 mod markdown;
 
 #[wasm_bindgen]
@@ -802,6 +803,7 @@ fn App() -> impl IntoView {
         error: RwSignal::new(None),
     };
     provide_context(chat_ui);
+    provide_context(compose::Composer::new());
     // Remember "show reasoning" across runs (stored in the DB settings table).
     let show_reasoning = chat_ui.show_reasoning;
     spawn_local(async move {
@@ -841,6 +843,7 @@ fn App() -> impl IntoView {
                         </Routes>
                     </div>
                 </main>
+                <compose::ComposeHost />
             </div>
         </Router>
     }

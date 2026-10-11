@@ -69,9 +69,16 @@ struct ActionDetailView: View {
 
                 if let message {
                     Card {
-                        Label("Original email", systemImage: "envelope")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                        HStack {
+                            Label("Original email", systemImage: "envelope")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            // No replying to an impostor from here.
+                            if !isWarning {
+                                replyMenu(message)
+                            }
+                        }
                         if let subject = message.subject {
                             Text(subject).font(.headline)
                         }
@@ -161,6 +168,24 @@ struct ActionDetailView: View {
         }
         .buttonStyle(.glass)
         .tint(.red)
+    }
+
+    private func replyMenu(_ message: MessageDetailDto) -> some View {
+        Menu {
+            Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {
+                Task { await model.compose(.replyAll, messageId: message.id) }
+            }
+            Button("Forward", systemImage: "arrowshape.turn.up.right") {
+                Task { await model.compose(.forward, messageId: message.id) }
+            }
+        } label: {
+            Label("Reply", systemImage: "arrowshape.turn.up.left")
+                .font(.subheadline.weight(.semibold))
+        } primaryAction: {
+            Task { await model.compose(.reply, messageId: message.id) }
+        }
+        .menuStyle(.button)
+        .buttonStyle(.glass)
     }
 
     private func loadMessage() async {

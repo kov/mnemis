@@ -17,11 +17,12 @@ use anyhow::Context;
 use mnemis_engine::config::Config;
 use mnemis_engine::embed::{Embedder, LocalEmbedder};
 use mnemis_engine::llm::LlmBackend;
-use mnemis_engine::{chat, config, db, mutations, orchestrator, queries, settings};
+use mnemis_engine::{chat, config, db, mail, mutations, orchestrator, queries, settings};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
-    ChatDto, ChatEvent, ChatTurnDto, FeedbackKind, LlmConfigDto, MessageDetailDto, MessageDto,
-    PendingResolutionDto, SourceRowDto, StatusSnapshot, SyncOutcome, UserProfileDto,
+    ChatDto, ChatEvent, ChatTurnDto, DraftDto, DraftKind, FeedbackKind, LlmConfigDto,
+    MessageDetailDto, MessageDto, PendingResolutionDto, SmtpSettingsDto, SourceRowDto,
+    StatusSnapshot, SyncOutcome, UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tauri::ipc::Channel;
@@ -242,6 +243,69 @@ async fn add_imap_source(
     password: String,
 ) -> Result<i64, String> {
     settings::add_imap_source(&state.pool, &name, &server, port, &username, &password)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_smtp_settings(
+    state: State<'_, AppState>,
+    source_id: i64,
+) -> Result<SmtpSettingsDto, String> {
+    mail::smtp_settings(&state.pool, source_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn save_smtp_settings(
+    state: State<'_, AppState>,
+    settings: SmtpSettingsDto,
+    password: Option<String>,
+) -> Result<(), String> {
+    mail::save_smtp_settings(&state.pool, &settings, password.as_deref())
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn start_draft(
+    state: State<'_, AppState>,
+    kind: DraftKind,
+    message_id: Option<i64>,
+) -> Result<i64, String> {
+    let postbox = mail::Network { pool: &state.pool };
+    mail::start_draft(&state.pool, &postbox, kind, message_id, None, false)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_draft(state: State<'_, AppState>, draft_id: i64) -> Result<DraftDto, String> {
+    mail::get_draft(&state.pool, draft_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn save_draft(state: State<'_, AppState>, draft: DraftDto) -> Result<(), String> {
+    mail::save_draft(&state.pool, &draft)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Send a draft; only the composer's Send button calls this.
+#[tauri::command(rename_all = "snake_case")]
+async fn send_draft(state: State<'_, AppState>, draft_id: i64) -> Result<DraftDto, String> {
+    let postbox = mail::Network { pool: &state.pool };
+    mail::send_draft(&state.pool, &postbox, draft_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn discard_draft(state: State<'_, AppState>, draft_id: i64) -> Result<(), String> {
+    mail::discard_draft(&state.pool, draft_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -803,6 +867,13 @@ fn main() {
             set_source_muted,
             delete_source,
             add_imap_source,
+            get_smtp_settings,
+            save_smtp_settings,
+            start_draft,
+            get_draft,
+            save_draft,
+            send_draft,
+            discard_draft,
             get_caldav_account,
             add_caldav_account,
             delete_caldav_account,

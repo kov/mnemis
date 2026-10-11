@@ -17,12 +17,12 @@ use anyhow::Context as _;
 use mnemis_engine::embed::{Embedder, NoEmbedder};
 use mnemis_engine::llm::{ForeignClient, ForeignLlm, LlmBackend};
 use mnemis_engine::source::SourceId;
-use mnemis_engine::{chat, config, db, memory, mutations, orchestrator, queries, settings};
+use mnemis_engine::{chat, config, db, mail, memory, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence,
-    FeedbackKind, LlmConfigDto, LlmProvider, MessageActionRef, MessageDetailDto, ProfileIdentifier,
-    SourceHealth, SourceRowDto, SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel,
-    UserProfileDto,
+    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence, DraftDto,
+    DraftKind, DraftStatus, FeedbackKind, LlmConfigDto, LlmProvider, MessageActionRef,
+    MessageDetailDto, ProfileIdentifier, SmtpSettingsDto, SourceHealth, SourceRowDto, SourceStatus,
+    StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
@@ -336,6 +336,64 @@ impl Engine {
     pub async fn delete_source(&self, source_id: i64) -> Result<(), MnemisError> {
         let pool = self.pool.clone();
         run(async move { settings::delete_source(&pool, source_id).await }).await
+    }
+
+    /// How the account sends; guessed from its IMAP settings until saved.
+    pub async fn smtp_settings(&self, source_id: i64) -> Result<SmtpSettingsDto, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::smtp_settings(&pool, source_id).await }).await
+    }
+
+    /// Save how the account sends. A non-empty `password` is stored in the
+    /// Keychain as the account's own SMTP password.
+    pub async fn save_smtp_settings(
+        &self,
+        settings: SmtpSettingsDto,
+        password: Option<String>,
+    ) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::save_smtp_settings(&pool, &settings, password.as_deref()).await })
+            .await
+    }
+
+    /// A new draft prefilled for its kind, from `message_id` for a reply or
+    /// forward. Returns the draft's id.
+    pub async fn start_draft(
+        &self,
+        kind: DraftKind,
+        message_id: Option<i64>,
+    ) -> Result<i64, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            let postbox = mail::Network { pool: &pool };
+            mail::start_draft(&pool, &postbox, kind, message_id, None, false).await
+        })
+        .await
+    }
+
+    pub async fn get_draft(&self, draft_id: i64) -> Result<DraftDto, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::get_draft(&pool, draft_id).await }).await
+    }
+
+    pub async fn save_draft(&self, draft: DraftDto) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::save_draft(&pool, &draft).await }).await
+    }
+
+    /// Send a draft; the user's send button is the only caller.
+    pub async fn send_draft(&self, draft_id: i64) -> Result<DraftDto, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            let postbox = mail::Network { pool: &pool };
+            mail::send_draft(&pool, &postbox, draft_id).await
+        })
+        .await
+    }
+
+    pub async fn discard_draft(&self, draft_id: i64) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::discard_draft(&pool, draft_id).await }).await
     }
 
     /// The source's folders, refreshed from the server first so ones created
@@ -807,6 +865,55 @@ pub enum ChatEvent {
     Compacting,
     Done,
     Error { message: String },
+}
+
+#[uniffi::remote(Enum)]
+pub enum DraftKind {
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
+}
+
+#[uniffi::remote(Enum)]
+pub enum DraftStatus {
+    Draft,
+    Sent,
+    Discarded,
+}
+
+#[uniffi::remote(Record)]
+pub struct DraftDto {
+    pub id: i64,
+    pub source_id: Option<i64>,
+    pub kind: DraftKind,
+    pub message_id: Option<i64>,
+    pub chat_id: Option<i64>,
+    pub from: String,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub status: DraftStatus,
+    pub error: Option<String>,
+    pub by_agent: bool,
+    pub updated_at: i64,
+    pub sent_at: Option<i64>,
+}
+
+#[uniffi::remote(Record)]
+pub struct SmtpSettingsDto {
+    pub source_id: i64,
+    pub server: String,
+    pub port: u16,
+    pub starttls: bool,
+    pub username: String,
+    pub own_password: bool,
+    pub from_name: String,
+    pub from_address: String,
+    pub save_sent: bool,
+    pub saved: bool,
 }
 
 #[uniffi::remote(Record)]

@@ -185,7 +185,11 @@ private struct TranscriptItemView: View {
         case let .reasoning(_, text):
             ReasoningView(text: text)
         case let .tool(_, name, arguments, output):
-            ToolCallView(name: name, arguments: arguments, output: output)
+            if name == "draft_email", let id = DraftCard.draftId(in: output) {
+                DraftCard(draftId: id)
+            } else {
+                ToolCallView(name: name, arguments: arguments, output: output)
+            }
         }
     }
 }
@@ -243,6 +247,66 @@ private struct ReasoningView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+/// An email the assistant drafted: who it's to and how it starts, and the
+/// way to review and send it.
+private struct DraftCard: View {
+    @Environment(AppModel.self) private var model
+    let draftId: Int64
+    @State private var draft: DraftDto?
+
+    static func draftId(in output: String?) -> Int64? {
+        guard let data = output?.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return (object["draft_id"] as? NSNumber)?.int64Value
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(status, systemImage: draft?.status == .sent ? "paperplane.fill" : "envelope")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if let draft {
+                if !draft.to.isEmpty {
+                    Text("To \(draft.to)")
+                        .font(.subheadline)
+                        .lineLimit(1)
+                }
+                Text(draft.subject.isEmpty ? "(no subject)" : draft.subject)
+                    .font(.headline)
+                Text(draft.body.trimmingCharacters(in: .whitespacesAndNewlines))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                if draft.status == .draft {
+                    Button("Review and send", systemImage: "square.and.pencil") {
+                        Task { await model.openDraft(draftId) }
+                    }
+                    .buttonStyle(.glassProminent)
+                    .padding(.top, 4)
+                }
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 16))
+        .task(id: model.draftsVersion) { await load() }
+    }
+
+    private var status: String {
+        switch draft?.status {
+        case .sent: "Email sent"
+        case .discarded: "Email discarded"
+        default: "Email draft"
+        }
+    }
+
+    private func load() async {
+        guard let engine = model.engine else { return }
+        draft = try? await engine.getDraft(draftId: draftId)
     }
 }
 

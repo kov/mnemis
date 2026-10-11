@@ -21,6 +21,9 @@ struct ContentView: View {
         .sheet(item: $model.pendingDismissal) { action in
             DismissReasonSheet(action: action)
         }
+        .sheet(item: $model.composing, onDismiss: { model.draftChanged() }) { draft in
+            ComposeView(draft: draft)
+        }
         .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
             SettingsView()
         }
