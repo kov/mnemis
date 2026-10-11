@@ -258,6 +258,7 @@ pub(crate) fn imported(
 ) -> Option<ImportedMessage> {
     use mail_parser::MimeHeaders;
     let msg = MessageParser::default().parse(raw)?;
+    let auth = crate::mail::suspicion::Auth::from_headers(raw);
     let subject = msg.subject().map(|s| s.to_string());
     let posted_at = msg
         .date()
@@ -319,6 +320,7 @@ pub(crate) fn imported(
             headers_only,
             // The fetch knows it, not the message; callers fill it in.
             received_at: None,
+            auth: Some(auth),
         }),
         raw,
     })
@@ -546,6 +548,24 @@ impl crate::mail::sync::MailServer for ImapMailSession {
                     received_at: f.internal_date().map(|d| d.with_timezone(&Utc)),
                 })
             })
+            .collect())
+    }
+
+    async fn auth_headers(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut sorted = uids.to_vec();
+        sorted.sort_unstable();
+        let fetches: Vec<_> = self
+            .session
+            .uid_fetch(
+                compress_uid_set(&sorted),
+                "(UID BODY.PEEK[HEADER.FIELDS (AUTHENTICATION-RESULTS)])",
+            )
+            .await?
+            .try_collect()
+            .await?;
+        Ok(fetches
+            .iter()
+            .filter_map(|f| Some((f.uid?, f.header().unwrap_or_default().to_vec())))
             .collect())
     }
 

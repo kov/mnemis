@@ -37,10 +37,10 @@ pub struct FolderStatus {
     pub highest_modseq: Option<u64>,
 }
 
-/// Record when the server received the folder's mail stored without it
-/// (before arrival times were kept): what tells a forged Date header, see
-/// [`super::misdated`]. A few bytes a message, once.
-async fn fill_received(
+/// Fill in, for the folder's mail stored before they were kept, when the
+/// server received it and its verdict on the sender: what tells forged mail
+/// (see [`super::suspicion`]). A few bytes a message, once.
+async fn fill_missing(
     pool: &SqlitePool,
     server: &mut dyn MailServer,
     channel_id: i64,
@@ -66,6 +66,36 @@ async fn fill_received(
                  WHERE channel_id = ? AND uidvalidity = ? AND uid = ?",
             )
             .bind(at.timestamp())
+            .bind(channel_id)
+            .bind(uidvalidity as i64)
+            .bind(uid as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    }
+
+    let unchecked: Vec<u32> = sqlx::query_scalar::<_, i64>(
+        "SELECT uid FROM messages WHERE channel_id = ? AND uidvalidity = ? \
+           AND uid IS NOT NULL AND auth_json IS NULL AND removed_at IS NULL",
+    )
+    .bind(channel_id)
+    .bind(uidvalidity as i64)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|u| u as u32)
+    .collect();
+    for chunk in unchecked.chunks(500) {
+        let headers = server.auth_headers(chunk).await?;
+        let mut tx = pool.begin().await?;
+        for (uid, header) in headers {
+            let auth = super::suspicion::Auth::from_headers(&header);
+            sqlx::query(
+                "UPDATE messages SET auth_json = ? \
+                 WHERE channel_id = ? AND uidvalidity = ? AND uid = ?",
+            )
+            .bind(serde_json::to_string(&auth)?)
             .bind(channel_id)
             .bind(uidvalidity as i64)
             .bind(uid as i64)
@@ -109,6 +139,9 @@ pub trait MailServer: Send {
     /// `(uid, flags)` of the mail whose flags changed since `modseq`, or of
     /// all mail when `None`.
     async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>>;
+    /// The `Authentication-Results` headers of each of `uids` in the open
+    /// folder, as a header section.
+    async fn auth_headers(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>>;
     /// When the server received each of `uids` in the open folder.
     async fn received(&mut self, uids: &[u32]) -> Result<Vec<(u32, DateTime<Utc>)>>;
     /// Mark mail in the open folder read or unread.
@@ -228,7 +261,7 @@ pub async fn sync_folder(
     }
 
     if !empty {
-        fill_received(pool, server, channel_id, status.uidvalidity).await?;
+        fill_missing(pool, server, channel_id, status.uidvalidity).await?;
     }
 
     // With change tracking, the same MODSEQ, UIDNEXT and message count mean
@@ -377,6 +410,8 @@ pub(crate) mod tests {
         pub date: DateTime<Utc>,
         /// When the server got it; the Date header's time when None.
         pub received: Option<DateTime<Utc>>,
+        /// The server's authentication results ("dmarc=fail …").
+        pub auth: Option<String>,
         pub flags: u32,
         pub modseq: u64,
     }
@@ -422,6 +457,7 @@ pub(crate) mod tests {
                     subject: subject.to_string(),
                     date: Utc::now() - Duration::days(age_days),
                     received: None,
+                    auth: None,
                     flags: 0,
                     modseq: 1,
                 },
@@ -435,7 +471,11 @@ pub(crate) mod tests {
 
     pub(crate) fn header(m: &FakeMessage) -> Vec<u8> {
         format!(
-            "Message-ID: <{}>\r\nSubject: {}\r\nFrom: Ana <ana@example.com>\r\nDate: {}\r\n\r\n",
+            "{}Message-ID: <{}>\r\nSubject: {}\r\nFrom: Ana <ana@example.com>\r\nDate: {}\r\n\r\n",
+            m.auth
+                .as_deref()
+                .map(|a| format!("Authentication-Results: mx.test; {a}\r\n"))
+                .unwrap_or_default(),
             m.id,
             m.subject,
             m.date.to_rfc2822()
@@ -538,6 +578,14 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|(_, m)| changed_since.is_none_or(|s| m.modseq > s))
                 .map(|(u, m)| (*u, m.flags))
+                .collect())
+        }
+
+        async fn auth_headers(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
+            anyhow::ensure!(!self.offline, "offline");
+            Ok(uids
+                .iter()
+                .filter_map(|u| Some((*u, header(self.current().messages.get(u)?))))
                 .collect())
         }
 
@@ -670,6 +718,53 @@ pub(crate) mod tests {
         let second = sync_folders(&pool, &mut server, source_id).await?;
         assert_eq!(second.unchanged, 1);
         assert_eq!(misdated(pool.clone()).await?, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stores_the_servers_verdict_on_the_sender() -> Result<()> {
+        let (_tmp, pool, source_id) = setup().await?;
+        folder(&pool, source_id, "INBOX", true).await?;
+        let mut server = FakeServer {
+            condstore: true,
+            ..Default::default()
+        };
+        server.add("INBOX", 1, "spoof@x", "Contract", 1);
+        server.folder("INBOX").messages.get_mut(&1).unwrap().auth =
+            Some("arc=none; dmarc=fail header.from=example.com".into());
+        server.add("INBOX", 2, "fine@x", "Lunch", 1);
+        let failures = |pool: SqlitePool| async move {
+            let rows: Vec<(String, Option<String>)> =
+                sqlx::query_as("SELECT external_id, auth_json FROM messages ORDER BY external_id")
+                    .fetch_all(&pool)
+                    .await?;
+            anyhow::Ok(
+                rows.into_iter()
+                    .map(|(id, auth)| {
+                        let auth: crate::mail::suspicion::Auth =
+                            serde_json::from_str(&auth.unwrap_or_default()).unwrap_or_default();
+                        (id, auth.failure())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let expected = vec![
+            ("fine@x".to_string(), None),
+            (
+                "spoof@x".to_string(),
+                Some("example.com didn't authorize its sender (DMARC failed)".to_string()),
+            ),
+        ];
+
+        sync_folders(&pool, &mut server, source_id).await?;
+        assert_eq!(failures(pool.clone()).await?, expected);
+
+        // Rows stored before verdicts were kept get them on the next sync.
+        sqlx::query("UPDATE messages SET auth_json = NULL")
+            .execute(&pool)
+            .await?;
+        sync_folders(&pool, &mut server, source_id).await?;
+        assert_eq!(failures(pool.clone()).await?, expected);
         Ok(())
     }
 

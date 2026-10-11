@@ -184,7 +184,7 @@ pub async fn threads(
                      ORDER BY l2.posted_at DESC LIMIT 1), \
                     (SELECT l2.body FROM live l2 WHERE l2.thread_id = t.id \
                      ORDER BY l2.posted_at DESC LIMIT 1), \
-                    (SELECT l2.received_at FROM live l2 WHERE l2.thread_id = t.id \
+                    (SELECT l2.id FROM live l2 WHERE l2.thread_id = t.id \
                      ORDER BY l2.posted_at DESC LIMIT 1) \
              FROM live l JOIN mail_threads t ON t.id = l.thread_id \
              JOIN sources s ON s.id = t.source_id \
@@ -201,6 +201,8 @@ pub async fn threads(
 
     let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
     let mine = own(pool).await?;
+    let latest: Vec<i64> = rows.iter().filter_map(|r| r.10).collect();
+    let mut warnings = super::suspicion::for_messages(pool, &latest, &mine).await?;
     let authors: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT m.thread_id, p.display_name, p.external_id FROM messages m \
          LEFT JOIN people p ON p.id = m.author_id \
@@ -243,7 +245,7 @@ pub async fn threads(
                 todos,
                 subject,
                 body,
-                received_at,
+                latest_id,
             )| {
                 ThreadSummaryDto {
                     thread_id,
@@ -257,7 +259,9 @@ pub async fn threads(
                     flagged,
                     todo_count: todos,
                     account,
-                    misdated: super::misdated(latest_at, received_at),
+                    warnings: latest_id
+                        .and_then(|id| warnings.remove(&id))
+                        .unwrap_or_default(),
                 }
             },
         )
@@ -280,13 +284,11 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
         bool,
         String,
         bool,
-        Option<i64>,
     )> = sqlx::query_as(
         "SELECT m.id, m.external_id, p.display_name, p.external_id, m.recipients_json, \
                 m.posted_at, m.subject, m.body, m.flags, m.has_attachments, c.name, \
                 EXISTS (SELECT 1 FROM cache.mail_raw r \
-                        WHERE r.source_id = c.source_id AND r.external_id = m.external_id), \
-                m.received_at \
+                        WHERE r.source_id = c.source_id AND r.external_id = m.external_id) \
          FROM messages m JOIN channels c ON c.id = m.channel_id \
          LEFT JOIN people p ON p.id = m.author_id \
          WHERE m.thread_id = ? AND m.removed_at IS NULL \
@@ -313,7 +315,6 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
         attachments,
         folder,
         downloaded,
-        received_at,
     ) in rows
     {
         let folder = leaf(&crate::source::imap_utf7::decode_mailbox_name(&folder)).to_string();
@@ -347,8 +348,7 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
         messages.push(ThreadMessageDto {
             message_id: id,
             from_me,
-            // The user's own mail is theirs, whatever its copies say.
-            misdated: super::misdated(posted_at, received_at).filter(|_| !from_me),
+            warnings: Vec::new(),
             from_name: name,
             from_address: address.filter(|a| a.contains('@')),
             to: shown("to"),
@@ -363,6 +363,12 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
             folders: vec![folder],
             downloaded,
         });
+    }
+
+    let ids: Vec<i64> = messages.iter().map(|m| m.message_id).collect();
+    let mut warnings = super::suspicion::for_messages(pool, &ids, &mine).await?;
+    for m in &mut messages {
+        m.warnings = warnings.remove(&m.message_id).unwrap_or_default();
     }
 
     let todos: Vec<(i64, String, String, Option<i64>)> =

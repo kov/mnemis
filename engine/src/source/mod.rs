@@ -92,6 +92,9 @@ pub struct MailMeta {
     pub headers_only: bool,
     /// When the server received it (IMAP INTERNALDATE).
     pub received_at: Option<DateTime<Utc>>,
+    /// The receiving server's verdict on the sender, when the headers were
+    /// read.
+    pub auth: Option<crate::mail::suspicion::Auth>,
 }
 
 #[derive(Debug)]

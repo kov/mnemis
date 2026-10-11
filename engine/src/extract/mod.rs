@@ -518,7 +518,7 @@ fn batch_system_prompt(
             recipients: m.recipients.clone(),
             subject: m.subject.clone(),
             snippet: tools::snippet(&m.body, SNIPPET_CHARS),
-            misdated: crate::mail::misdated(m.posted_at, m.received_at),
+            warnings: m.warnings.clone(),
         })
         .collect();
     prompt::build(&PromptInputs {
@@ -589,6 +589,10 @@ struct WindowRow {
     links: Vec<crate::source::links::Link>,
     /// When the server received it, if known.
     received_at: Option<i64>,
+    /// The receiving server's verdict on the sender, if known.
+    auth: Option<crate::mail::suspicion::Auth>,
+    /// Signs it isn't from who it claims (see `mail::suspicion`).
+    warnings: Vec<String>,
 }
 
 async fn load_window(
@@ -618,9 +622,10 @@ async fn load_rows(
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT m.id, m.external_id, m.posted_at, m.subject, m.body, p.display_name, \
-             p.external_id, m.recipients_json, m.links_json, m.received_at \
+             p.external_id, m.recipients_json, m.links_json, m.received_at, m.auth_json \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              WHERE m.channel_id = ? AND m.id > ? AND m.reader_only = 0 \
@@ -632,45 +637,61 @@ async fn load_rows(
     .fetch_all(pool)
     .await
     .context("loading window")?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                external_id,
+    let mut out = Vec::with_capacity(rows.len());
+    for (
+        id,
+        external_id,
+        posted_at,
+        subject,
+        body,
+        author_display,
+        author_address,
+        recipients_json,
+        links_json,
+        received_at,
+        auth_json,
+    ) in rows
+    {
+        // Tolerate NULL / malformed recipients_json — recipients are a
+        // triage hint, never load-bearing for correctness.
+        let recipients = recipients_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<Recipient>>(s).ok())
+            .unwrap_or_default();
+        let links: Vec<crate::source::links::Link> = links_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let auth: Option<crate::mail::suspicion::Auth> =
+            auth_json.and_then(|a| serde_json::from_str(&a).ok());
+        let warnings = crate::mail::suspicion::reasons(
+            pool,
+            &crate::mail::suspicion::Facts {
                 posted_at,
-                subject,
-                body,
-                author_display,
-                author_address,
-                recipients_json,
-                links_json,
                 received_at,
-            )| {
-                // Tolerate NULL / malformed recipients_json — recipients are a
-                // triage hint, never load-bearing for correctness.
-                let recipients = recipients_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<Recipient>>(s).ok())
-                    .unwrap_or_default();
-                WindowRow {
-                    id,
-                    external_id,
-                    posted_at,
-                    subject,
-                    body,
-                    author_display,
-                    author_address,
-                    recipients,
-                    links: links_json
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or_default(),
-                    received_at,
-                }
+                auth: auth.as_ref(),
+                links: &links,
+                author_address: author_address.as_deref(),
+                author_name: author_display.as_deref(),
             },
         )
-        .collect())
+        .await?;
+        out.push(WindowRow {
+            id,
+            external_id,
+            posted_at,
+            subject,
+            body,
+            author_display,
+            author_address,
+            recipients,
+            links,
+            received_at,
+            auth,
+            warnings,
+        });
+    }
+    Ok(out)
 }
 
 async fn load_existing_actions(pool: &SqlitePool, channel_id: i64) -> Result<Vec<ExistingAction>> {
@@ -1311,6 +1332,8 @@ mod tests {
             links: Vec::new(),
             recipients: Vec::new(),
             received_at: None,
+            auth: None,
+            warnings: Vec::new(),
         }
     }
 

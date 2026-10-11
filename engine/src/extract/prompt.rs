@@ -35,8 +35,8 @@ pub struct WindowMessage {
     /// The model calls `fetch_messages` to read the full text of any message
     /// that looks like it might carry an ask (metadata-first extraction).
     pub snippet: String,
-    /// Why its date looks forged, if it does (see `mail::misdated`).
-    pub misdated: Option<String>,
+    /// Signs it isn't from who it claims, if any (see `mail::suspicion`).
+    pub warnings: Vec<String>,
 }
 
 pub fn build(inputs: &PromptInputs) -> String {
@@ -184,10 +184,11 @@ pub fn build(inputs: &PromptInputs) -> String {
             out.push_str(&format!("Subject: {s}\n"));
         }
         out.push_str(&format!("Snippet: {}\n", m.snippet));
-        if let Some(why) = &m.misdated {
+        if !m.warnings.is_empty() {
             out.push_str(&format!(
-                "Warning: likely phishing — its Date header is forged ({why}). Don't record \
-                 a to-do from its asks.\n"
+                "Warning: possibly phishing — {}. Weigh this before recording a to-do from \
+                 its asks.\n",
+                m.warnings.join("; ")
             ));
         }
         out.push_str("---\n");
@@ -250,14 +251,14 @@ mod tests {
             recipients: Vec::new(),
             subject: subject.map(str::to_string),
             snippet: snippet.to_string(),
-            misdated: None,
+            warnings: Vec::new(),
         }
     }
 
     #[test]
     fn warns_of_a_forged_date() {
         let mut forged = msg("msg-1", Some("You won"), "Claim your prize");
-        forged.misdated = Some("dated 4 months after it arrived".to_string());
+        forged.warnings = vec!["dated 4 months after it arrived".to_string()];
         let inputs = PromptInputs {
             source_kind: "imap",
             channel_name: "INBOX",
@@ -270,7 +271,7 @@ mod tests {
             window: &[forged, msg("msg-2", Some("Lunch"), "Tomorrow?")],
         };
         let rendered = build(&inputs);
-        assert_eq!(rendered.matches("likely phishing").count(), 1);
+        assert_eq!(rendered.matches("possibly phishing").count(), 1);
         assert!(rendered.contains("dated 4 months after it arrived"));
     }
 
@@ -402,7 +403,7 @@ mod tests {
                 ],
                 subject: Some("Review".to_string()),
                 snippet: "please take a look".to_string(),
-                misdated: None,
+                warnings: Vec::new(),
             }],
         };
         let rendered = build(&inputs);

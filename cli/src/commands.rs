@@ -399,7 +399,9 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
         .map(
             |(external_id, posted_at, subject, body, author, recipients_json, received_at)| {
                 prompt::WindowMessage {
-                    misdated: mnemis_engine::mail::misdated(posted_at, received_at),
+                    warnings: mnemis_engine::mail::misdated(posted_at, received_at)
+                        .into_iter()
+                        .collect(),
                     external_id,
                     posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
                         .unwrap_or_else(Utc::now),

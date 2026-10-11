@@ -29,6 +29,7 @@ pub mod cache;
 pub mod ops;
 pub mod render;
 pub mod search;
+pub mod suspicion;
 pub mod sync;
 pub mod thread;
 pub mod view;

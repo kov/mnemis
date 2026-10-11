@@ -208,11 +208,11 @@ struct ThreadRow: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                if thread.todoCount > 0 || thread.hasAttachments || thread.flagged || thread.misdated != nil {
+                if thread.todoCount > 0 || thread.hasAttachments || thread.flagged || !thread.warnings.isEmpty {
                     HStack(spacing: 6) {
-                        if let why = thread.misdated {
-                            Badge(text: "Suspicious date", systemImage: "exclamationmark.triangle.fill", tint: .orange)
-                                .accessibilityHint("Likely phishing: \(why)")
+                        if !thread.warnings.isEmpty {
+                            Badge(text: "Suspicious", systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                                .accessibilityHint("Possibly phishing: \(thread.warnings.joined(separator: "; "))")
                         }
                         if thread.todoCount > 0 {
                             Badge(text: "\(thread.todoCount) to-do", systemImage: "checklist", tint: .blue)
@@ -377,11 +377,16 @@ private struct MessageCard: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if let why = message.misdated {
-                    Label("Likely phishing: its date is forged (\(why)).", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
+                if !message.warnings.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Possibly phishing:", systemImage: "exclamationmark.triangle.fill")
+                        ForEach(message.warnings, id: \.self) { reason in
+                            Text("• \(reason)").padding(.leading, 22)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 tools
                 MessageBody(messageId: message.messageId, downloaded: downloaded)

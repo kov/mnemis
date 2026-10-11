@@ -310,16 +310,16 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "expected exactly 1 open to-do pill in the inbox, got {badge_count}. text: {inbox_text}"
     );
     // Only the FYI's date is forged.
-    let misdated = client
+    let suspicious = client
         .execute(
-            r#"return String(document.querySelectorAll('.list .trow .pill.misdated').length);"#,
+            r#"return String(document.querySelectorAll('.list .trow .pill.suspicious').length);"#,
             vec![],
         )
         .await?;
     assert_eq!(
-        misdated.as_str(),
+        suspicious.as_str(),
         Some("1"),
-        "expected one suspicious-date pill. text: {inbox_text}"
+        "expected one suspicious pill. text: {inbox_text}"
     );
 
     // Open the to-do-less thread. Its full message isn't downloaded (and

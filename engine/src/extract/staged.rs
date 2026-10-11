@@ -7,16 +7,17 @@
 //! received, a vote cast), resolving it is suggested for the user to confirm.
 //!
 //! Whether the sender looks like an impostor is decided in code, from
-//! signals the model can't judge: a domain the user has never had mail from,
-//! and a sender name that has nothing to do with that domain. A new domain
-//! records the to-do with a warning; with the name on top, the message is a
-//! warning only. A Date header far from the mail's arrival (see
-//! `mail::misdated`) is one more signal, whatever the domain. The name alone means nothing: mailing services, bots and
-//! people at their employer's domain make it common in genuine mail.
+//! signals the model can't judge (see `mail::suspicion`): a forged date, a
+//! sender its domain didn't authorize, misleading links, a domain the user
+//! has never had mail from, and a sender name that has nothing to do with
+//! that domain, counted only with the new domain (alone it means nothing:
+//! mailing services, bots and people at their employer's domain make it
+//! common in genuine mail). One signal records the to-do with a warning; two
+//! make the message a warning only.
 
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
@@ -47,12 +48,6 @@ const IGNORED_KINDS: [&str; 2] = ["marketing", "spam"];
 
 /// The kinds `KIND_SYSTEM` offers.
 const KINDS: [&str; 5] = ["personal", "account", "notification", "marketing", "spam"];
-
-/// "New to the user" means something only against enough history: until the
-/// database holds this many earlier messages, spanning `HISTORY_DAYS`, no
-/// sender is judged (on a fresh install, every one is new).
-const HISTORY_MESSAGES: i64 = 200;
-const HISTORY_DAYS: i64 = 30;
 
 /// Link domains named in a warning.
 const WARNING_LINKS: usize = 3;
@@ -348,6 +343,7 @@ impl Suspicion {
 }
 
 async fn suspicion(pool: &SqlitePool, message: &WindowRow) -> Result<Suspicion> {
+    use crate::mail::suspicion::{first_from_domain, misleading_links, name_unrelated_to_host};
     let mut found = Suspicion {
         signals: crate::mail::misdated(message.posted_at, message.received_at)
             .map(|why| format!("its date is forged ({why})"))
@@ -355,37 +351,22 @@ async fn suspicion(pool: &SqlitePool, message: &WindowRow) -> Result<Suspicion> 
             .collect(),
         links: Vec::new(),
     };
-    let Some(host) = message
-        .author_address
-        .as_deref()
-        .and_then(|a| a.rsplit_once('@'))
-        .map(|(_, d)| d.to_lowercase())
-    else {
+    found
+        .signals
+        .extend(message.auth.as_ref().and_then(|a| a.failure()));
+    let Some(address) = message.author_address.as_deref() else {
         return Ok(found);
     };
-    let (history, oldest): (i64, Option<i64>) =
-        sqlx::query_as("SELECT COUNT(*), MIN(posted_at) FROM messages WHERE posted_at < ?")
-            .bind(message.posted_at)
-            .fetch_one(pool)
-            .await
-            .context("measuring history")?;
-    if history < HISTORY_MESSAGES
-        || oldest.is_none_or(|t| t > message.posted_at - HISTORY_DAYS * 86_400)
-    {
+    let Some(host) = address.rsplit_once('@').map(|(_, d)| d.to_lowercase()) else {
         return Ok(found);
-    }
+    };
     let domain = registrable(&host);
-    let (earlier,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages m JOIN people p ON p.id = m.author_id \
-         WHERE (p.external_id LIKE '%@' || ?1 OR p.external_id LIKE '%.' || ?1) \
-         AND m.posted_at < ?2",
-    )
-    .bind(&domain)
-    .bind(message.posted_at)
-    .fetch_one(pool)
-    .await
-    .context("loading sender history")?;
-    if earlier > 0 {
+    if let Some((shown, to)) = misleading_links(&message.links, Some(&domain)).first() {
+        found
+            .signals
+            .push(format!("a link showing {shown} leads to {to}"));
+    }
+    if !first_from_domain(pool, address, message.posted_at).await? {
         return Ok(found);
     }
     found
@@ -405,31 +386,6 @@ async fn suspicion(pool: &SqlitePool, message: &WindowRow) -> Result<Suspicion> 
         }
     }
     Ok(found)
-}
-
-/// Whether a sender's name reads like someone other than its address's
-/// host: none of its words (of four letters or more) appears in the host,
-/// as "Bradesco Net Empresas" from `suporte5.ux6qrc.com` does, nor does the
-/// registered domain appear in the name ("SpaceXAI" from `x.ai`).
-fn name_unrelated_to_host(name: &str, host: &str) -> bool {
-    let fold = |s: &str| -> String {
-        s.to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
-            .collect()
-    };
-    if name.contains('@') {
-        return false;
-    }
-    let domain: String = fold(&registrable(host)).split_whitespace().collect();
-    let host: String = fold(host).split_whitespace().collect();
-    let name = fold(name);
-    let words: Vec<&str> = name.split_whitespace().filter(|w| w.len() >= 4).collect();
-    let joined: String = name.split_whitespace().collect();
-    !words.is_empty()
-        && !words.iter().any(|w| host.contains(w))
-        && !host.contains(&joined)
-        && !joined.contains(&domain)
 }
 
 /// A record_action call with the warning ahead of its details.
@@ -601,7 +557,8 @@ fn action_system(ctx: &Context<'_>, external_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{distinctive_words, name_unrelated_to_host, parse_kind, with_caution};
+    use super::{distinctive_words, parse_kind, with_caution};
+    use crate::mail::suspicion::name_unrelated_to_host;
 
     #[tokio::test]
     async fn a_forged_date_is_a_signal_whatever_the_sender() -> anyhow::Result<()> {
@@ -620,6 +577,8 @@ mod tests {
             recipients: Vec::new(),
             links: Vec::new(),
             received_at: Some(arrived),
+            auth: None,
+            warnings: Vec::new(),
         };
         let found = super::suspicion(&pool, &message).await?;
         assert_eq!(

@@ -178,6 +178,12 @@ async fn store_message(
         .map(serde_json::to_string)
         .transpose()
         .context("serializing links")?;
+    let auth_json = mail
+        .auth
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serializing the sender's authentication")?;
 
     let existing: Option<(i64, bool, bool, Option<i64>)> = sqlx::query_as(
         "SELECT id, reader_only, has_body, thread_id FROM messages \
@@ -200,6 +206,7 @@ async fn store_message(
                  references_json = COALESCE(references_json, ?), \
                  size = COALESCE(?, size), \
                  received_at = COALESCE(?, received_at), \
+                 auth_json = COALESCE(?, auth_json), \
                  flags = CASE WHEN ? THEN ? ELSE flags END, \
                  body = CASE WHEN ? THEN ? ELSE body END, \
                  links_json = CASE WHEN ? THEN ? ELSE links_json END, \
@@ -214,6 +221,7 @@ async fn store_message(
         .bind(references_json.as_deref())
         .bind(mail.size.map(i64::from))
         .bind(mail.received_at.map(|t| t.timestamp()))
+        .bind(auth_json.as_deref())
         .bind(msg.mail.is_some())
         .bind(msg.flags as i64)
         .bind(fill_body)
@@ -241,8 +249,8 @@ async fn store_message(
          (channel_id, external_id, parent_external_id, author_id, posted_at, \
           subject, body, body_format, recipients_json, links_json, raw_json, flags, \
           ingested_at, uid, uidvalidity, in_reply_to, references_json, size, \
-          has_attachments, has_body, reader_only, received_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+          has_attachments, has_body, reader_only, received_at, auth_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(channel_id)
     .bind(&msg.external_id)
@@ -266,6 +274,7 @@ async fn store_message(
     .bind(has_body)
     .bind(reader_only)
     .bind(mail.received_at.map(|t| t.timestamp()))
+    .bind(auth_json.as_deref())
     .fetch_one(&mut **tx)
     .await
     .context("inserting message")?;
@@ -479,6 +488,7 @@ mod tests {
             has_attachments: false,
             headers_only,
             received_at: None,
+            auth: None,
         });
         m.raw = (!headers_only).then(|| format!("Message-ID: <{id}>\r\n\r\nthe body").into_bytes());
         m

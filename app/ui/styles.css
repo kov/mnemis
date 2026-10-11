@@ -1502,6 +1502,7 @@ h1 {
   font-size: var(--fs-12);
   padding: 0 14px 8px 58px;
 }
+.msg-warning ul { margin: 2px 0 0; padding-left: 18px; }
 .more-button { font-size: 16px; line-height: 1; }
 .menu-backdrop {
   position: fixed;

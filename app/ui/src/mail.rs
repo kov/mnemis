@@ -316,13 +316,14 @@ fn ThreadRow(thread: ThreadSummaryDto, selected: RwSignal<Option<i64>>) -> impl 
             {(thread.todo_count > 0
                 || thread.has_attachments
                 || thread.flagged
-                || thread.misdated.is_some())
+                || !thread.warnings.is_empty())
             .then(|| view! {
                 <span class="tags">
-                    {thread.misdated.clone().map(|why| view! {
-                        <span class="pill warn misdated" title=format!("Likely phishing: {why}")>
+                    {(!thread.warnings.is_empty()).then(|| view! {
+                        <span class="pill warn suspicious"
+                            title=format!("Possibly phishing: {}", thread.warnings.join("; "))>
                             // Text presentation: the emoji glyph is wider.
-                            "\u{26A0}\u{FE0E}"<span>"Suspicious date"</span>
+                            "\u{26A0}\u{FE0E}"<span>"Suspicious"</span>
                         </span>
                     })}
                     {(thread.todo_count > 0).then(|| view! {
@@ -512,7 +513,7 @@ fn MessageCard(
     };
     let folders = msg.folders.join(", ");
     let snippet = msg.snippet.clone();
-    let misdated = msg.misdated.clone();
+    let warnings = msg.warnings.clone();
 
     view! {
         <div class="msg-card" class:open=expanded class:unread=move || !seen.get()
@@ -531,8 +532,11 @@ fn MessageCard(
             </div>
             <Show when=expanded fallback=|| ()>
                 {(!recipients.is_empty()).then(|| view! { <div class="msg-to">{recipients.clone()}</div> })}
-                {misdated.clone().map(|why| view! {
-                    <div class="msg-warning">{format!("\u{26A0} Likely phishing: its date is forged ({why}).")}</div>
+                {(!warnings.is_empty()).then(|| view! {
+                    <div class="msg-warning">
+                        "\u{26A0}\u{FE0E} Possibly phishing:"
+                        <ul>{warnings.iter().map(|w| view! { <li>{w.clone()}</li> }).collect_view()}</ul>
+                    </div>
                 })}
                 <div class="msg-tools">
                     <button class="btn btn-ghost btn-sm btn-icon" data-action="reply" title="Reply"
