@@ -233,8 +233,10 @@ fn clean_html(html: &str, inline: HashMap<String, String>) -> (String, u32) {
         .link_rel(Some("noopener noreferrer"))
         .set_tag_attribute_value("a", "target", "_blank")
         .attribute_filter(move |element, attribute, value| {
-            let is_url = matches!(attribute, "src" | "background")
-                || (element == "img" && attribute == "srcset");
+            // The filter also sees elements ammonia goes on to drop (frames,
+            // media): only images and backgrounds survive to load anything.
+            let is_url = (element == "img" && matches!(attribute, "src" | "srcset"))
+                || attribute == "background";
             if is_url {
                 if let Some(cid) = value.strip_prefix("cid:") {
                     return inline
@@ -348,13 +350,18 @@ fn document(body: &str, is_html: bool, allow_remote: bool) -> String {
     } else {
         "data:"
     };
-    let scheme = if is_html { "light" } else { "light dark" };
+    // HTML mail assumes a white page; the frame is transparent otherwise.
+    let (scheme, page) = if is_html {
+        ("light", "html{background:#fff;color:#000}")
+    } else {
+        ("light dark", "")
+    };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
          img-src {images}; style-src 'unsafe-inline'; font-src data:\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <style>:root{{color-scheme:{scheme}}}\
+         <style>:root{{color-scheme:{scheme}}}{page}\
          body{{margin:0;padding:12px 16px;font:15px/1.45 -apple-system,system-ui,sans-serif;\
          overflow-wrap:anywhere}}\
          img{{max-width:100%;height:auto}}\
@@ -383,13 +390,19 @@ mod tests {
                  <p onclick=\"steal()\" style=\"color:blue\">Hello</p>\
                  <script>steal()</script><img src=\"https://t.example/pixel.gif\">\
                  <form action=\"https://evil\"><input name=pw></form>\
-                 <a href=\"https://example.com\">link</a>",
+                 <a href=\"https://example.com\">link</a>\
+                 <meta http-equiv=\"refresh\" content=\"0;url=https://t.example/\">\
+                 <iframe src=\"https://t.example/\"></iframe>",
             ),
             false,
         );
         assert!(r.complete);
         assert!(!r.html.contains("steal"), "scripts and handlers are gone");
         assert!(!r.html.contains("<form") && !r.html.contains("<input"));
+        assert!(
+            !r.html.contains("refresh") && !r.html.contains("<iframe"),
+            "no navigation"
+        );
         assert!(r.html.contains("p{color:red}"), "stylesheets stay");
         assert!(r.html.contains("style=\"color:blue\""));
         assert!(
