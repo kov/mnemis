@@ -4,6 +4,27 @@ import Network
 import Observation
 import SwiftUI
 
+/// Asks iOS for time to finish work if the user leaves the app midway (it
+/// grants about 30 seconds); without it the work freezes until they come
+/// back, and its server connections die meanwhile.
+@MainActor
+final class FinishInBackground {
+    private var id = UIBackgroundTaskIdentifier.invalid
+
+    init(_ name: String) {
+        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            // Out of time: the work freezes where it is.
+            MainActor.assumeIsolated { self?.end() }
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
+    }
+}
+
 enum AppTab: Hashable {
     case actions
     case chat
@@ -265,6 +286,8 @@ final class AppModel {
         guard let engine, !isSyncingMail else { return }
         isSyncingMail = true
         defer { isSyncingMail = false }
+        let finishing = FinishInBackground("mail sync")
+        defer { finishing.end() }
         do {
             let errors = try await engine.syncMail()
             if !errors.isEmpty {
@@ -292,6 +315,8 @@ final class AppModel {
         guard let engine, !isFindingToDos else { return }
         isFindingToDos = true
         defer { isFindingToDos = false }
+        let finishing = FinishInBackground("finding to-dos")
+        defer { finishing.end() }
         do {
             let outcome = try await engine.findToDos()
             lastSync = outcome
