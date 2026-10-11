@@ -67,6 +67,10 @@ block2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # iOS apps only have the data-protection keychain, scoped to the app, so plain
 # generic passwords need neither the macOS opt-in nor a biometric gate.
 security-framework = "3.7.0"
+# For the one keychain call the wrapper lacks: making items readable after
+# first unlock (`SecItemUpdate` of `kSecAttrAccessible`), for background sync.
+security-framework-sys = "2.17.0"
+core-foundation = "0.10.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

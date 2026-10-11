@@ -14,7 +14,8 @@
 //!   `errSecMissingEntitlement (-34018)`.
 //! - **iOS:** the same Keychain Services calls. iOS only has the
 //!   data-protection keychain and scopes it to the app, so there is no opt-in
-//!   and no biometric gate.
+//!   and no biometric gate. Items are readable after the first unlock (see
+//!   [`readable_in_background`]), so background sync works while locked.
 //! - **everything else (Linux):** the freedesktop Secret Service over D-Bus
 //!   (`secret-service`), with attributes `application=mnemis`, `ref=<reference>`.
 //!
@@ -29,6 +30,8 @@ const APPLICATION: &str = "mnemis";
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub use secret_service_backend::{delete, fetch, store};
 
+#[cfg(target_os = "ios")]
+pub use keychain_backend::readable_in_background;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use keychain_backend::{delete, fetch, store};
 
@@ -154,7 +157,54 @@ mod keychain_backend {
                 .map_err(|e| anyhow::anyhow!("storing secret in keychain: {e}"))
         })
         .await
-        .context("keychain store task panicked")?
+        .context("keychain store task panicked")??;
+        #[cfg(target_os = "ios")]
+        readable_in_background().await?;
+        Ok(())
+    }
+
+    /// Make every mnemis item readable from the first unlock after a restart
+    /// until the next restart (`AfterFirstUnlockThisDeviceOnly`), rather than
+    /// only while unlocked, so a background sync on a locked device can read
+    /// the passwords. One in-place update, so no secret is ever removed; a
+    /// no-op once done.
+    #[cfg(target_os = "ios")]
+    pub async fn readable_in_background() -> Result<()> {
+        use core_foundation::base::TCFType;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::{CFString, CFStringRef};
+        use security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+        use security_framework_sys::item::{kSecAttrService, kSecClass, kSecClassGenericPassword};
+        use security_framework_sys::keychain_item::SecItemUpdate;
+
+        unsafe extern "C" {
+            static kSecAttrAccessible: CFStringRef;
+        }
+
+        tokio::task::spawn_blocking(|| {
+            // SAFETY: the keys and values are Security.framework's constant
+            // CFStrings, valid for the process's lifetime.
+            let status = unsafe {
+                let key = |k: CFStringRef| CFString::wrap_under_get_rule(k);
+                let query = CFDictionary::from_CFType_pairs(&[
+                    (key(kSecClass), key(kSecClassGenericPassword)),
+                    (key(kSecAttrService), CFString::new(APPLICATION)),
+                ]);
+                let update = CFDictionary::from_CFType_pairs(&[(
+                    key(kSecAttrAccessible),
+                    key(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly),
+                )]);
+                SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef())
+            };
+            match status {
+                0 | ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+                status => Err(anyhow::anyhow!(
+                    "making secrets readable in the background: OSStatus {status}"
+                )),
+            }
+        })
+        .await
+        .context("keychain update task panicked")?
     }
 
     pub async fn fetch(reference: &str) -> Result<String> {

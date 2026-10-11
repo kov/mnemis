@@ -1,3 +1,4 @@
+import BackgroundTasks
 import Foundation
 import Network
 import Observation
@@ -56,20 +57,32 @@ final class AppModel {
     private(set) var mailVersion = 0
     private(set) var isSyncingMail = false
     private let network = NWPathMonitor()
+    /// `start` ran (a background wake-up opens the engine without it).
+    private var started = false
+
+    /// Open the engine (once); the launch and a background wake-up both
+    /// start here.
+    private func openEngine() async throws -> Engine {
+        if let engine { return engine }
+        let engine = try await Engine.open(
+            dataDir: Self.dataDirectory.path,
+            cacheDir: Self.cacheDirectory.path,
+            apple: AppleIntelligence()
+        )
+        self.engine = engine
+        try await defaultToAppleIntelligence(engine)
+        watchNetwork(engine)
+        return engine
+    }
 
     func start() async {
-        guard engine == nil else { return }
+        guard !started else { return }
+        started = true
         do {
-            let engine = try await Engine.open(
-                dataDir: Self.dataDirectory.path,
-                cacheDir: Self.cacheDirectory.path,
-                apple: AppleIntelligence()
-            )
-            self.engine = engine
-            try await defaultToAppleIntelligence(engine)
-            watchNetwork(engine)
+            let engine = try await openEngine()
             await refresh()
-            Task { await syncMail() }
+            // Always a full sync at launch: new mail, then to-dos.
+            Task { await sync(userInitiated: false) }
             #if DEBUG
             // `-MnemisOpenURL mnemis://…` at launch opens that screen, so the
             // simulator can be driven without taps (and without the
@@ -278,6 +291,38 @@ final class AppModel {
         mailVersion += 1
     }
 
+    static let backgroundSyncTask = "br.eti.noronha.mnemis.sync"
+
+    /// Ask iOS to wake the app for a sync in about 15 minutes; iOS decides
+    /// when, if at all.
+    nonisolated static func scheduleBackgroundSync() {
+        let request = BGAppRefreshTaskRequest(identifier: backgroundSyncTask)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            print("[sync] background sync not scheduled: \(error)")
+        }
+    }
+
+    /// A background wake-up: mail always, and to-dos when the model can run
+    /// in the background (Claude or omlx; the on-device model stalls there,
+    /// so it waits for the next launch). iOS gives this about 30 seconds.
+    func backgroundSync() async {
+        Self.scheduleBackgroundSync()
+        do {
+            let engine = try await openEngine()
+            let llm = try await engine.llmConfig()
+            if llm.provider == .appleIntelligence || llm.chatModel.isEmpty {
+                await syncMail()
+            } else {
+                await sync(userInitiated: false)
+            }
+        } catch {
+            print("[sync] background sync failed: \(error)")
+        }
+    }
+
     /// Ask the agent to turn an email into a to-do; true once it has.
     func toDo(fromMessage id: Int64) async -> Bool {
         guard let engine else { return false }
@@ -302,7 +347,10 @@ final class AppModel {
         network.start(queue: .global(qos: .utility))
     }
 
-    func sync() async {
+    /// New mail, then to-dos. Errors show when the user asked for it (Sync);
+    /// the launch and background syncs only log them, as the desktop's
+    /// scheduled ones do.
+    func sync(userInitiated: Bool = true) async {
         guard let engine, !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
@@ -310,10 +358,14 @@ final class AppModel {
             let outcome = try await engine.syncNow()
             lastSync = outcome
             if !outcome.errors.isEmpty {
-                errorMessage = outcome.errors.joined(separator: "\n")
+                print("[sync] \(outcome.errors.joined(separator: "; "))")
+                if userInitiated {
+                    errorMessage = outcome.errors.joined(separator: "\n")
+                }
             }
         } catch {
-            report(error)
+            print("[sync] failed: \(error)")
+            if userInitiated { report(error) }
         }
         await refresh()
     }

@@ -203,6 +203,12 @@ impl Engine {
             std::fs::create_dir_all(&data_dir)?;
             let pool = db::open_with_cache(&data_dir.join("mnemis.db"), &cache).await?;
             db::migrate(&pool).await?;
+            // Passwords saved before background sync existed were readable
+            // only while unlocked; the app opens in the foreground, unlocked.
+            #[cfg(target_os = "ios")]
+            if let Err(e) = mnemis_engine::secrets::readable_in_background().await {
+                tracing::warn!(error = %format!("{e:#}"), "keychain items stay unlock-only");
+            }
             // A missing or unusable LLM config leaves the app usable read-only;
             // only sync needs it.
             let llm = match config::load(Some(&data_dir.join("config.toml"))) {
