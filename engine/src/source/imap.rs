@@ -246,21 +246,7 @@ impl Source for ImapSource {
             .with_context(|| format!("failed to examine mailbox: {channel_external_id}"))?;
         let server_validity = mailbox.uid_validity.context("missing UIDVALIDITY")?;
 
-        let uid = if let Some(rest) = message_external_id.strip_prefix("imap-uid-") {
-            let (_, uid_str) = rest
-                .split_once('-')
-                .context("malformed imap-uid-VALIDITY-UID id")?;
-            uid_str
-                .parse::<u32>()
-                .context("malformed UID in imap-uid id")?
-        } else {
-            let uids: Vec<u32> = session
-                .uid_search(&format!("HEADER Message-ID {message_external_id}"))
-                .await?
-                .into_iter()
-                .collect();
-            *uids.first().context("message not found")?
-        };
+        let uid = find_uid(&mut session, message_external_id).await?;
 
         let fetches: Vec<_> = session
             .uid_fetch(&uid.to_string(), "(UID FLAGS BODY.PEEK[])")
@@ -309,6 +295,62 @@ impl ImapSource {
     /// The links of every message in a mailbox dated `since` or later, by
     /// Message-ID: one session, bodies fetched in chunks. For filling in
     /// messages ingested before links were kept.
+    /// A message's raw RFC 822 bytes, for replying with its headers and
+    /// forwarding it whole.
+    pub async fn fetch_raw(
+        &self,
+        channel_external_id: &str,
+        message_external_id: &str,
+    ) -> Result<Vec<u8>> {
+        let mut session = self.connect().await?;
+        session
+            .examine(channel_external_id)
+            .await
+            .with_context(|| format!("failed to examine mailbox: {channel_external_id}"))?;
+        let uid = find_uid(&mut session, message_external_id).await?;
+        let fetches: Vec<_> = session
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+            .await?
+            .try_collect()
+            .await?;
+        let raw = fetches
+            .first()
+            .and_then(|f| f.body())
+            .context("no fetch result")?
+            .to_vec();
+        let _ = session.logout().await;
+        Ok(raw)
+    }
+
+    /// File a copy of mail the user sent in their sent folder, marked read.
+    /// The one write mnemis makes over IMAP, and only when the account asks
+    /// for it: SMTP servers don't all keep what they relay.
+    pub async fn append_to_sent(&self, raw: &[u8]) -> Result<()> {
+        let mut session = self.connect().await?;
+        let names: Vec<_> = session
+            .list(Some(""), Some("*"))
+            .await?
+            .try_collect()
+            .await?;
+        let sent = names
+            .iter()
+            .find(|n| n.attributes().contains(&NameAttribute::Sent))
+            .or_else(|| {
+                names.iter().find(|n| {
+                    subscribed_by_default(n.name(), false)
+                        && !n.name().eq_ignore_ascii_case("INBOX")
+                })
+            })
+            .map(|n| n.name().to_string())
+            .context("no sent folder on the server")?;
+        session
+            .append(&sent, Some("(\\Seen)"), None, raw)
+            .await
+            .with_context(|| format!("failed to file the sent copy in {sent}"))?;
+        let _ = session.logout().await;
+        Ok(())
+    }
+
     pub async fn links_since(
         &self,
         channel_external_id: &str,
@@ -347,6 +389,25 @@ impl ImapSource {
         let _ = session.logout().await;
         Ok(out)
     }
+}
+
+/// The UID of a message in the examined mailbox, from its external id: the
+/// UID itself for `imap-uid-VALIDITY-UID` ids, else a Message-ID search.
+async fn find_uid(session: &mut ImapSession, message_external_id: &str) -> Result<u32> {
+    if let Some(rest) = message_external_id.strip_prefix("imap-uid-") {
+        let (_, uid_str) = rest
+            .split_once('-')
+            .context("malformed imap-uid-VALIDITY-UID id")?;
+        return uid_str
+            .parse::<u32>()
+            .context("malformed UID in imap-uid id");
+    }
+    let uids: Vec<u32> = session
+        .uid_search(format!("HEADER Message-ID {message_external_id}"))
+        .await?
+        .into_iter()
+        .collect();
+    uids.first().copied().context("message not found")
 }
 
 fn parse_author(addr: Option<&mail_parser::Address>) -> Option<ImportedAuthor> {

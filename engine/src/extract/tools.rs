@@ -314,6 +314,17 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             update_action_params(),
         ),
         ToolDef::function(
+            "draft_email".to_string(),
+            "Draft an email for the user: a new one, or a reply, reply-all or forward of a \
+             message by its external_id. The draft is shown to the user, who reviews, edits and \
+             sends it — you cannot send mail. For replies and forwards, write only the new text: \
+             the recipients, subject and the quoted or forwarded original are filled in, and \
+             to/cc/subject override them only when given. Returns the draft's id and how it is \
+             addressed."
+                .to_string(),
+            draft_email_params(),
+        ),
+        ToolDef::function(
             "search_conversation".to_string(),
             "Keyword search THIS conversation's own earlier turns — use it when the summary at \
              the top of the conversation isn't specific enough and you need to recall what was \
@@ -332,6 +343,24 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             recall_turns_params(),
         ),
     ]
+}
+
+fn draft_email_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "enum": ["new", "reply", "reply_all", "forward"] },
+            "message_external_id": {
+                "type": "string",
+                "description": "the message replied to or forwarded; required unless kind is new"
+            },
+            "to": { "type": "string", "description": "comma-separated addresses" },
+            "cc": { "type": "string", "description": "comma-separated addresses" },
+            "subject": { "type": "string" },
+            "body": { "type": "string", "description": "the text the user is sending, in their voice" }
+        },
+        "required": ["kind", "body"]
+    })
 }
 
 fn search_conversation_params() -> serde_json::Value {

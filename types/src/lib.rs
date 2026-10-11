@@ -508,6 +508,108 @@ pub struct ChatDto {
     pub archived: bool,
 }
 
+/// What an outgoing mail is: written from scratch, or answering or passing on
+/// a message the user received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftKind {
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
+}
+
+impl DraftKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Reply => "reply",
+            Self::ReplyAll => "reply_all",
+            Self::Forward => "forward",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "new" => Some(Self::New),
+            "reply" => Some(Self::Reply),
+            "reply_all" => Some(Self::ReplyAll),
+            "forward" => Some(Self::Forward),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftStatus {
+    Draft,
+    Sent,
+    Discarded,
+}
+
+impl DraftStatus {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "draft" => Some(Self::Draft),
+            "sent" => Some(Self::Sent),
+            "discarded" => Some(Self::Discarded),
+            _ => None,
+        }
+    }
+}
+
+/// An outgoing mail, composed by the user or drafted by the chat agent. Only
+/// the user sends it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftDto {
+    pub id: i64,
+    /// The account it is sent from.
+    pub source_id: Option<i64>,
+    pub kind: DraftKind,
+    /// The message replied to or forwarded.
+    pub message_id: Option<i64>,
+    /// The chat whose agent drafted it.
+    pub chat_id: Option<i64>,
+    /// The sender as it will appear, "Name <address>"; empty when the account
+    /// can't send.
+    pub from: String,
+    /// Comma-separated addresses, as typed.
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub status: DraftStatus,
+    /// Why the last send failed.
+    pub error: Option<String>,
+    /// Drafted by the chat agent rather than the user.
+    pub by_agent: bool,
+    /// Unix seconds.
+    pub updated_at: i64,
+    pub sent_at: Option<i64>,
+}
+
+/// How a mail account sends. Until saved, the values are guessed from its
+/// IMAP settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmtpSettingsDto {
+    pub source_id: i64,
+    pub server: String,
+    pub port: u16,
+    /// STARTTLS on a plain connection instead of TLS from the start.
+    pub starttls: bool,
+    pub username: String,
+    /// A password of its own is stored, rather than the IMAP one reused.
+    pub own_password: bool,
+    pub from_name: String,
+    pub from_address: String,
+    /// File a copy of sent mail in the account's sent folder.
+    pub save_sent: bool,
+    /// False while the values are only guesses.
+    pub saved: bool,
+}
+
 /// One turn in a chat transcript. A single model response may produce several
 /// turns: an assistant message, plus one row per tool call (role `'assistant'`,
 /// `tool_name`/`tool_call_id` set, `content` = arguments) and one per tool

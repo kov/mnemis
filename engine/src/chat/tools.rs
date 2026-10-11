@@ -31,6 +31,16 @@ struct RecallTurnsArgs {
     turn_ids: Vec<i64>,
 }
 
+#[derive(Deserialize)]
+struct DraftEmailArgs {
+    kind: String,
+    message_external_id: Option<String>,
+    to: Option<String>,
+    cc: Option<String>,
+    subject: Option<String>,
+    body: String,
+}
+
 /// Dispatch a chat tool call. The conversation-scoped recall tools are handled
 /// here (they need `chat_id`); every other tool falls through to the shared
 /// extraction dispatcher at `Global` scope (the chat ranges over all sources).
@@ -48,6 +58,13 @@ pub(crate) async fn dispatch(
         },
         "recall_turns" => DispatchOutput {
             output: recall_turns(pool, chat_id, arguments).await,
+            recorded_action: false,
+        },
+        "draft_email" => DispatchOutput {
+            output: match draft_email(pool, chat_id, arguments).await {
+                Ok(json) => json,
+                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+            },
             recorded_action: false,
         },
         _ => tools::dispatch(pool, ToolScope::Global, fetch_budget, name, arguments).await,
@@ -116,6 +133,55 @@ async fn recall_turns(pool: &SqlitePool, chat_id: i64, arguments: &str) -> Strin
         }));
     }
     json!({ "turns": turns, "truncated": truncated }).to_string()
+}
+
+/// Write a draft for the user to review and send: prefilled like one they
+/// start themselves, with the agent's text above the quoted original.
+async fn draft_email(pool: &SqlitePool, chat_id: i64, arguments: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use mnemis_types::DraftKind;
+
+    let args: DraftEmailArgs =
+        serde_json::from_str(arguments).context("parsing draft_email args")?;
+    let kind =
+        DraftKind::parse(&args.kind).with_context(|| format!("unknown kind {:?}", args.kind))?;
+    let message_id = match (kind, args.message_external_id.as_deref()) {
+        (DraftKind::New, _) => None,
+        (_, None) => anyhow::bail!("message_external_id is required for a {}", args.kind),
+        (_, Some(external_id)) => {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM messages WHERE external_id = ? ORDER BY posted_at DESC LIMIT 1",
+            )
+            .bind(external_id)
+            .fetch_optional(pool)
+            .await?;
+            Some(row.with_context(|| format!("no message {external_id}"))?.0)
+        }
+    };
+    let postbox = crate::mail::Network { pool };
+    let id =
+        crate::mail::start_draft(pool, &postbox, kind, message_id, Some(chat_id), true).await?;
+    let mut draft = crate::mail::get_draft(pool, id).await?;
+    if let Some(to) = args.to.filter(|t| !t.trim().is_empty()) {
+        draft.to = to;
+    }
+    if let Some(cc) = args.cc {
+        draft.cc = cc;
+    }
+    if let Some(subject) = args.subject.filter(|s| !s.trim().is_empty()) {
+        draft.subject = subject;
+    }
+    draft.body = format!("{}{}", args.body.trim_end(), draft.body);
+    crate::mail::save_draft(pool, &draft).await?;
+    Ok(json!({
+        "draft_id": id,
+        "from": draft.from,
+        "to": draft.to,
+        "cc": draft.cc,
+        "subject": draft.subject,
+        "status": "shown to the user to review and send; it has not been sent",
+    })
+    .to_string())
 }
 
 /// Truncate to `max` chars, reporting whether anything was cut. Preserves

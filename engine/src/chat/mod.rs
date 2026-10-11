@@ -1197,6 +1197,73 @@ mod tests {
         assert_eq!(events, 1, "a 'created' audit event should be written");
     }
 
+    #[tokio::test]
+    async fn agent_drafts_a_reply_but_never_sends_it() {
+        let tmp = TempDir::new().unwrap();
+        let pool = db::open(&tmp.path().join("t.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let ctx = seed_minimal(&pool).await.unwrap();
+        seed_messages(
+            &pool,
+            ctx.source_id,
+            ctx.channel_id,
+            &[SeedMessage {
+                external_id: "m1@example.com",
+                author_email: "ana@example.com",
+                author_name: "Ana",
+                subject: "Renewal",
+                body: "Can you renew the cert before Friday?",
+                recipients: &[],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let args = serde_json::json!({
+            "kind": "reply",
+            "message_external_id": "m1@example.com",
+            "body": "Sure, I'll do it Thursday.",
+        });
+        let llm = crate::test_util::MockLlm::new(vec![
+            mock::turn(vec![crate::llm::OutputItem::FunctionCall {
+                call_id: "mock-call".to_string(),
+                name: "draft_email".to_string(),
+                arguments: args.to_string(),
+            }]),
+            mock::no_tools("Here's a reply for you to review."),
+        ]);
+        let chat = store::create_chat(&pool, None, None).await.unwrap();
+        let (_events, sink) = collector();
+        run_chat_turn(
+            &pool,
+            &llm,
+            "system",
+            chat,
+            "tell Ana I'll do it Thursday",
+            100_000,
+            1_000_000,
+            Duration::from_secs(60),
+            None,
+            &sink,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (id, status, chat_id): (i64, String, i64) =
+            sqlx::query_as("SELECT id, status, chat_id FROM drafts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), chat_id), ("draft", chat));
+        let draft = crate::mail::get_draft(&pool, id).await.unwrap();
+        assert!(draft.by_agent);
+        assert_eq!(draft.to, "Ana <ana@example.com>");
+        assert_eq!(draft.subject, "Re: Renewal");
+        assert!(draft.body.starts_with("Sure, I'll do it Thursday."));
+        assert!(draft.body.contains("> Can you renew the cert"));
+    }
+
     /// Summarizer calls (tool-less) return a fixed recap; chat turns (with
     /// tools) return a fixed answer. Lets a compaction test run regardless of
     /// how many summarizer chunks the fold takes.

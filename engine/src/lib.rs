@@ -7,6 +7,7 @@ pub mod embed;
 pub mod extract;
 pub mod ingest;
 pub mod llm;
+pub mod mail;
 pub mod maintenance;
 pub mod memory;
 pub mod mutations;

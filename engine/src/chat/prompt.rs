@@ -36,7 +36,10 @@ pub fn render(inputs: &RenderInputs) -> String {
          When the user explicitly asks you to track, complete, or change something, act on it — \
          use high confidence so the change applies immediately. When you are merely suggesting \
          something, use medium or low confidence so the user can confirm it. Never invent to-dos \
-         or evidence; if you can't find support for a claim, say so plainly.\n\n",
+         or evidence; if you can't find support for a claim, say so plainly.\n\n\
+         When the user wants to write, answer or pass on an email, draft it with draft_email, \
+         in their voice and in the language of the thread. You cannot send mail: the draft \
+         appears to the user, who reviews and sends it. Never say an email was sent.\n\n",
     );
 
     out.push_str("# You are helping\n");
