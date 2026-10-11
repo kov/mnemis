@@ -56,6 +56,7 @@ final class AppModel {
     /// lists reload.
     private(set) var mailVersion = 0
     private(set) var isSyncingMail = false
+    private(set) var isFindingToDos = false
     private let network = NWPathMonitor()
     /// `start` ran (a background wake-up opens the engine without it).
     private var started = false
@@ -257,10 +258,11 @@ final class AppModel {
     }
 
     /// Mail only: new mail, flags and removals in every folder, without
-    /// looking for to-dos. Errors show when the user asked for it (pull to
-    /// refresh); the launch sync only logs them.
+    /// looking for to-dos, so it never waits on the model. Errors show when
+    /// the user asked for it (pull to refresh); the launch sync only logs
+    /// them.
     func syncMail(userInitiated: Bool = false) async {
-        guard let engine, !isSyncingMail, !isSyncing else { return }
+        guard let engine, !isSyncingMail else { return }
         isSyncingMail = true
         defer { isSyncingMail = false }
         do {
@@ -276,6 +278,34 @@ final class AppModel {
             report(error)
         }
         mailVersion += 1
+    }
+
+    /// Pull to refresh on mail: the mail now, then to-dos in the background.
+    func refreshMail() async {
+        await syncMail(userInitiated: true)
+        Task { await findToDos(userInitiated: false) }
+    }
+
+    /// Look for to-dos in mail synced but not yet read by the model, then
+    /// sync the calendar. Skipped without a model.
+    func findToDos(userInitiated: Bool) async {
+        guard let engine, !isFindingToDos else { return }
+        isFindingToDos = true
+        defer { isFindingToDos = false }
+        do {
+            let outcome = try await engine.findToDos()
+            lastSync = outcome
+            if !outcome.errors.isEmpty {
+                print("[sync] \(outcome.errors.joined(separator: "; "))")
+                if userInitiated {
+                    errorMessage = outcome.errors.joined(separator: "\n")
+                }
+            }
+        } catch {
+            print("[sync] to-dos: \(error)")
+            if userInitiated { report(error) }
+        }
+        await refresh()
     }
 
     /// Marks messages read or unread here at once; the server hears in the
@@ -347,27 +377,16 @@ final class AppModel {
         network.start(queue: .global(qos: .utility))
     }
 
-    /// New mail, then to-dos. Errors show when the user asked for it (Sync);
-    /// the launch and background syncs only log them, as the desktop's
-    /// scheduled ones do.
+    /// New mail, shown as soon as it's in, then to-dos. Errors show when the
+    /// user asked for it (Sync); the launch and background syncs only log
+    /// them, as the desktop's scheduled ones do.
     func sync(userInitiated: Bool = true) async {
-        guard let engine, !isSyncing else { return }
+        guard engine != nil, !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
-        do {
-            let outcome = try await engine.syncNow()
-            lastSync = outcome
-            if !outcome.errors.isEmpty {
-                print("[sync] \(outcome.errors.joined(separator: "; "))")
-                if userInitiated {
-                    errorMessage = outcome.errors.joined(separator: "\n")
-                }
-            }
-        } catch {
-            print("[sync] failed: \(error)")
-            if userInitiated { report(error) }
-        }
+        await syncMail(userInitiated: userInitiated)
         await refresh()
+        await findToDos(userInitiated: userInitiated)
     }
 
     func setStatus(_ action: ActionDto, to status: ActionStatus) async {

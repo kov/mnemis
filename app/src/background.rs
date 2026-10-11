@@ -1,8 +1,10 @@
-//! Syncing on its own: a full sync (mail, then to-dos) at startup and every
-//! [`EVERY`] while the app runs, window open or hidden in the tray. Without an
-//! LLM it syncs mail only. Sync now (button or tray) and this loop share one
-//! lock, so syncs never overlap, and every sync tells the UI when it starts
-//! and ends, so it shows "Syncing…" and reloads whatever started it.
+//! Syncing on its own: a full sync at startup and every [`EVERY`] while the
+//! app runs, window open or hidden in the tray. Every sync, this or Sync now
+//! (button or tray), fetches mail first and tells the UI, so new mail shows
+//! at once; then it looks for to-dos (skipped without an LLM). Mail phases
+//! share one lock, so they never overlap; the engine runs one to-do search
+//! at a time. The UI hears when a sync starts, when its mail is in and when
+//! it ends.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,13 +26,18 @@ const EVERY: Duration = Duration::from_secs(15 * 60);
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SyncEvent {
     Started,
+    /// The mail is in; to-dos are being looked for.
+    MailSynced,
     Finished,
 }
 
 /// A full sync now; errors without an LLM (Sync now promises to-dos).
 pub async fn full_sync(state: &AppState) -> Result<SyncOutcome, String> {
-    let _serialized = state.sync_lock.lock().await;
-    run(state, false).await
+    if state.current_llm().is_none() {
+        return Err("No LLM configured. Set it in Settings → LLM.".to_string());
+    }
+    let serialized = state.sync_lock.lock().await;
+    run(state, serialized).await
 }
 
 /// Start the loop. `MNEMIS_NO_BACKGROUND_SYNC` (the UI tests) turns it off.
@@ -42,8 +49,8 @@ pub fn spawn(app: AppHandle) {
         loop {
             if let Some(state) = app.try_state::<AppState>() {
                 // A sync already running (Sync now) covers this turn.
-                if let Ok(_serialized) = state.sync_lock.try_lock() {
-                    match run(&state, true).await {
+                if let Ok(serialized) = state.sync_lock.try_lock() {
+                    match run(&state, serialized).await {
                         Ok(o) => info!(
                             messages = o.messages_ingested,
                             actions = o.actions_created,
@@ -67,16 +74,24 @@ pub fn watch_sync(state: State<'_, AppState>, on_event: Channel<SyncEvent>) {
     }
 }
 
-async fn run(state: &AppState, mail_only_without_llm: bool) -> Result<SyncOutcome, String> {
-    let stack = state.current_llm();
-    if stack.is_none() && !mail_only_without_llm {
-        return Err("No LLM configured. Set it in Settings → LLM.".to_string());
-    }
+/// Mail (holding `serialized`, the mail-phase lock), then to-dos when an
+/// LLM is configured.
+async fn run(
+    state: &AppState,
+    serialized: tokio::sync::MutexGuard<'_, ()>,
+) -> Result<SyncOutcome, String> {
     notify(state, SyncEvent::Started);
-    let result = match stack {
-        Some(stack) => {
+    let mail = orchestrator::sync_mail_outcome(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"));
+    drop(serialized);
+    notify(state, SyncEvent::MailSynced);
+    let result = match (mail, state.current_llm()) {
+        (Err(e), _) => Err(e),
+        (Ok(mail), None) => Ok(mail),
+        (Ok(mut out), Some(stack)) => {
             let traces = config::traces_dir_for(&state.db_path);
-            orchestrator::sync_now(
+            match orchestrator::find_to_dos(
                 &state.pool,
                 &stack.llm,
                 Arc::clone(&stack.embedder),
@@ -86,15 +101,17 @@ async fn run(state: &AppState, mail_only_without_llm: bool) -> Result<SyncOutcom
                 Some(&traces),
             )
             .await
+            {
+                Ok(found) => {
+                    out.embeddings_drained += found.embeddings_drained;
+                    out.actions_created += found.actions_created;
+                    out.errors.extend(found.errors);
+                    Ok(out)
+                }
+                Err(e) => Err(format!("{e:#}")),
+            }
         }
-        None => orchestrator::sync_mail(&state.pool)
-            .await
-            .map(|errors| SyncOutcome {
-                errors,
-                ..Default::default()
-            }),
-    }
-    .map_err(|e| format!("{e:#}"));
+    };
     notify(state, SyncEvent::Finished);
     result
 }

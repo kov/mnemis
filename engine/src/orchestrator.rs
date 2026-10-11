@@ -1,18 +1,15 @@
-//! End-to-end sync. For each enabled source we phase the work: poll + ingest
-//! every channel, then embed all the new messages in one pass, then extract
-//! every channel. Embedding and extraction use *different* models on the omlx
-//! server; interleaving them per-channel kept both the embedding model and the
-//! large chat model resident the whole sync, pinning the server at its memory
-//! ceiling and throttling generation (see the omlx memory-enforcer note in the
-//! `v1-gotchas` memory). Phasing lets the long extract pass run chat-only.
-//! Used by both the CLI's `sync` command and the desktop app's manual "Sync
-//! now" button.
+//! End-to-end sync, in two phases so new mail shows without waiting on the
+//! model. [`sync_mail`] brings every account's folders up to date (the
+//! to-do poll's folders ingested as extraction candidates, the rest for
+//! reading); [`find_to_dos`] then embeds what's new, extracts every folder
+//! with mail not yet extracted, and syncs the calendar. Apps run the first,
+//! refresh, and run the second in the background; [`sync_now`] runs both.
 //!
-//! The implementation is deliberately blocking-per-source so callers get a
-//! single aggregate `SyncOutcome` back. Per-channel progress streaming (for
-//! a live spinner) can be layered on later via a `tokio::sync::mpsc` if the
-//! UI needs it — current design intent is "click button → wait → refresh"
-//! (see project memory v2-redesign).
+//! Embedding and extraction use *different* models on the omlx server;
+//! interleaving them per-channel kept both resident the whole sync, pinning
+//! the server at its memory ceiling and throttling generation (see the omlx
+//! memory-enforcer note in the `v1-gotchas` memory). So per account the
+//! embed pass runs first, then the extract pass, chat model only.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -30,12 +27,9 @@ use crate::secrets;
 use crate::source::imap::{ImapConfig, ImapSource};
 use crate::source::{Cursor, Source, SourceId};
 
-/// Run one polling + extraction cycle across every non-disabled source.
-///
-/// `model_name` is recorded in `extraction_runs.model` so the eventual
-/// re-extraction tooling can spot prompt/model changes. `window_char_budget`
-/// caps how much message text a single extraction call carries; larger
-/// windows are split into sequential batches (see
+/// A full sync: [`sync_mail`], then [`find_to_dos`]. `model_name` is
+/// recorded in `extraction_runs.model`; `window_char_budget` caps how much
+/// message text one extraction call carries (see
 /// [`crate::extract::extract_for_channel`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_now(
@@ -47,21 +41,47 @@ pub async fn sync_now(
     idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SyncOutcome> {
-    let mut out = SyncOutcome::default();
+    let mut out = sync_mail_outcome(pool).await?;
+    let found = find_to_dos(
+        pool,
+        llm,
+        embedder,
+        model_name,
+        window_char_budget,
+        idle_timeout,
+        traces_dir,
+    )
+    .await?;
+    out.embeddings_drained += found.embeddings_drained;
+    out.actions_created += found.actions_created;
+    out.errors.extend(found.errors);
+    Ok(out)
+}
 
+/// Phase two of a sync: embed new mail and extract to-dos from every folder
+/// with mail not yet extracted (whatever synced it), then sync the
+/// calendar. One run at a time per database; a second waits its turn, then
+/// finds only what arrived since.
+#[allow(clippy::too_many_arguments)]
+pub async fn find_to_dos(
+    pool: &SqlitePool,
+    llm: &dyn LlmTransport,
+    embedder: Arc<dyn Embedder>,
+    model_name: &str,
+    window_char_budget: usize,
+    idle_timeout: Duration,
+    traces_dir: Option<&std::path::Path>,
+) -> Result<SyncOutcome> {
+    let _serialized = extraction_lock(pool).await;
+    let mut out = SyncOutcome::default();
+    let started = Instant::now();
     let sources: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, name FROM sources WHERE status != 'disabled' ORDER BY id")
             .fetch_all(pool)
             .await
             .context("listing sources")?;
-
-    info!(count = sources.len(), "sync starting");
-    let sync_started = Instant::now();
-
     for (source_id, source_name) in sources {
-        let started = Instant::now();
-        info!(source_id, source_name = %source_name, "source: start");
-        match sync_one_source(
+        let counts = extract_source(
             pool,
             source_id,
             &source_name,
@@ -72,61 +92,15 @@ pub async fn sync_now(
             idle_timeout,
             traces_dir,
         )
-        .await
-        {
-            Ok(counts) => {
-                info!(
-                    source_id,
-                    source_name = %source_name,
-                    channels = counts.channels_polled,
-                    messages = counts.messages_ingested,
-                    embeddings = counts.embeddings_drained,
-                    actions = counts.actions_created,
-                    errors = counts.errors.len(),
-                    secs = started.elapsed().as_secs(),
-                    "source: done"
-                );
-                out.sources_synced += 1;
-                out.channels_polled += counts.channels_polled;
-                out.messages_ingested += counts.messages_ingested;
-                out.embeddings_drained += counts.embeddings_drained;
-                out.actions_created += counts.actions_created;
-                out.errors.extend(counts.errors);
-                mark_source_ok(pool, source_id).await.ok();
-            }
-            Err(e) => {
-                let msg = format!("source '{source_name}' (id={source_id}): {e:#}");
-                // {e:#} expands the anyhow chain — the outer "source sync
-                // failed" alone is rarely enough to tell what actually broke.
-                warn!(
-                    error = format!("{e:#}"),
-                    source_id,
-                    source_name = %source_name,
-                    secs = started.elapsed().as_secs(),
-                    "source: failed"
-                );
-                out.sources_failed += 1;
-                out.errors.push(msg.clone());
-                mark_source_failure(pool, source_id, &format!("{e:#}"))
-                    .await
-                    .ok();
-            }
-        }
+        .await?;
+        out.embeddings_drained += counts.embeddings_drained;
+        out.actions_created += counts.actions_created;
+        out.errors.extend(counts.errors);
     }
 
     // Final embed pass picks up actions/notes enqueued during this cycle.
-    let drain_started = Instant::now();
     match drain_once(pool, embedder.as_ref()).await {
-        Ok(n) => {
-            out.embeddings_drained += n as i64;
-            if n > 0 {
-                info!(
-                    count = n,
-                    secs = drain_started.elapsed().as_secs(),
-                    "final embed drain"
-                );
-            }
-        }
+        Ok(n) => out.embeddings_drained += n as i64,
         Err(e) => warn!(error = format!("{e:#}"), "final embed drain failed"),
     }
 
@@ -153,18 +127,31 @@ pub async fn sync_now(
     }
 
     info!(
-        sources_synced = out.sources_synced,
-        sources_failed = out.sources_failed,
-        channels = out.channels_polled,
-        messages = out.messages_ingested,
         actions = out.actions_created,
         embeddings = out.embeddings_drained,
         errors = out.errors.len(),
-        secs = sync_started.elapsed().as_secs(),
-        "sync done"
+        secs = started.elapsed().as_secs(),
+        "to-dos found"
     );
-
     Ok(out)
+}
+
+/// Only one [`find_to_dos`] per database at a time: two would extract the
+/// same new mail twice.
+async fn extraction_lock(pool: &SqlitePool) -> tokio::sync::OwnedMutexGuard<()> {
+    type Locks = std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
+    >;
+    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
+    let key = std::path::PathBuf::from(pool.connect_options().get_filename());
+    let lock = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("extraction locks poisoned")
+        .entry(key)
+        .or_default()
+        .clone();
+    lock.lock_owned().await
 }
 
 #[derive(Default)]
@@ -174,39 +161,6 @@ struct SourceCounts {
     embeddings_drained: i64,
     actions_created: i64,
     errors: Vec<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn sync_one_source(
-    pool: &SqlitePool,
-    source_id: i64,
-    source_name: &str,
-    llm: &dyn LlmTransport,
-    embedder: &Arc<dyn Embedder>,
-    model_name: &str,
-    window_char_budget: usize,
-    idle_timeout: Duration,
-    traces_dir: Option<&std::path::Path>,
-) -> Result<SourceCounts> {
-    let source = build_imap_source(pool, SourceId(source_id)).await?;
-    let mut counts = sync_one_source_with(
-        pool,
-        source_id,
-        source_name,
-        &source,
-        llm,
-        embedder,
-        model_name,
-        window_char_budget,
-        idle_timeout,
-        traces_dir,
-    )
-    .await?;
-    let _guard = crate::mail::sync::account_lock(pool, source_id).await;
-    counts
-        .errors
-        .extend(sync_reader(pool, &source, source_id, source_name).await);
-    Ok(counts)
 }
 
 /// The reader's view of every folder (history, flags, removals); returns the
@@ -339,40 +293,77 @@ pub async fn search_mail_server(
     Ok((ids, errors))
 }
 
-/// Bring every mail account's folders up to date for reading, without
-/// extracting: new mail in folders polled for to-dos is ingested as
-/// extraction candidates (the next full sync extracts it), the rest as
+/// Phase one of a sync: bring every mail account's folders up to date,
+/// without extracting. New mail in the folders polled for to-dos is
+/// ingested as extraction candidates (for [`find_to_dos`]), the rest as
 /// reading-only mail. Quick enough to run often. Returns the errors.
 pub async fn sync_mail(pool: &SqlitePool) -> Result<Vec<String>> {
+    Ok(sync_mail_outcome(pool).await?.errors)
+}
+
+/// [`sync_mail`], with counts; records each account's health.
+pub async fn sync_mail_outcome(pool: &SqlitePool) -> Result<SyncOutcome> {
     let sources: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, name FROM sources WHERE status != 'disabled' AND kind = 'imap' ORDER BY id",
     )
     .fetch_all(pool)
     .await
     .context("listing sources")?;
-    let mut errors = Vec::new();
+    let started = Instant::now();
+    let mut out = SyncOutcome::default();
     for (source_id, source_name) in sources {
         let _guard = crate::mail::sync::account_lock(pool, source_id).await;
-        let source = match build_imap_source(pool, SourceId(source_id)).await {
-            Ok(source) => source,
-            Err(e) => {
-                errors.push(format!("source '{source_name}': {e:#}"));
-                continue;
+        let result = async {
+            let source = build_imap_source(pool, SourceId(source_id)).await?;
+            if let Err(e) = discover_channels(pool, &source, source_id).await {
+                warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
             }
-        };
-        if let Err(e) = discover_channels(pool, &source, source_id).await {
-            warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
+            let mut counts = SourceCounts::default();
+            poll_channels(pool, &source, source_id, &source_name, &mut counts).await?;
+            counts
+                .errors
+                .extend(sync_reader(pool, &source, source_id, &source_name).await);
+            anyhow::Ok(counts)
         }
-        let mut counts = SourceCounts::default();
-        poll_channels(pool, &source, source_id, &source_name, &mut counts).await?;
-        errors.extend(counts.errors);
-        errors.extend(sync_reader(pool, &source, source_id, &source_name).await);
+        .await;
+        match result {
+            Ok(counts) => {
+                out.sources_synced += 1;
+                out.channels_polled += counts.channels_polled;
+                out.messages_ingested += counts.messages_ingested;
+                out.errors.extend(counts.errors);
+                mark_source_ok(pool, source_id).await.ok();
+            }
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    source_id,
+                    source_name = %source_name,
+                    "source: mail sync failed"
+                );
+                out.sources_failed += 1;
+                out.errors
+                    .push(format!("source '{source_name}' (id={source_id}): {e:#}"));
+                mark_source_failure(pool, source_id, &format!("{e:#}"))
+                    .await
+                    .ok();
+            }
+        }
     }
-    Ok(errors)
+    info!(
+        sources_synced = out.sources_synced,
+        sources_failed = out.sources_failed,
+        messages = out.messages_ingested,
+        errors = out.errors.len(),
+        secs = started.elapsed().as_secs(),
+        "mail synced"
+    );
+    Ok(out)
 }
 
-/// Inner loop, split out so tests can inject a fake `Source` without
-/// touching the keychain or the IMAP transport.
+/// Poll then extract one source in one go, so tests can inject a fake
+/// `Source` without touching the keychain or the IMAP transport.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn sync_one_source_with(
     pool: &SqlitePool,
@@ -386,37 +377,52 @@ async fn sync_one_source_with(
     idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
-    // Refresh the folder list from the server first, so a freshly added source
-    // (or a newly created server-side folder) is polled this run instead of
-    // only after some later sync. Best-effort: a discovery failure shouldn't
-    // stop us polling the folders we already know.
     if let Err(e) = discover_channels(pool, source, source_id).await {
-        warn!(
-            error = %format!("{e:#}"),
-            source_id, "channel discovery failed; polling known channels only"
-        );
+        warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
     }
-
     let mut counts = SourceCounts::default();
+    poll_channels(pool, source, source_id, source_name, &mut counts).await?;
+    let extracted = extract_source(
+        pool,
+        source_id,
+        source_name,
+        llm,
+        embedder,
+        model_name,
+        window_char_budget,
+        idle_timeout,
+        traces_dir,
+    )
+    .await?;
+    counts.embeddings_drained = extracted.embeddings_drained;
+    counts.actions_created = extracted.actions_created;
+    counts.errors.extend(extracted.errors);
+    Ok(counts)
+}
 
-    // Phase 1 — poll + ingest every channel. No embedding or extraction
-    // inline here: keeping them out of this loop is what avoids holding both
-    // the embed and chat models resident at once (see the module doc).
-    {
-        // Extraction runs unlocked: it can take minutes, and the reader's
-        // quick sync and mark-read shouldn't wait on it.
-        let _guard = crate::mail::sync::account_lock(pool, source_id).await;
-        poll_channels(pool, source, source_id, source_name, &mut counts).await?;
-    }
-    // Extract every channel with mail not yet extracted: what this poll
-    // brought, and what a mail-only sync ([`sync_mail`]) ingested since.
+/// Embed then extract one source's folders with mail not yet extracted.
+#[allow(clippy::too_many_arguments)]
+async fn extract_source(
+    pool: &SqlitePool,
+    source_id: i64,
+    source_name: &str,
+    llm: &dyn LlmTransport,
+    embedder: &Arc<dyn Embedder>,
+    model_name: &str,
+    window_char_budget: usize,
+    idle_timeout: Duration,
+    traces_dir: Option<&std::path::Path>,
+) -> Result<SourceCounts> {
+    let mut counts = SourceCounts::default();
     let to_extract = channels_pending_extraction(pool, source_id).await?;
+    if to_extract.is_empty() {
+        return Ok(counts);
+    }
 
-    // Phase 2 — embed everything ingested this cycle in a single pass, while
-    // the embedding model is the only one that needs to be hot. `drain_once`
-    // records per-entry failures and keeps them queued (returning Ok), so a
-    // single transport error surfaces once at the source level rather than
-    // once per channel.
+    // Embed everything new in a single pass, while the embedding model is
+    // the only one that needs to be hot. `drain_once` records per-entry
+    // failures and keeps them queued (returning Ok), so a single transport
+    // error surfaces once at the source level rather than once per channel.
     match drain_once(pool, embedder.as_ref()).await {
         Ok(n) => {
             counts.embeddings_drained += n as i64;
@@ -435,8 +441,8 @@ async fn sync_one_source_with(
         }
     }
 
-    // Phase 3 — extract each channel that ingested new messages. Only the chat
-    // model is exercised now, so the embed model can stay evicted.
+    // Then extract each folder; only the chat model is exercised now, so the
+    // embed model can stay evicted.
     for (channel_id, external_id) in to_extract {
         let ex_started = Instant::now();
         trace!(channel_id, channel = %external_id, "channel: extracting");

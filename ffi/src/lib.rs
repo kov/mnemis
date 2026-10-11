@@ -772,6 +772,30 @@ impl Engine {
         .await
     }
 
+    /// Find to-dos in mail synced but not yet extracted, then sync the
+    /// calendar: the second half of a sync, after `sync_mail`.
+    pub async fn find_to_dos(&self) -> Result<SyncOutcome, MnemisError> {
+        let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
+            message: "No LLM configured. Set it up in Settings.".into(),
+        })?;
+        let pool = self.pool.clone();
+        let traces = config::traces_dir_for(&self.data_dir.join("mnemis.db"));
+        run(async move {
+            let embedder: Arc<dyn Embedder> = Arc::new(NoEmbedder);
+            orchestrator::find_to_dos(
+                &pool,
+                &stack.llm,
+                embedder,
+                &stack.chat_model,
+                stack.window_char_budget,
+                stack.idle_timeout,
+                Some(&traces),
+            )
+            .await
+        })
+        .await
+    }
+
     /// Development tool: score the configured LLM's extraction over the
     /// messages posted in `[from, to)` (unix seconds) that actions were
     /// recorded from, plus `others` more, without writing anything (see

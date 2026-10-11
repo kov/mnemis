@@ -856,16 +856,16 @@ pub fn StatusPanel() -> impl IntoView {
     }
 
     let on_click = move |_| {
-        if syncing.get() {
+        if syncing.get() != crate::SyncPhase::Idle {
             return;
         }
-        syncing.set(true);
+        syncing.set(crate::SyncPhase::Mail);
         last_outcome.set(None);
         spawn_local(async move {
             let result = run_sync_now().await;
             let succeeded = result.is_ok();
             last_outcome.set(Some(result));
-            syncing.set(false);
+            syncing.set(crate::SyncPhase::Idle);
             if succeeded {
                 // Bump the tick so resources subscribed to it (Actions,
                 // Inbox, Status itself) all refetch on their own. Without
@@ -890,9 +890,13 @@ pub fn StatusPanel() -> impl IntoView {
                 <button
                     class="sync-button"
                     on:click=on_click
-                    disabled=move || syncing.get()
+                    disabled=move || syncing.get() != crate::SyncPhase::Idle
                 >
-                    {move || if syncing.get() { "Syncing…" } else { "Sync now" }}
+                    {move || match syncing.get() {
+                        crate::SyncPhase::Idle => "Sync now",
+                        crate::SyncPhase::Mail => "Syncing…",
+                        crate::SyncPhase::ToDos => "Finding to-dos…",
+                    }}
                 </button>
             </div>
             {move || last_outcome.get().map(|res| match res {

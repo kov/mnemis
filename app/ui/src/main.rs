@@ -170,10 +170,17 @@ pub fn watch_appearance() {
     });
 }
 
-/// A sync is running, whoever started it (Sync now, the tray, or the app's
-/// own schedule).
+/// Where a running sync is, whoever started it (Sync now, the tray, or the
+/// app's own schedule).
+#[derive(Clone, Copy, PartialEq)]
+pub enum SyncPhase {
+    Idle,
+    Mail,
+    ToDos,
+}
+
 #[derive(Clone, Copy)]
-pub struct Syncing(pub RwSignal<bool>);
+pub struct Syncing(pub RwSignal<SyncPhase>);
 
 #[derive(Deserialize)]
 struct SyncEnvelope {
@@ -186,6 +193,7 @@ struct SyncEnvelope {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SyncEventMsg {
     Started,
+    MailSynced,
     Finished,
 }
 
@@ -197,7 +205,7 @@ struct WatchSyncArgs {
 /// Follow every sync the backend runs: show it as running, and reload what
 /// it may have changed once it ends. Same channel wiring as
 /// [`watch_appearance`].
-fn watch_sync(syncing: RwSignal<bool>, sync_tick: RwSignal<u32>, mail_tick: RwSignal<u32>) {
+fn watch_sync(syncing: RwSignal<SyncPhase>, sync_tick: RwSignal<u32>, mail_tick: RwSignal<u32>) {
     let closure = Closure::wrap(Box::new(move |payload: JsValue| {
         let Some(s) = js_sys::JSON::stringify(&payload)
             .ok()
@@ -209,11 +217,16 @@ fn watch_sync(syncing: RwSignal<bool>, sync_tick: RwSignal<u32>, mail_tick: RwSi
             return;
         };
         match env.message {
-            Some(SyncEventMsg::Started) if !env.end => syncing.set(true),
-            Some(SyncEventMsg::Finished) if !env.end => {
-                syncing.set(false);
+            Some(SyncEventMsg::Started) if !env.end => syncing.set(SyncPhase::Mail),
+            // The mail shows now; to-dos follow.
+            Some(SyncEventMsg::MailSynced) if !env.end => {
+                syncing.set(SyncPhase::ToDos);
                 sync_tick.update(|v| *v += 1);
                 mail_tick.update(|v| *v += 1);
+            }
+            Some(SyncEventMsg::Finished) if !env.end => {
+                syncing.set(SyncPhase::Idle);
+                sync_tick.update(|v| *v += 1);
             }
             _ => {}
         }
@@ -867,7 +880,7 @@ fn App() -> impl IntoView {
     // Keep tracking the OS appearance: re-theme live when the system accent or
     // light/dark preference changes while the app is open.
     watch_appearance();
-    let syncing = RwSignal::new(false);
+    let syncing = RwSignal::new(SyncPhase::Idle);
     provide_context(Syncing(syncing));
     watch_sync(
         syncing,
