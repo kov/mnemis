@@ -27,7 +27,7 @@ pub const WINDOW_DAYS: i64 = 90;
 const CHUNK: usize = 50;
 
 /// A folder as the server reports it when opened.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FolderStatus {
     /// How many messages the folder holds.
     pub exists: u32,
@@ -35,6 +35,28 @@ pub struct FolderStatus {
     pub uidnext: u32,
     /// Present when the server tracks flag changes (CONDSTORE).
     pub highest_modseq: Option<u64>,
+}
+
+/// With change tracking, the same UIDVALIDITY, MODSEQ, UIDNEXT and message
+/// count mean nothing arrived, left or changed flags since the last sync.
+fn unchanged(state: &MailState, status: &FolderStatus) -> bool {
+    status.highest_modseq.is_some()
+        && state.uidvalidity == Some(status.uidvalidity)
+        && state.modseq == status.highest_modseq
+        && state.uidnext == Some(status.uidnext)
+        && state.exists == Some(status.exists)
+}
+
+/// Whether the folder holds mail stored before arrival times or sender
+/// verdicts were kept ([`fill_missing`] needs the folder open).
+async fn missing_anything(pool: &SqlitePool, channel_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM messages WHERE channel_id = ? AND uid IS NOT NULL \
+           AND removed_at IS NULL AND (received_at IS NULL OR auth_json IS NULL))",
+    )
+    .bind(channel_id)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Fill in, for the folder's mail stored before they were kept, when the
@@ -131,6 +153,10 @@ pub struct FetchedMessage {
 pub trait MailServer: Send {
     /// Open a folder for the calls that follow.
     async fn open(&mut self, folder: &str) -> Result<FolderStatus>;
+    /// Every folder's status in one go, where the server can (LIST-STATUS,
+    /// with CONDSTORE for flag changes); empty where it can't, and the
+    /// sync opens each folder instead.
+    async fn statuses(&mut self) -> Result<HashMap<String, FolderStatus>>;
     /// UIDs of the mail in the open folder, all of it or what arrived since
     /// a date.
     async fn uids(&mut self, since: Option<DateTime<Utc>>) -> Result<Vec<u32>>;
@@ -209,8 +235,25 @@ pub async fn sync_folders(
     if let Err(e) = super::ops::flush(pool, server, source_id).await {
         counts.errors.push(format!("sending mail changes: {e:#}"));
     }
+    // What changed, asked of the server once, where it can say: a folder it
+    // shows unchanged isn't opened.
+    let statuses = server.statuses().await.unwrap_or_else(|e| {
+        warn!(error = %format!("{e:#}"), "mail sync: folder statuses failed");
+        HashMap::new()
+    });
     for (channel_id, folder) in channels {
-        match sync_folder(pool, server, source_id, channel_id, &folder, Utc::now()).await {
+        let known = statuses.get(&folder);
+        match sync_folder_known(
+            pool,
+            server,
+            source_id,
+            channel_id,
+            &folder,
+            known,
+            Utc::now(),
+        )
+        .await
+        {
             Ok(c) => {
                 counts.folders += 1;
                 counts.new += c.new;
@@ -235,9 +278,22 @@ pub async fn sync_folder(
     folder: &str,
     now: DateTime<Utc>,
 ) -> Result<SyncCounts> {
+    sync_folder_known(pool, server, source_id, channel_id, folder, None, now).await
+}
+
+/// [`sync_folder`], given the folder's status when the server already said
+/// it ([`MailServer::statuses`]): unchanged since the last sync, it isn't
+/// opened at all.
+async fn sync_folder_known(
+    pool: &SqlitePool,
+    server: &mut dyn MailServer,
+    source_id: i64,
+    channel_id: i64,
+    folder: &str,
+    known: Option<&FolderStatus>,
+    now: DateTime<Utc>,
+) -> Result<SyncCounts> {
     let mut counts = SyncCounts::default();
-    let status = server.open(folder).await?;
-    let empty = status.exists == 0;
     let (state, muted, cursor): (Option<String>, bool, Option<String>) =
         sqlx::query_as("SELECT mail_state, muted, cursor FROM channels WHERE id = ?")
             .bind(channel_id)
@@ -246,6 +302,15 @@ pub async fn sync_folder(
     let mut state: MailState = state
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    if let Some(status) = known
+        && unchanged(&state, status)
+        && !missing_anything(pool, channel_id).await?
+    {
+        counts.unchanged = 1;
+        return Ok(counts);
+    }
+    let status = server.open(folder).await?;
+    let empty = status.exists == 0;
 
     if state.uidvalidity != Some(status.uidvalidity) {
         // The server renumbered the folder: forget the old UIDs; the rows are
@@ -264,13 +329,7 @@ pub async fn sync_folder(
         fill_missing(pool, server, channel_id, status.uidvalidity).await?;
     }
 
-    // With change tracking, the same MODSEQ, UIDNEXT and message count mean
-    // nothing arrived, left or changed flags since the last sync.
-    if status.highest_modseq.is_some()
-        && state.modseq == status.highest_modseq
-        && state.uidnext == Some(status.uidnext)
-        && state.exists == Some(status.exists)
-    {
+    if unchanged(&state, &status) {
         counts.unchanged = 1;
         return Ok(counts);
     }
@@ -436,6 +495,10 @@ pub(crate) mod tests {
         pub fetched: Vec<u32>,
         /// UID searches run.
         pub searches: usize,
+        /// Folders opened.
+        pub opens: usize,
+        /// Answers every folder's status at once (LIST-STATUS).
+        pub list_status: bool,
         pub open: String,
     }
 
@@ -464,6 +527,18 @@ pub(crate) mod tests {
             );
         }
 
+        fn status_of(&self, folder: &str) -> Result<FolderStatus> {
+            let f = self.folders.get(folder).context("no such folder")?;
+            Ok(FolderStatus {
+                exists: f.messages.len() as u32,
+                uidvalidity: f.uidvalidity,
+                uidnext: f.messages.keys().last().map_or(1, |u| u + 1),
+                highest_modseq: self
+                    .condstore
+                    .then(|| f.messages.values().map(|m| m.modseq).max().unwrap_or(1)),
+            })
+        }
+
         fn current(&self) -> &FakeFolder {
             &self.folders[&self.open]
         }
@@ -486,17 +561,21 @@ pub(crate) mod tests {
     #[async_trait]
     impl MailServer for FakeServer {
         async fn open(&mut self, folder: &str) -> Result<FolderStatus> {
-            let f = self.folders.get(folder).context("no such folder")?;
-            let status = FolderStatus {
-                exists: f.messages.len() as u32,
-                uidvalidity: f.uidvalidity,
-                uidnext: f.messages.keys().last().map_or(1, |u| u + 1),
-                highest_modseq: self
-                    .condstore
-                    .then(|| f.messages.values().map(|m| m.modseq).max().unwrap_or(1)),
-            };
+            let status = self.status_of(folder)?;
+            self.opens += 1;
             self.open = folder.to_string();
             Ok(status)
+        }
+
+        async fn statuses(&mut self) -> Result<HashMap<String, FolderStatus>> {
+            if !(self.list_status && self.condstore) {
+                return Ok(HashMap::new());
+            }
+            let names: Vec<String> = self.folders.keys().cloned().collect();
+            names
+                .into_iter()
+                .map(|n| Ok((n.clone(), self.status_of(&n)?)))
+                .collect()
         }
 
         async fn uids(&mut self, since: Option<DateTime<Utc>>) -> Result<Vec<u32>> {
@@ -765,6 +844,36 @@ pub(crate) mod tests {
             .await?;
         sync_folders(&pool, &mut server, source_id).await?;
         assert_eq!(failures(pool.clone()).await?, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_folders_the_server_shows_unchanged_and_opens_them_otherwise() -> Result<()> {
+        for list_status in [true, false] {
+            let (_tmp, pool, source_id) = setup().await?;
+            folder(&pool, source_id, "INBOX", true).await?;
+            folder(&pool, source_id, "Archive", true).await?;
+            let mut server = FakeServer {
+                condstore: true,
+                list_status,
+                ..Default::default()
+            };
+            server.add("INBOX", 1, "a@x", "Lunch", 1);
+            server.add("Archive", 1, "b@x", "Dinner", 2);
+            sync_folders(&pool, &mut server, source_id).await?;
+
+            server.opens = 0;
+            let idle = sync_folders(&pool, &mut server, source_id).await?;
+            assert_eq!(idle.unchanged, 2);
+            assert_eq!(server.opens, if list_status { 0 } else { 2 });
+
+            // New mail in one folder: only that one is opened.
+            server.add("INBOX", 2, "c@x", "Tea", 0);
+            server.opens = 0;
+            let next = sync_folders(&pool, &mut server, source_id).await?;
+            assert_eq!(next.new, 1);
+            assert_eq!(server.opens, if list_status { 1 } else { 2 });
+        }
         Ok(())
     }
 

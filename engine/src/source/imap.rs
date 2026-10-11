@@ -600,6 +600,60 @@ impl crate::mail::sync::MailServer for ImapMailSession {
             .collect())
     }
 
+    async fn statuses(
+        &mut self,
+    ) -> Result<std::collections::HashMap<String, crate::mail::sync::FolderStatus>> {
+        use async_imap::types::{StatusAttribute, UnsolicitedResponse};
+        let mut out = std::collections::HashMap::new();
+        // Without change tracking, a status can't show flags unchanged.
+        if !(self.has("LIST-STATUS") && self.condstore) {
+            return Ok(out);
+        }
+        // The answers arrive as unsolicited STATUS responses, on a bounded
+        // channel earlier commands may have filled: drain it first. A
+        // folder whose status is lost is opened, as without LIST-STATUS.
+        while self.session.unsolicited_responses.try_recv().is_ok() {}
+        self.session
+            .run_command_and_check_ok(
+                r#"LIST "" "*" RETURN (STATUS (MESSAGES UIDNEXT UIDVALIDITY HIGHESTMODSEQ))"#,
+            )
+            .await
+            .context("LIST-STATUS failed")?;
+        while let Ok(response) = self.session.unsolicited_responses.try_recv() {
+            let UnsolicitedResponse::Status {
+                mailbox,
+                attributes,
+            } = response
+            else {
+                continue;
+            };
+            let (mut exists, mut uidvalidity, mut uidnext, mut modseq) = (None, None, None, None);
+            for attribute in attributes {
+                match attribute {
+                    StatusAttribute::Messages(n) => exists = Some(n),
+                    StatusAttribute::UidValidity(n) => uidvalidity = Some(n),
+                    StatusAttribute::UidNext(n) => uidnext = Some(n),
+                    StatusAttribute::HighestModSeq(n) => modseq = Some(n),
+                    _ => {}
+                }
+            }
+            if let (Some(exists), Some(uidvalidity), Some(uidnext), Some(modseq)) =
+                (exists, uidvalidity, uidnext, modseq)
+            {
+                out.insert(
+                    mailbox,
+                    crate::mail::sync::FolderStatus {
+                        exists,
+                        uidvalidity,
+                        uidnext,
+                        highest_modseq: Some(modseq),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
     async fn auth_headers(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut sorted = uids.to_vec();
         sorted.sort_unstable();

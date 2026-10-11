@@ -326,12 +326,16 @@ pub async fn sync_mail_outcome(pool: &SqlitePool) -> Result<SyncOutcome> {
                     }
                 }
                 let mut counts = SourceCounts::default();
+                let statuses = crate::mail::sync::MailServer::statuses(&mut session)
+                    .await
+                    .unwrap_or_default();
                 poll_channels(
                     pool,
                     &mut session,
                     source_id,
                     &source_name,
                     None,
+                    &statuses,
                     &mut counts,
                 )
                 .await?;
@@ -406,6 +410,7 @@ async fn sync_one_source_with(
         source_id,
         source_name,
         None,
+        &Default::default(),
         &mut counts,
     )
     .await?;
@@ -563,6 +568,7 @@ async fn poll_channels(
     source_id: i64,
     source_name: &str,
     only: Option<i64>,
+    statuses: &std::collections::HashMap<String, crate::mail::sync::FolderStatus>,
     counts: &mut SourceCounts,
 ) -> Result<()> {
     let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
@@ -577,6 +583,14 @@ async fn poll_channels(
 
     let total_channels = channels.len();
     for (idx, (channel_id, external_id, cursor)) in channels.into_iter().enumerate() {
+        // Nothing arrived since the poll's position, as the server's status
+        // shows: no need to open the folder.
+        if let Some(status) = statuses.get(&external_id)
+            && cursor.as_deref()
+                == Some(format!("{}:{}", status.uidvalidity, status.uidnext).as_str())
+        {
+            continue;
+        }
         counts.channels_polled += 1;
         let ch_started = Instant::now();
         info!(
@@ -696,6 +710,7 @@ pub async fn sync_scope(pool: &SqlitePool, scope: mnemis_types::MailScope) -> Re
                         source_id,
                         &source_name,
                         Some(*channel_id),
+                        &Default::default(),
                         &mut counts,
                     )
                     .await?;
