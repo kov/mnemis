@@ -369,8 +369,8 @@ private struct MessageCard: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                MessageBody(messageId: message.messageId, downloaded: downloaded)
                 tools
+                MessageBody(messageId: message.messageId, downloaded: downloaded)
             }
         }
         // Unread and open for a moment: it's been read. Folding it or
@@ -391,26 +391,15 @@ private struct MessageCard: View {
         return parts.joined(separator: " · ")
     }
 
+    /// Reply, Reply all and Forward (labelled when they fit), and the
+    /// rest in a menu at the far end.
     private var tools: some View {
-        ViewThatFits(in: .horizontal) {
-            toolRow.labelStyle(.titleAndIcon)
-            toolRow.labelStyle(.iconOnly)
-        }
-        .buttonStyle(.glass)
-        .font(.subheadline.weight(.semibold))
-    }
-
-    private var toolRow: some View {
         HStack(spacing: 8) {
-            Button("Reply", systemImage: "arrowshape.turn.up.left") {
-                Task { await model.compose(.reply, messageId: message.messageId) }
+            ViewThatFits(in: .horizontal) {
+                replyRow.labelStyle(.titleAndIcon)
+                replyRow.labelStyle(.iconOnly)
             }
-            Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {
-                Task { await model.compose(.replyAll, messageId: message.messageId) }
-            }
-            Button("Forward", systemImage: "arrowshape.turn.up.right") {
-                Task { await model.compose(.forward, messageId: message.messageId) }
-            }
+            Spacer(minLength: 0)
             Menu {
                 Button("Talk about this", systemImage: "bubble.left.and.text.bubble.right") {
                     Task { await model.talkAbout(messageId: message.messageId) }
@@ -422,8 +411,26 @@ private struct MessageCard: View {
                 }
             } label: {
                 Label("More", systemImage: "ellipsis")
+                    .labelStyle(.iconOnly)
+                    .frame(minHeight: 22)
             }
             .menuStyle(.button)
+        }
+        .buttonStyle(.glass)
+        .font(.subheadline.weight(.semibold))
+    }
+
+    private var replyRow: some View {
+        HStack(spacing: 8) {
+            Button("Reply", systemImage: "arrowshape.turn.up.left") {
+                Task { await model.compose(.reply, messageId: message.messageId) }
+            }
+            Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {
+                Task { await model.compose(.replyAll, messageId: message.messageId) }
+            }
+            Button("Forward", systemImage: "arrowshape.turn.up.right") {
+                Task { await model.compose(.forward, messageId: message.messageId) }
+            }
         }
         .lineLimit(1)
         .fixedSize()
