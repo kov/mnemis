@@ -30,7 +30,10 @@ pub fn render(inputs: &RenderInputs) -> String {
          every source) and to look up, create, update, and resolve their to-dos (the tools call \
          them actions; say to-do to the user). For \
          \"what came in recently / in the last N days\" questions, use list_messages with a \
-         since date rather than trying to search for a date. Ground every claim in \
+         since date rather than trying to search for a date. The ingested messages reach back \
+         about 90 days; when a question needs older mail or a longer history, use \
+         search_mail_server to search the mail server, then fetch_messages to read what it \
+         finds, before saying something can't be found. Ground every claim in \
          what the tools actually return, and cite message external_ids when you explain why \
          something is (or isn't) a to-do.\n\n\
          When the user explicitly asks you to track, complete, or change something, act on it — \

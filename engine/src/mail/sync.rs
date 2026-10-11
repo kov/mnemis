@@ -69,6 +69,8 @@ pub trait MailServer: Send {
     async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>>;
     /// Mark mail in the open folder read or unread.
     async fn store_seen(&mut self, uids: &[u32], seen: bool) -> Result<()>;
+    /// UIDs in the open folder matching `criteria`, searched by the server.
+    async fn search(&mut self, criteria: &super::search::Criteria) -> Result<Vec<u32>>;
 }
 
 /// What the folder sync last saw, kept in `channels.mail_state`.
@@ -448,6 +450,30 @@ pub(crate) mod tests {
                         raw,
                     })
                 })
+                .collect())
+        }
+
+        async fn search(&mut self, c: &crate::mail::search::Criteria) -> Result<Vec<u32>> {
+            self.searches += 1;
+            let has = |hay: &str, needle: &Option<String>| {
+                needle
+                    .as_ref()
+                    .is_none_or(|n| hay.to_lowercase().contains(&n.to_lowercase()))
+            };
+            Ok(self
+                .current()
+                .messages
+                .iter()
+                .filter(|(_, m)| {
+                    let from = "Ana <ana@example.com>";
+                    let text = format!("{} The body of {}.", m.subject, m.id);
+                    has(from, &c.from)
+                        && has(&m.subject, &c.subject)
+                        && has(&text, &c.text)
+                        && c.since.is_none_or(|d| m.date.date_naive() >= d)
+                        && c.before.is_none_or(|d| m.date.date_naive() < d)
+                })
+                .map(|(u, _)| *u)
                 .collect())
         }
 

@@ -260,6 +260,19 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             fetch_messages_params(),
         ),
         ToolDef::function(
+            "search_mail_server".to_string(),
+            "Search the user's mail accounts on the mail server itself, every folder but \
+             Trash and Junk. Use it when the ingested messages don't reach far enough: the \
+             local copy holds about the last 90 days, so anything older, or a request for \
+             history (\"all of them\", \"the last 18 months\"), needs this. Every given field \
+             must match; servers match words literally (no meaning), so search the sender or a \
+             distinctive subject word. Slower than search_messages (seconds). Hits are stored, \
+             so read them with fetch_messages. Returns up to `limit` hits, newest first, with \
+             external_id, posted_at, author, subject and folder."
+                .to_string(),
+            search_mail_server_params(),
+        ),
+        ToolDef::function(
             "list_messages".to_string(),
             "List the user's messages newest-first, optionally within a time window. Use this for \
              \"what came in recently / in the last N days\" questions — search_messages is for \
@@ -360,6 +373,20 @@ fn draft_email_params() -> serde_json::Value {
             "body": { "type": "string", "description": "the text the user is sending, in their voice" }
         },
         "required": ["kind", "body"]
+    })
+}
+
+fn search_mail_server_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "from": { "type": "string", "description": "part of the sender's name or address" },
+            "subject": { "type": "string", "description": "a word or phrase in the subject" },
+            "text": { "type": "string", "description": "a word or phrase anywhere in the message" },
+            "since": { "type": "string", "description": "YYYY-MM-DD; on or after this day" },
+            "before": { "type": "string", "description": "YYYY-MM-DD; before this day" },
+            "limit": { "type": "integer", "description": "most hits to return (default 20, at most 50)" }
+        }
     })
 }
 
@@ -666,13 +693,42 @@ async fn fetch_messages(
     let mut not_found = Vec::new();
     let mut over_budget = Vec::new();
 
+    // Mail synced as headers only (the reader's history, server search hits)
+    // gets its body first: from the mail cache, else from the server.
+    let mut header_only = Vec::new();
+    for ext_id in &args.external_ids {
+        let row: Option<(i64, bool)> = sqlx::query_as(
+            "SELECT MIN(m.id), MAX(m.has_body) FROM messages m \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?) \
+             HAVING COUNT(*) > 0",
+        )
+        .bind(ext_id)
+        .bind(filter)
+        .bind(filter)
+        .fetch_optional(pool)
+        .await
+        .context("fetch_messages lookup failed")?;
+        if let Some((id, false)) = row {
+            header_only.push(id);
+        }
+    }
+    let download_error = match header_only.is_empty() {
+        true => None,
+        false => crate::orchestrator::complete_messages(pool, &header_only)
+            .await
+            .err()
+            .map(|e| format!("{e:#}")),
+    };
+
     for ext_id in &args.external_ids {
         let row: Option<(String, i64, Option<String>, Option<String>, String)> = sqlx::query_as(
             "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              JOIN channels c ON c.id = m.channel_id \
-             WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?)",
+             WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?) \
+             ORDER BY m.has_body DESC LIMIT 1",
         )
         .bind(ext_id)
         .bind(filter)
@@ -705,6 +761,12 @@ async fn fetch_messages(
         "messages": messages,
         "not_found": not_found,
     });
+    if let Some(e) = download_error {
+        result["download_error"] = json!(format!(
+            "some of these were only partly synced and couldn't be downloaded, so their \
+             body may be empty: {e}"
+        ));
+    }
     if !over_budget.is_empty() {
         result["over_budget"] = json!(over_budget);
         result["notice"] = json!(

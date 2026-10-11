@@ -272,6 +272,73 @@ pub async fn fetch_thread(pool: &SqlitePool, thread_id: i64) -> Result<usize> {
     fetched
 }
 
+/// Give header-only messages among `ids` their bodies: from the cache, else
+/// downloaded from their account's server.
+pub async fn complete_messages(pool: &SqlitePool, ids: &[i64]) -> Result<()> {
+    let missing = crate::mail::cache::complete_from_cache(pool, ids).await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut by_source: Vec<(i64, Vec<i64>)> = Vec::new();
+    for id in missing {
+        let source_id: i64 = sqlx::query_scalar(
+            "SELECT c.source_id FROM messages m JOIN channels c ON c.id = m.channel_id \
+             WHERE m.id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+        match by_source.iter_mut().find(|s| s.0 == source_id) {
+            Some(s) => s.1.push(id),
+            None => by_source.push((source_id, vec![id])),
+        }
+    }
+    for (source_id, ids) in by_source {
+        let source = build_imap_source(pool, SourceId(source_id)).await?;
+        let mut session = source.mail_session().await?;
+        let fetched = crate::mail::cache::fetch_messages(pool, &mut session, source_id, &ids).await;
+        session.logout().await;
+        fetched?;
+    }
+    Ok(())
+}
+
+/// Search every mail account's server; returns the hits' row ids (newest
+/// first, at most `limit` per account) and the accounts that failed.
+pub async fn search_mail_server(
+    pool: &SqlitePool,
+    criteria: &crate::mail::search::Criteria,
+    limit: usize,
+) -> Result<(Vec<i64>, Vec<String>)> {
+    let sources: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, name FROM sources WHERE status != 'disabled' AND kind = 'imap' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("listing sources")?;
+    let mut ids = Vec::new();
+    let mut errors = Vec::new();
+    for (source_id, source_name) in sources {
+        // Search stores what it finds, as the sync does.
+        let _guard = crate::mail::sync::account_lock(pool, source_id).await;
+        let result = async {
+            let source = build_imap_source(pool, SourceId(source_id)).await?;
+            let mut session = source.mail_session().await?;
+            let found =
+                crate::mail::search::search_server(pool, &mut session, source_id, criteria, limit)
+                    .await;
+            session.logout().await;
+            found
+        }
+        .await;
+        match result {
+            Ok(found) => ids.extend(found),
+            Err(e) => errors.push(format!("{source_name}: {e:#}")),
+        }
+    }
+    Ok((ids, errors))
+}
+
 /// Bring every mail account's folders up to date for reading, without
 /// extracting: new mail in folders polled for to-dos is ingested as
 /// extraction candidates (the next full sync extracts it), the rest as

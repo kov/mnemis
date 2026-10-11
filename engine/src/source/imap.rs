@@ -472,6 +472,23 @@ impl crate::mail::sync::MailServer for ImapMailSession {
             .collect())
     }
 
+    async fn search(&mut self, criteria: &crate::mail::search::Criteria) -> Result<Vec<u32>> {
+        let query = criteria.imap();
+        // Quoted non-ASCII needs the charset named.
+        let query = if query.is_ascii() {
+            query
+        } else {
+            format!("CHARSET UTF-8 {query}")
+        };
+        Ok(self
+            .session
+            .uid_search(query)
+            .await
+            .context("IMAP search failed")?
+            .into_iter()
+            .collect())
+    }
+
     async fn headers(&mut self, uids: &[u32]) -> Result<Vec<crate::mail::sync::FetchedHeaders>> {
         let mut sorted = uids.to_vec();
         sorted.sort_unstable();

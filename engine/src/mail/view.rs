@@ -83,7 +83,7 @@ fn leaf(path: &str) -> &str {
     }
 }
 
-fn role(path: &str) -> MailboxRole {
+pub(crate) fn role(path: &str) -> MailboxRole {
     if path.eq_ignore_ascii_case("INBOX") {
         return MailboxRole::Inbox;
     }

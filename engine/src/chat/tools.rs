@@ -60,6 +60,13 @@ pub(crate) async fn dispatch(
             output: recall_turns(pool, chat_id, arguments).await,
             recorded_action: false,
         },
+        "search_mail_server" => DispatchOutput {
+            output: match search_mail_server(pool, arguments).await {
+                Ok(json) => json,
+                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+            },
+            recorded_action: false,
+        },
         "draft_email" => DispatchOutput {
             output: match draft_email(pool, chat_id, arguments).await {
                 Ok(json) => json,
@@ -69,6 +76,80 @@ pub(crate) async fn dispatch(
         },
         _ => tools::dispatch(pool, ToolScope::Global, fetch_budget, name, arguments).await,
     }
+}
+
+#[derive(Deserialize)]
+struct SearchMailServerArgs {
+    from: Option<String>,
+    subject: Option<String>,
+    text: Option<String>,
+    since: Option<String>,
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Search the mail servers, then describe the hits from the rows the search
+/// stored.
+async fn search_mail_server(pool: &SqlitePool, arguments: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let args: SearchMailServerArgs =
+        serde_json::from_str(arguments).context("parsing search_mail_server args")?;
+    let day = |s: &Option<String>, name: &str| -> anyhow::Result<Option<chrono::NaiveDate>> {
+        s.as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                chrono::NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d")
+                    .with_context(|| format!("{name} must be YYYY-MM-DD"))
+            })
+            .transpose()
+    };
+    let text = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+    let criteria = crate::mail::search::Criteria {
+        since: day(&args.since, "since")?,
+        before: day(&args.before, "before")?,
+        from: text(args.from),
+        subject: text(args.subject),
+        text: text(args.text),
+    };
+    anyhow::ensure!(
+        !criteria.is_empty(),
+        "give at least one of from, subject, text, since or before"
+    );
+    let limit = args.limit.unwrap_or(20).clamp(1, 50);
+    let (ids, errors) = crate::orchestrator::search_mail_server(pool, &criteria, limit).await?;
+    let mut hits = Vec::new();
+    for id in ids {
+        let (external_id, posted_at, author, address, subject, folder): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT m.external_id, m.posted_at, p.display_name, p.external_id, m.subject, \
+                    c.external_id \
+             FROM messages m JOIN channels c ON c.id = m.channel_id \
+             LEFT JOIN people p ON p.id = m.author_id WHERE m.id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+        hits.push(json!({
+            "external_id": external_id,
+            "posted_at": chrono::DateTime::<chrono::Utc>::from_timestamp(posted_at, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+            "author": author.or(address),
+            "subject": subject,
+            "folder": crate::source::imap_utf7::decode_mailbox_name(&folder),
+        }));
+    }
+    let mut out = json!({ "messages": hits });
+    if !errors.is_empty() {
+        out["errors"] = json!(errors);
+    }
+    Ok(out.to_string())
 }
 
 async fn search_conversation(pool: &SqlitePool, chat_id: i64, arguments: &str) -> String {

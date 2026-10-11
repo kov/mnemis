@@ -145,6 +145,73 @@ pub async fn fetch_thread(
     fetch_wanted(pool, server, source_id, wanted).await
 }
 
+/// Complete header-only messages among `ids` (`has_body = 0`) from the
+/// cache where it holds them; returns the ids still without a body.
+pub async fn complete_from_cache(pool: &SqlitePool, ids: &[i64]) -> Result<Vec<i64>> {
+    let mut missing = Vec::new();
+    for &id in ids {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(i64, String, i64, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT c.source_id, m.external_id, m.channel_id, m.uid, m.uidvalidity, m.flags \
+             FROM messages m JOIN channels c ON c.id = m.channel_id \
+             WHERE m.id = ? AND m.has_body = 0",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .context("finding header-only mail")?;
+        let Some((source_id, external_id, channel_id, uid, uidvalidity, flags)) = row else {
+            continue;
+        };
+        let mut conn = pool.acquire().await?;
+        let raw = get(&mut conn, source_id, &external_id).await?;
+        drop(conn);
+        let complete = raw.and_then(|raw| {
+            crate::source::imap::imported(
+                &raw,
+                uid.unwrap_or_default() as u32,
+                uidvalidity.unwrap_or_default() as u32,
+                flags as u32,
+                false,
+            )
+        });
+        match complete {
+            Some(m) => {
+                crate::ingest::ingest_for_reading(pool, SourceId(source_id), channel_id, &[m])
+                    .await?;
+            }
+            None => missing.push(id),
+        }
+    }
+    Ok(missing)
+}
+
+/// Download the messages among `ids` that the account's server holds,
+/// which also completes header-only rows. Returns how many arrived.
+pub async fn fetch_messages(
+    pool: &SqlitePool,
+    server: &mut dyn MailServer,
+    source_id: i64,
+    ids: &[i64],
+) -> Result<usize> {
+    let mut wanted = Vec::new();
+    for &id in ids {
+        let row: Option<(i64, String, i64, i64)> = sqlx::query_as(
+            "SELECT m.channel_id, c.external_id, m.uid, m.uidvalidity \
+             FROM messages m JOIN channels c ON c.id = m.channel_id \
+             WHERE m.id = ? AND c.source_id = ? AND m.uid IS NOT NULL \
+               AND m.uidvalidity IS NOT NULL AND m.removed_at IS NULL",
+        )
+        .bind(id)
+        .bind(source_id)
+        .fetch_optional(pool)
+        .await
+        .context("finding mail to download")?;
+        wanted.extend(row);
+    }
+    fetch_wanted(pool, server, source_id, wanted).await
+}
+
 /// Fetch `(channel, folder, uid, uidvalidity)` rows, folder by folder.
 async fn fetch_wanted(
     pool: &SqlitePool,
