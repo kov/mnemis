@@ -20,8 +20,8 @@ const FLAGGED: i64 = 0x04;
 const SNIPPET_LEN: usize = 160;
 const OPEN: &str = "('pending', 'auto_claimed', 'claimed')";
 
-/// Every mail folder, account by account: the inbox first, then the other
-/// special folders, then the rest by path.
+/// Every mail folder, account by account, as a tree: the inbox first, then
+/// the other special folders, then the rest by path.
 pub async fn mailboxes(pool: &SqlitePool) -> Result<Vec<MailboxDto>> {
     let rows: Vec<(i64, i64, String, String, i64)> = sqlx::query_as(
         "SELECT c.id, c.source_id, s.name, c.name, \
@@ -35,8 +35,11 @@ pub async fn mailboxes(pool: &SqlitePool) -> Result<Vec<MailboxDto>> {
     .context("listing folders")?;
     let mut out: Vec<MailboxDto> = rows
         .into_iter()
-        .map(
-            |(channel_id, source_id, account, path, unread)| MailboxDto {
+        .map(|(channel_id, source_id, account, path, unread)| {
+            // Folders found before names were decoded on discovery
+            // still hold the server's modified UTF-7.
+            let path = crate::source::imap_utf7::decode_mailbox_name(&path);
+            MailboxDto {
                 channel_id,
                 source_id,
                 account,
@@ -44,17 +47,28 @@ pub async fn mailboxes(pool: &SqlitePool) -> Result<Vec<MailboxDto>> {
                 role: role(&path),
                 path,
                 unread,
-            },
-        )
+            }
+        })
         .collect();
-    out.sort_by(|a, b| {
-        (a.source_id, rank(a.role), a.path.to_lowercase()).cmp(&(
-            b.source_id,
-            rank(b.role),
-            b.path.to_lowercase(),
-        ))
+    // A tree: top-level folders by role then name, each followed by its
+    // subfolders, so INBOX's children sit under INBOX.
+    out.sort_by_cached_key(|b| {
+        let levels: Vec<String> = levels(&b.path).iter().map(|l| l.to_lowercase()).collect();
+        let top = levels.first().map(String::as_str).unwrap_or_default();
+        (b.source_id, rank(role(top)), levels)
     });
     Ok(out)
+}
+
+/// A folder path's levels, top first (see [`leaf`] for the separators).
+fn levels(path: &str) -> Vec<&str> {
+    if path.contains('/') {
+        path.split('/').collect()
+    } else if path.len() > 6 && path[..6].eq_ignore_ascii_case("INBOX.") {
+        path.split('.').collect()
+    } else {
+        vec![path]
+    }
 }
 
 /// The last level of a folder path. Servers separate levels with `/` or,
@@ -283,6 +297,7 @@ pub async fn thread(pool: &SqlitePool, thread_id: i64) -> Result<ThreadDto> {
         downloaded,
     ) in rows
     {
+        let folder = leaf(&crate::source::imap_utf7::decode_mailbox_name(&folder)).to_string();
         if let Some(&i) = by_id.get(&external_id) {
             let m = &mut messages[i];
             m.folders.push(folder);
@@ -421,6 +436,38 @@ mod tests {
         assert_eq!(leaf("INBOX/Lembrar"), "Lembrar");
         assert_eq!(leaf("INBOX.Sent Items"), "Sent Items");
         assert_eq!(leaf("Archive"), "Archive");
+    }
+
+    #[tokio::test]
+    async fn folders_list_as_a_tree_with_decoded_names() -> Result<()> {
+        let (_tmp, pool, source_id) = setup().await?;
+        for path in [
+            "Gnome",
+            "INBOX/Condom&AO0-nio",
+            "Sent",
+            "INBOX",
+            "Archive",
+            "Gnome/Bugs",
+        ] {
+            folder(&pool, source_id, path, true).await?;
+        }
+        let paths: Vec<String> = mailboxes(&pool)
+            .await?
+            .into_iter()
+            .map(|b| b.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "INBOX",
+                "INBOX/Condomínio",
+                "Sent",
+                "Archive",
+                "Gnome",
+                "Gnome/Bugs"
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]
