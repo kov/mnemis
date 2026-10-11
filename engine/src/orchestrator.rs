@@ -568,6 +568,8 @@ mod tests {
                     links: None,
                     raw_json: None,
                     flags: 0,
+                    mail: None,
+                    raw: None,
                 }],
                 next_cursor: Cursor("1:2".to_string()),
                 more_available: false,

@@ -19,8 +19,31 @@ fn register_sqlite_vec() {
     });
 }
 
+/// Open the database at `path`, with the mail cache next to it
+/// (`<stem>-cache.db`).
 pub async fn open(path: &Path) -> Result<SqlitePool> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mnemis");
+    open_with_cache(path, &path.with_file_name(format!("{stem}-cache.db"))).await
+}
+
+/// Open the database at `path` and attach the mail cache at `cache_path` as
+/// schema `cache`. The cache holds only what can be fetched again (full
+/// message bodies), so it belongs in the OS cache directory, where the
+/// system may delete it: it is recreated empty.
+pub async fn open_with_cache(path: &Path, cache_path: &Path) -> Result<SqlitePool> {
     register_sqlite_vec();
+
+    if let Some(dir) = cache_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating cache dir {}", dir.display()))?;
+    }
+    let cache = cache_path
+        .to_str()
+        .context("cache path is not UTF-8")?
+        .to_string();
 
     let opts = SqliteConnectOptions::new()
         .filename(path)
@@ -31,6 +54,31 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .after_connect(move |conn, _meta| {
+            let cache = cache.clone();
+            Box::pin(async move {
+                sqlx::query("ATTACH DATABASE ? AS cache")
+                    .bind(cache)
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA cache.journal_mode = WAL")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS cache.mail_raw (\
+                         source_id INTEGER NOT NULL, \
+                         external_id TEXT NOT NULL, \
+                         raw BLOB NOT NULL, \
+                         size INTEGER NOT NULL, \
+                         fetched_at INTEGER NOT NULL, \
+                         viewed_at INTEGER, \
+                         PRIMARY KEY (source_id, external_id))",
+                )
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
         .connect_with(opts)
         .await
         .with_context(|| format!("failed to open SQLite at {}", path.display()))?;

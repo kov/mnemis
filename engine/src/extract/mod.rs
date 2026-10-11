@@ -618,7 +618,7 @@ async fn load_rows(
              p.external_id, m.recipients_json, m.links_json \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
-             WHERE m.channel_id = ? AND m.id > ? \
+             WHERE m.channel_id = ? AND m.id > ? AND m.reader_only = 0 \
              ORDER BY m.id ASC LIMIT ?",
     )
     .bind(channel_id)
@@ -1113,6 +1113,8 @@ mod tests {
             links: None,
             raw_json: None,
             flags: 0,
+            mail: None,
+            raw: None,
         };
         ingest_batch(
             &pool,
@@ -1127,6 +1129,33 @@ mod tests {
         .await?;
 
         Ok((tmp, pool, source_id, channel_id))
+    }
+
+    #[tokio::test]
+    async fn mail_kept_only_for_reading_stays_out_of_the_window() -> Result<()> {
+        let (_tmp, pool, source_id, channel_id) = setup().await?;
+        let mut old = ImportedMessage {
+            external_id: "old-1".to_string(),
+            parent_external_id: None,
+            author: None,
+            posted_at: DateTime::<Utc>::from_timestamp(1_600_000_000, 0).unwrap(),
+            subject: Some("Last year".to_string()),
+            body: "Please do this old thing".to_string(),
+            body_format: "text".to_string(),
+            recipients: Vec::new(),
+            links: None,
+            raw_json: None,
+            flags: 0,
+            mail: None,
+            raw: None,
+        };
+        old.mail = Some(crate::source::MailMeta::default());
+        crate::ingest::ingest_for_reading(&pool, SourceId(source_id), channel_id, &[old]).await?;
+
+        let window = load_window(&pool, channel_id, None).await?;
+        let ids: Vec<&str> = window.iter().map(|r| r.external_id.as_str()).collect();
+        assert_eq!(ids, ["msg-1"]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1246,6 +1275,8 @@ mod tests {
             links: None,
             raw_json: None,
             flags: 0,
+            mail: None,
+            raw: None,
         };
         ingest_batch(
             pool,

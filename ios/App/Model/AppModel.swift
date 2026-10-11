@@ -46,6 +46,7 @@ final class AppModel {
         do {
             let engine = try await Engine.open(
                 dataDir: Self.dataDirectory.path,
+                cacheDir: Self.cacheDirectory.path,
                 apple: AppleIntelligence()
             )
             self.engine = engine
@@ -402,12 +403,21 @@ final class AppModel {
     /// `Application Support/mnemis`: the database, config.toml and traces.
     /// Not visible in Files, and backed up with the device.
     static var dataDirectory: URL {
+        URL.applicationSupportDirectory.appending(path: dataName, directoryHint: .isDirectory)
+    }
+
+    /// Where the mail cache lives: everything in it can be fetched again.
+    static var cacheDirectory: URL {
+        URL.cachesDirectory.appending(path: dataName, directoryHint: .isDirectory)
+    }
+
+    private static var dataName: String {
         var name = "mnemis"
         #if DEBUG
         // `-MnemisDataDir <name>` opens another data directory (say, a copy
         // of a desktop database to evaluate against).
         name = UserDefaults.standard.string(forKey: "MnemisDataDir") ?? name
         #endif
-        return URL.applicationSupportDirectory.appending(path: name, directoryHint: .isDirectory)
+        return name
     }
 }

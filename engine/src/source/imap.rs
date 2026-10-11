@@ -11,8 +11,8 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use super::links::{self, Link};
 use super::{
-    ChannelInfo, Cursor, ImportedAuthor, ImportedMessage, PollBatch, Recipient, Source, SourceId,
-    SourceKind,
+    ChannelInfo, Cursor, ImportedAuthor, ImportedMessage, MailMeta, PollBatch, Recipient, Source,
+    SourceId, SourceKind,
 };
 
 /// New folders start muted except the inbox and the sent folder: what was
@@ -179,46 +179,18 @@ impl Source for ImapSource {
                     .try_collect()
                     .await?;
 
-                let parser = MessageParser::default();
-                let mut out = Vec::with_capacity(fetches.len());
-                for fetch in &fetches {
-                    let raw = fetch.body().unwrap_or_default();
-                    let uid = fetch.uid.unwrap_or(0);
-                    let flags = parse_flags(fetch.flags().map(|f| format!("{f:?}")));
-
-                    let Some(msg) = parser.parse(raw) else {
-                        continue;
-                    };
-
-                    let subject = msg.subject().map(|s| s.to_string());
-                    let body = msg.body_text(0).map(|c| c.into_owned()).unwrap_or_default();
-                    let posted_at = msg
-                        .date()
-                        .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0))
-                        .unwrap_or_else(Utc::now);
-                    let author = parse_author(msg.from());
-                    let mut recipients = parse_recipients(msg.to(), "to");
-                    recipients.extend(parse_recipients(msg.cc(), "cc"));
-                    let message_id = msg
-                        .message_id()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("imap-uid-{server_validity}-{uid}"));
-
-                    out.push(ImportedMessage {
-                        external_id: message_id,
-                        parent_external_id: None,
-                        author,
-                        posted_at,
-                        subject,
-                        body,
-                        body_format: "text".to_string(),
-                        recipients,
-                        links: Some(links::from_message(&msg)),
-                        raw_json: None,
-                        flags,
-                    });
-                }
-                out
+                fetches
+                    .iter()
+                    .filter_map(|fetch| {
+                        imported(
+                            fetch.body().unwrap_or_default(),
+                            fetch.uid.unwrap_or(0),
+                            server_validity,
+                            parse_flags(fetch.flags().map(|f| format!("{f:?}"))),
+                            false,
+                        )
+                    })
+                    .collect()
             }
         };
 
@@ -254,41 +226,93 @@ impl Source for ImapSource {
             .try_collect()
             .await?;
         let fetch = fetches.first().context("no fetch result")?;
-        let raw = fetch.body().unwrap_or_default();
-        let flags = parse_flags(fetch.flags().map(|f| format!("{f:?}")));
-
-        let parser = MessageParser::default();
-        let msg = parser.parse(raw).context("failed to parse message")?;
-        let subject = msg.subject().map(|s| s.to_string());
-        let body = msg.body_text(0).map(|c| c.into_owned()).unwrap_or_default();
-        let posted_at = msg
-            .date()
-            .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0))
-            .unwrap_or_else(Utc::now);
-        let author = parse_author(msg.from());
-        let mut recipients = parse_recipients(msg.to(), "to");
-        recipients.extend(parse_recipients(msg.cc(), "cc"));
-        let message_id = msg
-            .message_id()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("imap-uid-{server_validity}-{uid}"));
-
+        let message = imported(
+            fetch.body().unwrap_or_default(),
+            uid,
+            server_validity,
+            parse_flags(fetch.flags().map(|f| format!("{f:?}"))),
+            false,
+        )
+        .context("failed to parse message")?;
         let _ = session.logout().await;
-
-        Ok(ImportedMessage {
-            external_id: message_id,
-            parent_external_id: None,
-            author,
-            posted_at,
-            subject,
-            body,
-            body_format: "text".to_string(),
-            recipients,
-            links: Some(links::from_message(&msg)),
-            raw_json: None,
-            flags,
-        })
+        Ok(message)
     }
+}
+
+/// An `ImportedMessage` from a fetched message: the whole RFC 822 text, or
+/// with `headers_only` just its header block (the body stays empty until the
+/// full message is fetched).
+pub(crate) fn imported(
+    raw: &[u8],
+    uid: u32,
+    uidvalidity: u32,
+    flags: u32,
+    headers_only: bool,
+) -> Option<ImportedMessage> {
+    use mail_parser::MimeHeaders;
+    let msg = MessageParser::default().parse(raw)?;
+    let subject = msg.subject().map(|s| s.to_string());
+    let posted_at = msg
+        .date()
+        .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0))
+        .unwrap_or_else(Utc::now);
+    let mut recipients = parse_recipients(msg.to(), "to");
+    recipients.extend(parse_recipients(msg.cc(), "cc"));
+    let external_id = msg
+        .message_id()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("imap-uid-{uidvalidity}-{uid}"));
+    let ids = |v: &mail_parser::HeaderValue| -> Vec<String> {
+        v.as_text_list()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.trim_matches(['<', '>', ' ']).to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let has_attachments = if headers_only {
+        msg.content_type().is_some_and(|t| {
+            t.ctype().eq_ignore_ascii_case("multipart")
+                && t.subtype().is_some_and(|s| s.eq_ignore_ascii_case("mixed"))
+        })
+    } else {
+        // Inline images the HTML shows aren't what the paperclip means.
+        msg.attachments().any(|p| {
+            p.content_disposition().is_some_and(|d| d.is_attachment()) || p.content_id().is_none()
+        })
+    };
+    let (body, links, raw) = if headers_only {
+        (String::new(), None, None)
+    } else {
+        (
+            msg.body_text(0).map(|c| c.into_owned()).unwrap_or_default(),
+            Some(links::from_message(&msg)),
+            Some(raw.to_vec()),
+        )
+    };
+    Some(ImportedMessage {
+        external_id,
+        parent_external_id: None,
+        author: parse_author(msg.from()),
+        posted_at,
+        subject,
+        body,
+        body_format: "text".to_string(),
+        recipients,
+        links,
+        raw_json: None,
+        flags,
+        mail: Some(MailMeta {
+            uid: Some(uid),
+            uidvalidity: Some(uidvalidity),
+            in_reply_to: ids(msg.in_reply_to()).pop(),
+            references: ids(msg.references()),
+            size: raw.as_ref().map(|r| r.len() as u32),
+            has_attachments,
+            headers_only,
+        }),
+        raw,
+    })
 }
 
 impl ImapSource {

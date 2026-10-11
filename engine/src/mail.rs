@@ -1,4 +1,5 @@
-//! Outgoing mail: each IMAP account's SMTP settings, drafts, and sending.
+//! Mail: reading (the submodules) and outgoing mail — each IMAP account's
+//! SMTP settings, drafts, and sending.
 //!
 //! A draft is prefilled from the message it answers or forwards, edited by
 //! the user (or written by the chat agent's `draft_email` tool), and sent only
@@ -23,6 +24,9 @@ use sqlx::SqlitePool;
 
 use crate::secrets;
 use crate::source::SourceId;
+
+pub mod cache;
+pub mod thread;
 
 /// How long composing waits for the original's headers before going on
 /// without them.
@@ -324,9 +328,10 @@ fn parse_headers(raw: &[u8]) -> OriginalHeaders {
     }
 }
 
-/// Fetched headers of originals, by database and message, so a reply
-/// started after [`prefetch_original`] doesn't wait on the server. A fetch
-/// in flight is shared: a reply started meanwhile waits for it.
+/// Parsed headers of originals, by database and message. The message itself
+/// lands in the mail cache; this shares a fetch in flight, so a reply
+/// started during [`prefetch_original`] waits for it instead of fetching
+/// again.
 type HeaderCell = Arc<tokio::sync::OnceCell<OriginalHeaders>>;
 static HEADERS: LazyLock<Mutex<HashMap<(PathBuf, i64), HeaderCell>>> =
     LazyLock::new(Default::default);
@@ -355,15 +360,40 @@ async fn original_headers(
 ) -> OriginalHeaders {
     let cell = header_cell(pool, message_id);
     let fetch = cell.get_or_try_init(|| async {
-        let raw = postbox
-            .fetch_original(original.source_id, &original.mailbox, &original.external_id)
-            .await?;
+        let raw = original_raw(pool, postbox, original).await?;
         anyhow::Ok(parse_headers(&raw))
     });
     match tokio::time::timeout(ORIGINAL_FETCH_TIMEOUT, fetch).await {
         Ok(Ok(headers)) => headers.clone(),
         _ => OriginalHeaders::default(),
     }
+}
+
+/// The original's full message: from the mail cache, else from the server
+/// (and then cached).
+async fn original_raw(
+    pool: &SqlitePool,
+    postbox: &dyn Postbox,
+    original: &Original,
+) -> Result<Vec<u8>> {
+    let mut conn = pool.acquire().await?;
+    if let Some(raw) = cache::get(&mut conn, original.source_id, &original.external_id).await? {
+        return Ok(raw);
+    }
+    drop(conn);
+    let raw = postbox
+        .fetch_original(original.source_id, &original.mailbox, &original.external_id)
+        .await?;
+    let mut conn = pool.acquire().await?;
+    cache::store(
+        &mut conn,
+        original.source_id,
+        &original.external_id,
+        &raw,
+        Utc::now().timestamp(),
+    )
+    .await?;
+    Ok(raw)
 }
 
 /// Fetch what replying to a message needs ahead of time, for when the user
@@ -919,8 +949,7 @@ async fn send_inner(pool: &SqlitePool, postbox: &dyn Postbox, id: i64) -> Result
         ("forward", Some(message_id)) => {
             let o = load_original(pool, message_id).await?;
             Some(
-                postbox
-                    .fetch_original(o.source_id, &o.mailbox, &o.external_id)
+                original_raw(pool, postbox, &o)
                     .await
                     .context("fetching the message to forward")?,
             )

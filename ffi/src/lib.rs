@@ -185,18 +185,21 @@ impl Engine {
 #[uniffi::export]
 impl Engine {
     /// Open (creating if needed) the database and config under `data_dir`,
-    /// the app's Application Support directory. `apple` is the Apple
-    /// Intelligence bridge, when the device has it.
+    /// the app's Application Support directory, and the mail cache under
+    /// `cache_dir`, its Caches directory (which the system may clear). `apple`
+    /// is the Apple Intelligence bridge, when the device has it.
     #[uniffi::constructor]
     pub async fn open(
         data_dir: String,
+        cache_dir: String,
         apple: Option<Arc<dyn AppleModel>>,
     ) -> Result<Arc<Self>, MnemisError> {
         init_logging();
         let data_dir = PathBuf::from(data_dir);
+        let cache = PathBuf::from(cache_dir).join("mail-cache.db");
         run(async move {
             std::fs::create_dir_all(&data_dir)?;
-            let pool = db::open(&data_dir.join("mnemis.db")).await?;
+            let pool = db::open_with_cache(&data_dir.join("mnemis.db"), &cache).await?;
             db::migrate(&pool).await?;
             // A missing or unusable LLM config leaves the app usable read-only;
             // only sync needs it.

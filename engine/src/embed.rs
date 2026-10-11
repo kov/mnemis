@@ -466,6 +466,8 @@ mod tests {
             links: None,
             raw_json: None,
             flags: 0,
+            mail: None,
+            raw: None,
         };
 
         let batch = PollBatch {

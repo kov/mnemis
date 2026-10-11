@@ -784,8 +784,12 @@ fn main() {
             }
             info!(path = %app_data.display(), "opening sqlite");
 
+            let cache = resolve_cache_path(app)?;
             let pool = tauri::async_runtime::block_on(async {
-                let pool = db::open(&app_data).await?;
+                let pool = match &cache {
+                    Some(cache) => db::open_with_cache(&app_data, cache).await?,
+                    None => db::open(&app_data).await?,
+                };
                 db::migrate(&pool).await?;
                 anyhow::Ok(pool)
             })?;
@@ -940,6 +944,20 @@ async fn build_llm_stack(cfg: &Config) -> anyhow::Result<LlmStack> {
 /// Falling back to `config::default_db_path()` rather than Tauri's
 /// `app_data_dir()` is deliberate: the CLI and the desktop app must share
 /// one database, and the CLI's path predates the Tauri bundle identifier.
+/// The mail cache goes in the OS cache directory, except for a database
+/// given by `MNEMIS_DB_PATH` (tests, evaluation copies), which keeps its
+/// cache beside it.
+fn resolve_cache_path(app: &tauri::App) -> anyhow::Result<Option<PathBuf>> {
+    if std::env::var("MNEMIS_DB_PATH").is_ok() {
+        return Ok(None);
+    }
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .context("resolving the cache dir")?;
+    Ok(Some(dir.join("mail-cache.db")))
+}
+
 fn resolve_db_path(_app: &tauri::App) -> anyhow::Result<PathBuf> {
     if let Ok(p) = std::env::var("MNEMIS_DB_PATH") {
         return Ok(PathBuf::from(p));

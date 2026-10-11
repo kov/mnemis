@@ -18,6 +18,10 @@ const CLEAR_TABLES: &[&str] = &[
     "dismissal_feedback",
     "messages_vec",
     "messages", // FTS cleared by trigger
+    "mail_thread_refs",
+    "mail_threads",
+    "mail_ops",
+    "cache.mail_raw",
     // memory notes
     "memory_notes_vec",
     "memory_notes", // FTS cleared by trigger
@@ -65,7 +69,7 @@ pub async fn reset_data(pool: &SqlitePool) -> Result<ResetCounts> {
     )
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE channels SET cursor = NULL, last_synced_at = NULL")
+    sqlx::query("UPDATE channels SET cursor = NULL, last_synced_at = NULL, mail_state = NULL")
         .execute(&mut *tx)
         .await?;
     // sqlite_sequence is auto-created when an AUTOINCREMENT column exists;
@@ -193,6 +197,8 @@ mod tests {
             links: None,
             raw_json: None,
             flags: 0,
+            mail: None,
+            raw: None,
         };
         ingest_batch(
             &pool,

@@ -72,6 +72,24 @@ pub struct ImportedMessage {
     pub links: Option<Vec<links::Link>>,
     pub raw_json: Option<String>,
     pub flags: u32,
+    /// Where the mail sits on the server and how it threads; None for chat.
+    pub mail: Option<MailMeta>,
+    /// The full RFC 822 message, when it was fetched whole: kept in the mail
+    /// cache so reading it needs no second fetch.
+    pub raw: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MailMeta {
+    pub uid: Option<u32>,
+    pub uidvalidity: Option<u32>,
+    /// Message-IDs without angle brackets, like `external_id`.
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+    pub size: Option<u32>,
+    pub has_attachments: bool,
+    /// Only the headers were fetched; `body` is empty.
+    pub headers_only: bool,
 }
 
 #[derive(Debug)]
