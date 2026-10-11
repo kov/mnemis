@@ -1,10 +1,12 @@
 import Foundation
+import Network
 import Observation
 import SwiftUI
 
 enum AppTab: Hashable {
     case actions
     case chat
+    case mail
 }
 
 /// The app's view of the engine: what the screens show, and the calls that
@@ -41,6 +43,20 @@ final class AppModel {
     /// actions list shows a setup prompt instead of an empty list.
     private(set) var needsSetup = false
 
+    /// Every account's folders, for the mail sidebar.
+    private(set) var mailboxes: [MailboxDto] = []
+    /// The folder open in Mail on iPad.
+    var mailScope: MailScope = .allInboxes
+    /// The folders pushed in the iPhone's Mail tab.
+    var mailPath: [MailScope] = []
+    /// The open thread.
+    var threadSelection: Int64?
+    /// Bumped when mail changed (a sync, a message marked read), so thread
+    /// lists reload.
+    private(set) var mailVersion = 0
+    private(set) var isSyncingMail = false
+    private let network = NWPathMonitor()
+
     func start() async {
         guard engine == nil else { return }
         do {
@@ -51,7 +67,9 @@ final class AppModel {
             )
             self.engine = engine
             try await defaultToAppleIntelligence(engine)
+            watchNetwork(engine)
             await refresh()
+            Task { await syncMail() }
             #if DEBUG
             // `-MnemisOpenURL mnemis://…` at launch opens that screen, so the
             // simulator can be driven without taps (and without the
@@ -218,9 +236,50 @@ final class AppModel {
             chats = try await engine.listChats(includeArchived: false)
             let llm = try await engine.llmConfig()
             needsSetup = sources.isEmpty || llm.chatModel.isEmpty
+            mailboxes = try await engine.mailboxes()
         } catch {
             report(error)
         }
+        mailVersion += 1
+    }
+
+    /// Mail only: new mail, flags and removals in every folder, without
+    /// looking for to-dos.
+    func syncMail() async {
+        guard let engine, !isSyncingMail, !isSyncing else { return }
+        isSyncingMail = true
+        defer { isSyncingMail = false }
+        do {
+            let errors = try await engine.syncMail()
+            if !errors.isEmpty {
+                print("[mail] sync: \(errors.joined(separator: "; "))")
+            }
+            mailboxes = try await engine.mailboxes()
+        } catch {
+            report(error)
+        }
+        mailVersion += 1
+    }
+
+    /// Marks messages read or unread here at once; the server hears in the
+    /// background.
+    func markSeen(_ ids: [Int64], seen: Bool) async {
+        guard let engine else { return }
+        do {
+            try await engine.markSeen(messageIds: ids, seen: seen)
+            mailboxes = try await engine.mailboxes()
+        } catch {
+            report(error)
+        }
+        mailVersion += 1
+    }
+
+    /// Fetching mail ahead only off metered and Low Data networks.
+    private func watchNetwork(_ engine: Engine) {
+        network.pathUpdateHandler = { path in
+            engine.setPrefetchAllowed(allowed: !path.isExpensive && !path.isConstrained)
+        }
+        network.start(queue: .global(qos: .utility))
     }
 
     func sync() async {
@@ -261,13 +320,22 @@ final class AppModel {
     /// Open the chat about `action` — the existing one if there is one — on
     /// the Chat tab.
     func talkAbout(_ action: ActionDto) async {
+        await talkAbout(kind: "action", id: action.id)
+    }
+
+    /// The same for an email.
+    func talkAbout(messageId: Int64) async {
+        await talkAbout(kind: "message", id: messageId)
+    }
+
+    private func talkAbout(kind: String, id entity: Int64) async {
         guard let engine else { return }
         do {
             let id: Int64
-            if let existing = try await engine.findSeededChat(seededFromKind: "action", seededFromId: action.id) {
+            if let existing = try await engine.findSeededChat(seededFromKind: kind, seededFromId: entity) {
                 id = existing
             } else {
-                id = try await engine.createChat(seededFromKind: "action", seededFromId: action.id)
+                id = try await engine.createChat(seededFromKind: kind, seededFromId: entity)
             }
             await refreshChats()
             chatSelection = id
@@ -369,8 +437,10 @@ final class AppModel {
     }
 
     /// Deep links: `mnemis://action/<id>` and `mnemis://chat/<id>` open that
-    /// action or chat, `mnemis://draft/<id>` the composer on that draft (for
-    /// notifications, and for driving the app in tests).
+    /// action or chat, `mnemis://draft/<id>` the composer on that draft,
+    /// `mnemis://mail/<folder id>` a folder (0: All Inboxes) and
+    /// `mnemis://thread/<id>` a thread in All Inboxes (for notifications,
+    /// and for driving the app in tests).
     func open(_ url: URL) {
         guard url.scheme == "mnemis", let id = Int64(url.lastPathComponent) else { return }
         switch url.host() {
@@ -382,9 +452,28 @@ final class AppModel {
             chatSelection = id
         case "draft":
             Task { await openDraft(id) }
+        case "mail":
+            showMail(id == 0 ? .allInboxes : .mailbox(channelId: id))
+        case "thread":
+            showMail(.allInboxes)
+            threadSelection = id
         default:
             break
         }
+    }
+
+    /// Open a folder in Mail, on either layout.
+    func showMail(_ scope: MailScope) {
+        selectedTab = .mail
+        mailScope = scope
+        mailPath = [scope]
+        threadSelection = nil
+    }
+
+    /// Show a to-do, from wherever it was mentioned.
+    func showAction(_ id: Int64) {
+        selectedTab = .actions
+        actionSelection = id
     }
 
     func action(_ id: ActionDto.ID?) -> ActionDto? {

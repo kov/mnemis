@@ -42,6 +42,12 @@ struct ContentView: View {
     }
 }
 
+/// What the iPad sidebar can select: a section, or a mail folder.
+private enum SidebarItem: Hashable {
+    case section(AppTab)
+    case mailbox(MailScope)
+}
+
 /// iPad: sections | a stack where the list's detail slides in over it (with
 /// back button and swipe), as in the Claude app.
 private struct SplitLayout: View {
@@ -51,14 +57,35 @@ private struct SplitLayout: View {
         @Bindable var model = model
         NavigationSplitView(columnVisibility: $model.columnVisibility) {
             List(selection: Binding(
-                get: { Optional(model.selectedTab) },
-                set: { if let tab = $0 { model.selectedTab = tab } }
+                get: { Optional(model.selectedTab == .mail ? SidebarItem.mailbox(model.mailScope) : .section(model.selectedTab)) },
+                set: { item in
+                    switch item {
+                    case let .section(tab): model.selectedTab = tab
+                    case let .mailbox(scope):
+                        if model.selectedTab != .mail || model.mailScope != scope {
+                            model.showMail(scope)
+                        }
+                    case nil: break
+                    }
+                }
             )) {
                 Label("To-dos", systemImage: "checklist")
                     .badge(model.todos.count)
-                    .tag(AppTab.actions)
+                    .tag(SidebarItem.section(.actions))
                 Label("Chats", systemImage: "bubble.left.and.text.bubble.right")
-                    .tag(AppTab.chat)
+                    .tag(SidebarItem.section(.chat))
+                Section("Mail") {
+                    Label("All Inboxes", systemImage: "tray.2")
+                        .badge(model.inboxUnread)
+                        .tag(SidebarItem.mailbox(.allInboxes))
+                }
+                ForEach(model.mailAccounts, id: \.account) { account in
+                    Section(account.account) {
+                        ForEach(account.folders, id: \.channelId) { box in
+                            MailboxLabel(box: box).tag(SidebarItem.mailbox(box.scope))
+                        }
+                    }
+                }
             }
             .navigationTitle("mnemis")
             .toolbar { SettingsItem() }
@@ -67,6 +94,10 @@ private struct SplitLayout: View {
             switch model.selectedTab {
             case .actions: ActionsStack(showsSettings: false)
             case .chat: ChatsStack(showsSettings: false)
+            case .mail:
+                // A new folder starts a new stack, rather than pushing.
+                NavigationStack { ThreadListView(scope: model.mailScope) }
+                    .id(model.mailScope)
             }
         }
     }
@@ -86,6 +117,14 @@ private struct CompactLayout: View {
             Tab("Chats", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
                 ChatsStack(showsSettings: true)
             }
+            Tab("Mail", systemImage: "envelope", value: AppTab.mail) {
+                NavigationStack(path: $model.mailPath) {
+                    MailboxListView()
+                        .navigationTitle("Mail")
+                        .toolbar { SettingsItem() }
+                }
+            }
+            .badge(model.inboxUnread)
         }
         .tabBarMinimizeBehavior(.onScrollDown)
     }
