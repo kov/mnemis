@@ -165,7 +165,7 @@ async fn draft_email(pool: &SqlitePool, chat_id: i64, arguments: &str) -> anyhow
     if let Some(to) = args.to.filter(|t| !t.trim().is_empty()) {
         draft.to = to;
     }
-    if let Some(cc) = args.cc {
+    if let Some(cc) = args.cc.filter(|c| !c.trim().is_empty()) {
         draft.cc = cc;
     }
     if let Some(subject) = args.subject.filter(|s| !s.trim().is_empty()) {
