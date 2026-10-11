@@ -4,6 +4,8 @@
 //! once. Everything the reader shows is derived from these bytes; a message
 //! missing here is fetched from the server again.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 use sqlx::{SqliteConnection, SqlitePool};
 
@@ -25,6 +27,18 @@ const PREFETCH_MAX_SIZE: i64 = 2 << 20;
 /// Messages fetched ahead per sync, so one sync never runs long.
 const PREFETCH_PER_SYNC: i64 = 200;
 const CHUNK: usize = 20;
+
+/// Whether syncs fetch ahead. The iOS app turns it off on metered or
+/// low-data networks; opening a thread still downloads it.
+static PREFETCH_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_prefetch_allowed(allowed: bool) {
+    PREFETCH_ALLOWED.store(allowed, Ordering::Relaxed);
+}
+
+pub fn prefetch_allowed() -> bool {
+    PREFETCH_ALLOWED.load(Ordering::Relaxed)
+}
 
 /// Mail kept whatever its age: every message of a thread behind an open
 /// to-do, or answered by an unsent draft. `m` is the messages row.

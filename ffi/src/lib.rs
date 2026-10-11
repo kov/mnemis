@@ -498,6 +498,11 @@ impl Engine {
         run(async move { orchestrator::sync_mail(&pool).await }).await
     }
 
+    /// Whether syncs fetch mail ahead; off on metered or low-data networks.
+    pub fn set_prefetch_allowed(&self, allowed: bool) {
+        mail::cache::set_prefetch_allowed(allowed);
+    }
+
     /// The source's folders, refreshed from the server first so ones created
     /// there show up. Discovery is best-effort: offline, the known folders
     /// still come back.

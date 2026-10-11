@@ -225,7 +225,11 @@ async fn sync_reader(
     let result = async {
         let counts = crate::mail::sync::sync_folders(pool, &mut session, source_id).await?;
         let now = Utc::now().timestamp();
-        let fetched = crate::mail::cache::prefetch(pool, &mut session, source_id, now).await?;
+        let fetched = if crate::mail::cache::prefetch_allowed() {
+            crate::mail::cache::prefetch(pool, &mut session, source_id, now).await?
+        } else {
+            0
+        };
         let evicted = crate::mail::cache::evict(pool, now).await?;
         anyhow::Ok((counts, fetched, evicted))
     }
