@@ -188,7 +188,6 @@ async fn sync_one_source(
     idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
-    let _guard = crate::mail::sync::account_lock(pool, source_id).await;
     let source = build_imap_source(pool, SourceId(source_id)).await?;
     let mut counts = sync_one_source_with(
         pool,
@@ -203,6 +202,7 @@ async fn sync_one_source(
         traces_dir,
     )
     .await?;
+    let _guard = crate::mail::sync::account_lock(pool, source_id).await;
     counts
         .errors
         .extend(sync_reader(pool, &source, source_id, source_name).await);
@@ -222,16 +222,25 @@ async fn sync_reader(
         Ok(session) => session,
         Err(e) => return vec![format!("source '{source_name}': mail sync: {e:#}")],
     };
-    let result = crate::mail::sync::sync_folders(pool, &mut session, source_id).await;
+    let result = async {
+        let counts = crate::mail::sync::sync_folders(pool, &mut session, source_id).await?;
+        let now = Utc::now().timestamp();
+        let fetched = crate::mail::cache::prefetch(pool, &mut session, source_id, now).await?;
+        let evicted = crate::mail::cache::evict(pool, now).await?;
+        anyhow::Ok((counts, fetched, evicted))
+    }
+    .await;
     session.logout().await;
     match result {
-        Ok(c) => {
+        Ok((c, fetched, evicted)) => {
             info!(
                 source_id,
                 folders = c.folders,
                 new = c.new,
                 flag_changes = c.flag_changes,
                 removed = c.removed,
+                fetched,
+                evicted,
                 secs = started.elapsed().as_secs(),
                 "source: mail synced"
             );
@@ -242,6 +251,20 @@ async fn sync_reader(
         }
         Err(e) => vec![format!("source '{source_name}': mail sync: {e:#}")],
     }
+}
+
+/// Fetch the messages of a thread the user is opening that aren't cached.
+pub async fn fetch_thread(pool: &SqlitePool, thread_id: i64) -> Result<usize> {
+    let source_id: i64 = sqlx::query_scalar("SELECT source_id FROM mail_threads WHERE id = ?")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .context("finding the thread")?;
+    let source = build_imap_source(pool, SourceId(source_id)).await?;
+    let mut session = source.mail_session().await?;
+    let fetched = crate::mail::cache::fetch_thread(pool, &mut session, source_id, thread_id).await;
+    session.logout().await;
+    fetched
 }
 
 /// Bring every mail account's folders up to date for reading, without
@@ -307,7 +330,12 @@ async fn sync_one_source_with(
     // Phase 1 — poll + ingest every channel. No embedding or extraction
     // inline here: keeping them out of this loop is what avoids holding both
     // the embed and chat models resident at once (see the module doc).
-    poll_channels(pool, source, source_id, source_name, &mut counts).await?;
+    {
+        // Extraction runs unlocked: it can take minutes, and the reader's
+        // quick sync and mark-read shouldn't wait on it.
+        let _guard = crate::mail::sync::account_lock(pool, source_id).await;
+        poll_channels(pool, source, source_id, source_name, &mut counts).await?;
+    }
     // Extract every channel with mail not yet extracted: what this poll
     // brought, and what a mail-only sync ([`sync_mail`]) ingested since.
     let to_extract = channels_pending_extraction(pool, source_id).await?;

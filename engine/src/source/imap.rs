@@ -497,6 +497,27 @@ impl crate::mail::sync::MailServer for ImapMailSession {
             .collect())
     }
 
+    async fn messages(&mut self, uids: &[u32]) -> Result<Vec<crate::mail::sync::FetchedMessage>> {
+        let mut sorted = uids.to_vec();
+        sorted.sort_unstable();
+        let fetches: Vec<_> = self
+            .session
+            .uid_fetch(compress_uid_set(&sorted), "(UID FLAGS BODY.PEEK[])")
+            .await?
+            .try_collect()
+            .await?;
+        Ok(fetches
+            .iter()
+            .filter_map(|f| {
+                Some(crate::mail::sync::FetchedMessage {
+                    uid: f.uid?,
+                    flags: parse_flags(f.flags().map(|f| format!("{f:?}"))),
+                    raw: f.body()?.to_vec(),
+                })
+            })
+            .collect())
+    }
+
     async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>> {
         let query = match changed_since {
             Some(modseq) => format!("(UID FLAGS) (CHANGEDSINCE {modseq})"),

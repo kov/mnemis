@@ -46,6 +46,14 @@ pub struct FetchedHeaders {
     pub header: Vec<u8>,
 }
 
+/// One whole message, as fetched.
+#[derive(Debug, Clone)]
+pub struct FetchedMessage {
+    pub uid: u32,
+    pub flags: u32,
+    pub raw: Vec<u8>,
+}
+
 /// An account's mail server, one session.
 #[async_trait]
 pub trait MailServer: Send {
@@ -55,6 +63,7 @@ pub trait MailServer: Send {
     /// a date.
     async fn uids(&mut self, since: Option<DateTime<Utc>>) -> Result<Vec<u32>>;
     async fn headers(&mut self, uids: &[u32]) -> Result<Vec<FetchedHeaders>>;
+    async fn messages(&mut self, uids: &[u32]) -> Result<Vec<FetchedMessage>>;
     /// `(uid, flags)` of the mail whose flags changed since `modseq`, or of
     /// all mail when `None`.
     async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>>;
@@ -313,8 +322,10 @@ pub(crate) mod tests {
         pub condstore: bool,
         /// Every store: folder, UIDs, read or unread.
         pub stored: Vec<(String, Vec<u32>, bool)>,
-        /// Fail every store, as when offline.
+        /// Fail every store and fetch of whole messages, as when offline.
         pub offline: bool,
+        /// UIDs of every whole message fetched.
+        pub fetched: Vec<u32>,
         pub open: String,
     }
 
@@ -393,6 +404,25 @@ pub(crate) mod tests {
                         flags: m.flags,
                         size: Some(1000),
                         header: header(m),
+                    })
+                })
+                .collect())
+        }
+
+        async fn messages(&mut self, uids: &[u32]) -> Result<Vec<FetchedMessage>> {
+            anyhow::ensure!(!self.offline, "offline");
+            self.fetched.extend(uids);
+            let f = self.current();
+            Ok(uids
+                .iter()
+                .filter_map(|u| {
+                    let m = f.messages.get(u)?;
+                    let mut raw = header(m);
+                    raw.extend(format!("The body of {}.\r\n", m.id).into_bytes());
+                    Some(FetchedMessage {
+                        uid: *u,
+                        flags: m.flags,
+                        raw,
                     })
                 })
                 .collect())
