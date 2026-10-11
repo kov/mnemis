@@ -411,10 +411,13 @@ pub async fn delete_source(pool: &SqlitePool, source_id: i64) -> Result<()> {
         .await?;
     tx.commit().await?;
     // Its password or Google sign-in goes too; best-effort, the account is
-    // gone either way.
+    // gone either way. Only an entry that's there: removing asks for Touch
+    // ID on the Mac, reading doesn't.
     if let Some(reference) = config_ref.filter(|r| !r.is_empty()) {
         crate::oauth::forget(&reference);
-        let _ = secrets::delete(&reference).await;
+        if secrets::fetch(&reference).await.is_ok() {
+            let _ = secrets::delete(&reference).await;
+        }
     }
     Ok(())
 }
