@@ -188,8 +188,9 @@ async fn sync_one_source(
     idle_timeout: Duration,
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
+    let _guard = crate::mail::sync::account_lock(pool, source_id).await;
     let source = build_imap_source(pool, SourceId(source_id)).await?;
-    sync_one_source_with(
+    let mut counts = sync_one_source_with(
         pool,
         source_id,
         source_name,
@@ -201,7 +202,78 @@ async fn sync_one_source(
         idle_timeout,
         traces_dir,
     )
+    .await?;
+    counts
+        .errors
+        .extend(sync_reader(pool, &source, source_id, source_name).await);
+    Ok(counts)
+}
+
+/// The reader's view of every folder (history, flags, removals); returns the
+/// errors, which never fail the source's sync.
+async fn sync_reader(
+    pool: &SqlitePool,
+    source: &ImapSource,
+    source_id: i64,
+    source_name: &str,
+) -> Vec<String> {
+    let started = Instant::now();
+    let mut session = match source.mail_session().await {
+        Ok(session) => session,
+        Err(e) => return vec![format!("source '{source_name}': mail sync: {e:#}")],
+    };
+    let result = crate::mail::sync::sync_folders(pool, &mut session, source_id).await;
+    session.logout().await;
+    match result {
+        Ok(c) => {
+            info!(
+                source_id,
+                folders = c.folders,
+                new = c.new,
+                flag_changes = c.flag_changes,
+                removed = c.removed,
+                secs = started.elapsed().as_secs(),
+                "source: mail synced"
+            );
+            c.errors
+                .into_iter()
+                .map(|e| format!("source '{source_name}': mail sync: {e}"))
+                .collect()
+        }
+        Err(e) => vec![format!("source '{source_name}': mail sync: {e:#}")],
+    }
+}
+
+/// Bring every mail account's folders up to date for reading, without
+/// extracting: new mail in folders polled for to-dos is ingested as
+/// extraction candidates (the next full sync extracts it), the rest as
+/// reading-only mail. Quick enough to run often. Returns the errors.
+pub async fn sync_mail(pool: &SqlitePool) -> Result<Vec<String>> {
+    let sources: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, name FROM sources WHERE status != 'disabled' AND kind = 'imap' ORDER BY id",
+    )
+    .fetch_all(pool)
     .await
+    .context("listing sources")?;
+    let mut errors = Vec::new();
+    for (source_id, source_name) in sources {
+        let _guard = crate::mail::sync::account_lock(pool, source_id).await;
+        let source = match build_imap_source(pool, SourceId(source_id)).await {
+            Ok(source) => source,
+            Err(e) => {
+                errors.push(format!("source '{source_name}': {e:#}"));
+                continue;
+            }
+        };
+        if let Err(e) = discover_channels(pool, &source, source_id).await {
+            warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
+        }
+        let mut counts = SourceCounts::default();
+        poll_channels(pool, &source, source_id, &source_name, &mut counts).await?;
+        errors.extend(counts.errors);
+        errors.extend(sync_reader(pool, &source, source_id, &source_name).await);
+    }
+    Ok(errors)
 }
 
 /// Inner loop, split out so tests can inject a fake `Source` without
@@ -230,64 +302,15 @@ async fn sync_one_source_with(
         );
     }
 
-    let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
-    )
-    .bind(source_id)
-    .fetch_all(pool)
-    .await
-    .context("listing channels")?;
-
-    let total_channels = channels.len();
     let mut counts = SourceCounts::default();
 
-    // Phase 1 — poll + ingest every channel, remembering which ones got new
-    // messages so we only extract those. No embedding or extraction inline
-    // here: keeping them out of this loop is what avoids holding both the
-    // embed and chat models resident at once (see the module doc).
-    let mut to_extract: Vec<(i64, String)> = Vec::new();
-    for (idx, (channel_id, external_id, cursor)) in channels.into_iter().enumerate() {
-        counts.channels_polled += 1;
-        let ch_started = Instant::now();
-        info!(
-            channel_id,
-            channel = %external_id,
-            progress = format!("{}/{total_channels}", idx + 1),
-            "channel: poll"
-        );
-        let cursor = cursor.map(Cursor);
-        let batch = match source.poll(&external_id, cursor.as_ref()).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    error = format!("{e:#}"),
-                    channel_id,
-                    channel = %external_id,
-                    "channel: poll failed"
-                );
-                counts.errors.push(format!(
-                    "source '{source_name}' channel '{external_id}': poll failed: {e:#}"
-                ));
-                continue;
-            }
-        };
-
-        let inserted = ingest_batch(pool, SourceId(source_id), channel_id, &batch).await?;
-        counts.messages_ingested += inserted as i64;
-
-        if inserted == 0 {
-            info!(
-                channel_id,
-                channel = %external_id,
-                ingested = 0,
-                secs = ch_started.elapsed().as_secs(),
-                "channel: no new messages"
-            );
-            continue;
-        }
-        trace!(channel_id, ingested = inserted, "channel: ingested");
-        to_extract.push((channel_id, external_id));
-    }
+    // Phase 1 — poll + ingest every channel. No embedding or extraction
+    // inline here: keeping them out of this loop is what avoids holding both
+    // the embed and chat models resident at once (see the module doc).
+    poll_channels(pool, source, source_id, source_name, &mut counts).await?;
+    // Extract every channel with mail not yet extracted: what this poll
+    // brought, and what a mail-only sync ([`sync_mail`]) ingested since.
+    let to_extract = channels_pending_extraction(pool, source_id).await?;
 
     // Phase 2 — embed everything ingested this cycle in a single pass, while
     // the embedding model is the only one that needs to be hot. `drain_once`
@@ -367,6 +390,90 @@ async fn sync_one_source_with(
     }
 
     Ok(counts)
+}
+
+/// Poll every folder polled for to-dos and ingest what's new, whole: the
+/// extraction candidates.
+async fn poll_channels(
+    pool: &SqlitePool,
+    source: &dyn Source,
+    source_id: i64,
+    source_name: &str,
+    counts: &mut SourceCounts,
+) -> Result<()> {
+    let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .context("listing channels")?;
+
+    let total_channels = channels.len();
+    for (idx, (channel_id, external_id, cursor)) in channels.into_iter().enumerate() {
+        counts.channels_polled += 1;
+        let ch_started = Instant::now();
+        info!(
+            channel_id,
+            channel = %external_id,
+            progress = format!("{}/{total_channels}", idx + 1),
+            "channel: poll"
+        );
+        let cursor = cursor.map(Cursor);
+        let batch = match source.poll(&external_id, cursor.as_ref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    channel_id,
+                    channel = %external_id,
+                    "channel: poll failed"
+                );
+                counts.errors.push(format!(
+                    "source '{source_name}' channel '{external_id}': poll failed: {e:#}"
+                ));
+                continue;
+            }
+        };
+
+        let inserted = ingest_batch(pool, SourceId(source_id), channel_id, &batch).await?;
+        counts.messages_ingested += inserted as i64;
+
+        if inserted == 0 {
+            info!(
+                channel_id,
+                channel = %external_id,
+                ingested = 0,
+                secs = ch_started.elapsed().as_secs(),
+                "channel: no new messages"
+            );
+            continue;
+        }
+        trace!(channel_id, ingested = inserted, "channel: ingested");
+    }
+    Ok(())
+}
+
+/// The account's folders polled for to-dos that hold mail newer than their
+/// last successful extraction.
+async fn channels_pending_extraction(
+    pool: &SqlitePool,
+    source_id: i64,
+) -> Result<Vec<(i64, String)>> {
+    sqlx::query_as(
+        "SELECT c.id, c.external_id FROM channels c \
+         WHERE c.source_id = ? AND c.muted = 0 AND EXISTS ( \
+             SELECT 1 FROM messages m WHERE m.channel_id = c.id AND m.reader_only = 0 \
+               AND m.id > COALESCE(( \
+                   SELECT up_to_message_id FROM extraction_runs r \
+                   WHERE r.channel_id = c.id AND r.result IN ('ok', 'no_activity') \
+                   ORDER BY r.ran_at DESC, r.id DESC LIMIT 1), 0)) \
+         ORDER BY c.id",
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .context("listing folders to extract")
 }
 
 /// Build a runnable `ImapSource` from the persisted settings + the keychain

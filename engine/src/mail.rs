@@ -26,6 +26,7 @@ use crate::secrets;
 use crate::source::SourceId;
 
 pub mod cache;
+pub mod sync;
 pub mod thread;
 
 /// How long composing waits for the original's headers before going on

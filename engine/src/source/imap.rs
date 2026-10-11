@@ -415,6 +415,106 @@ impl ImapSource {
     }
 }
 
+impl ImapSource {
+    /// One session for the reader's sync of every folder.
+    pub async fn mail_session(&self) -> Result<ImapMailSession> {
+        let mut session = self.connect().await?;
+        let condstore = session
+            .capabilities()
+            .await
+            .context("reading server capabilities")?
+            .has_str("CONDSTORE");
+        Ok(ImapMailSession { session, condstore })
+    }
+}
+
+pub struct ImapMailSession {
+    session: ImapSession,
+    condstore: bool,
+}
+
+impl ImapMailSession {
+    pub async fn logout(mut self) {
+        let _ = self.session.logout().await;
+    }
+}
+
+#[async_trait]
+impl crate::mail::sync::MailServer for ImapMailSession {
+    async fn open(&mut self, folder: &str) -> Result<crate::mail::sync::FolderStatus> {
+        // SELECT, not EXAMINE: the reader marks mail read. Bodies are still
+        // fetched with BODY.PEEK so fetching never marks anything.
+        let mailbox = if self.condstore {
+            self.session.select_condstore(folder).await
+        } else {
+            self.session.select(folder).await
+        }
+        .with_context(|| format!("failed to open folder {folder}"))?;
+        Ok(crate::mail::sync::FolderStatus {
+            exists: mailbox.exists,
+            uidvalidity: mailbox.uid_validity.context("missing UIDVALIDITY")?,
+            uidnext: mailbox.uid_next.context("missing UIDNEXT")?,
+            highest_modseq: mailbox.highest_modseq.filter(|_| self.condstore),
+        })
+    }
+
+    async fn uids(&mut self, since: Option<DateTime<Utc>>) -> Result<Vec<u32>> {
+        let query = match since {
+            Some(date) => format!("SINCE {}", date.format("%d-%b-%Y")),
+            None => "ALL".to_string(),
+        };
+        Ok(self
+            .session
+            .uid_search(query)
+            .await
+            .context("IMAP search failed")?
+            .into_iter()
+            .collect())
+    }
+
+    async fn headers(&mut self, uids: &[u32]) -> Result<Vec<crate::mail::sync::FetchedHeaders>> {
+        let mut sorted = uids.to_vec();
+        sorted.sort_unstable();
+        let fetches: Vec<_> = self
+            .session
+            .uid_fetch(
+                compress_uid_set(&sorted),
+                "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])",
+            )
+            .await?
+            .try_collect()
+            .await?;
+        Ok(fetches
+            .iter()
+            .filter_map(|f| {
+                Some(crate::mail::sync::FetchedHeaders {
+                    uid: f.uid?,
+                    flags: parse_flags(f.flags().map(|f| format!("{f:?}"))),
+                    size: f.size,
+                    header: f.header()?.to_vec(),
+                })
+            })
+            .collect())
+    }
+
+    async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>> {
+        let query = match changed_since {
+            Some(modseq) => format!("(UID FLAGS) (CHANGEDSINCE {modseq})"),
+            None => "(UID FLAGS)".to_string(),
+        };
+        let fetches: Vec<_> = self
+            .session
+            .uid_fetch("1:*", query)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(fetches
+            .iter()
+            .filter_map(|f| Some((f.uid?, parse_flags(f.flags().map(|f| format!("{f:?}"))))))
+            .collect())
+    }
+}
+
 /// The UID of a message in the examined mailbox, from its external id: the
 /// UID itself for `imap-uid-VALIDITY-UID` ids, else a Message-ID search.
 async fn find_uid(session: &mut ImapSession, message_external_id: &str) -> Result<u32> {
