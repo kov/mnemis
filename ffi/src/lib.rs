@@ -517,6 +517,12 @@ impl Engine {
         run(async move { orchestrator::sync_mail(&pool).await }).await
     }
 
+    /// Sync only the folder (or every inbox) on screen; the errors.
+    pub async fn sync_scope(&self, scope: MailScope) -> Result<Vec<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { orchestrator::sync_scope(&pool, scope).await }).await
+    }
+
     /// Whether syncs fetch mail ahead; off on metered or low-data networks.
     pub fn set_prefetch_allowed(&self, allowed: bool) {
         mail::cache::set_prefetch_allowed(allowed);

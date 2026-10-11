@@ -25,7 +25,7 @@ use crate::ingest::ingest_batch;
 use crate::llm::LlmTransport;
 use crate::secrets;
 use crate::source::imap::{ImapConfig, ImapSource};
-use crate::source::{Cursor, Source, SourceId};
+use crate::source::{Cursor, PollBatch, Source, SourceId};
 
 /// A full sync: [`sync_mail`], then [`find_to_dos`]. `model_name` is
 /// recorded in `extraction_runs.model`; `window_char_budget` caps how much
@@ -167,22 +167,18 @@ struct SourceCounts {
 
 /// The reader's view of every folder (history, flags, removals); returns the
 /// errors, which never fail the source's sync.
-async fn sync_reader(
+async fn reader_pass(
     pool: &SqlitePool,
-    source: &ImapSource,
+    session: &mut crate::source::imap::ImapMailSession,
     source_id: i64,
     source_name: &str,
 ) -> Vec<String> {
     let started = Instant::now();
-    let mut session = match source.mail_session().await {
-        Ok(session) => session,
-        Err(e) => return vec![format!("source '{source_name}': mail sync: {e:#}")],
-    };
     let result = async {
-        let counts = crate::mail::sync::sync_folders(pool, &mut session, source_id).await?;
+        let counts = crate::mail::sync::sync_folders(pool, &mut *session, source_id).await?;
         let now = Utc::now().timestamp();
         let fetched = if crate::mail::cache::prefetch_allowed() {
-            crate::mail::cache::prefetch(pool, &mut session, source_id, now).await?
+            crate::mail::cache::prefetch(pool, &mut *session, source_id, now).await?
         } else {
             0
         };
@@ -190,7 +186,6 @@ async fn sync_reader(
         anyhow::Ok((counts, fetched, evicted))
     }
     .await;
-    session.logout().await;
     match result {
         Ok((c, fetched, evicted)) => {
             info!(
@@ -317,17 +312,37 @@ pub async fn sync_mail_outcome(pool: &SqlitePool) -> Result<SyncOutcome> {
         let _guard = crate::mail::sync::account_lock(pool, source_id).await;
         // Erased, as is each account's extraction: left concrete, the nested
         // futures overflow the compiler's `Send` check in callers.
+        // One session for the whole account: folders, polls, the reader.
         let result: Erased<'_, SourceCounts> = Box::pin(async {
             let source = build_imap_source(pool, SourceId(source_id)).await?;
-            if let Err(e) = discover_channels(pool, &source, source_id).await {
-                warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
+            let mut session = source.mail_session().await?;
+            let counts = async {
+                match session.channels().await {
+                    Ok(channels) => {
+                        store_channels(pool, &channels, source_id).await?;
+                    }
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
+                    }
+                }
+                let mut counts = SourceCounts::default();
+                poll_channels(
+                    pool,
+                    &mut session,
+                    source_id,
+                    &source_name,
+                    None,
+                    &mut counts,
+                )
+                .await?;
+                counts
+                    .errors
+                    .extend(reader_pass(pool, &mut session, source_id, &source_name).await);
+                anyhow::Ok(counts)
             }
-            let mut counts = SourceCounts::default();
-            poll_channels(pool, &source, source_id, &source_name, &mut counts).await?;
+            .await;
+            session.logout().await;
             counts
-                .errors
-                .extend(sync_reader(pool, &source, source_id, &source_name).await);
-            anyhow::Ok(counts)
         });
         let result = result.await;
         match result {
@@ -385,7 +400,15 @@ async fn sync_one_source_with(
         warn!(error = %format!("{e:#}"), source_id, "channel discovery failed");
     }
     let mut counts = SourceCounts::default();
-    poll_channels(pool, source, source_id, source_name, &mut counts).await?;
+    poll_channels(
+        pool,
+        &mut ViaSource(source),
+        source_id,
+        source_name,
+        None,
+        &mut counts,
+    )
+    .await?;
     let extracted = extract_source(
         pool,
         source_id,
@@ -536,15 +559,18 @@ pub async fn push_mail_changes(pool: &SqlitePool) -> Result<Vec<String>> {
 /// extraction candidates.
 async fn poll_channels(
     pool: &SqlitePool,
-    source: &dyn Source,
+    poller: &mut dyn Poller,
     source_id: i64,
     source_name: &str,
+    only: Option<i64>,
     counts: &mut SourceCounts,
 ) -> Result<()> {
     let channels: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, external_id, cursor FROM channels WHERE source_id = ? AND muted = 0",
+        "SELECT id, external_id, cursor FROM channels \
+         WHERE source_id = ?1 AND muted = 0 AND (?2 IS NULL OR id = ?2)",
     )
     .bind(source_id)
+    .bind(only)
     .fetch_all(pool)
     .await
     .context("listing channels")?;
@@ -560,7 +586,7 @@ async fn poll_channels(
             "channel: poll"
         );
         let cursor = cursor.map(Cursor);
-        let batch = match source.poll(&external_id, cursor.as_ref()).await {
+        let batch = match poller.poll(&external_id, cursor.as_ref()).await {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -592,6 +618,116 @@ async fn poll_channels(
         trace!(channel_id, ingested = inserted, "channel: ingested");
     }
     Ok(())
+}
+
+/// What polls a folder for to-dos: an open IMAP session or, in tests, any
+/// [`Source`].
+#[async_trait::async_trait]
+trait Poller: Send {
+    async fn poll(&mut self, folder: &str, cursor: Option<&Cursor>) -> Result<PollBatch>;
+}
+
+#[async_trait::async_trait]
+impl Poller for crate::source::imap::ImapMailSession {
+    async fn poll(&mut self, folder: &str, cursor: Option<&Cursor>) -> Result<PollBatch> {
+        crate::source::imap::ImapMailSession::poll(self, folder, cursor).await
+    }
+}
+
+#[cfg(test)]
+struct ViaSource<'a>(&'a dyn Source);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Poller for ViaSource<'_> {
+    async fn poll(&mut self, folder: &str, cursor: Option<&Cursor>) -> Result<PollBatch> {
+        self.0.poll(folder, cursor).await
+    }
+}
+
+/// Sync only what the user is looking at, a folder or every account's
+/// inbox, for reading and, where it's polled, for to-dos: what pulling to
+/// refresh waits on, ahead of the full sync. Returns the errors.
+pub async fn sync_scope(pool: &SqlitePool, scope: mnemis_types::MailScope) -> Result<Vec<String>> {
+    let (all_inboxes, channel_id) = match scope {
+        mnemis_types::MailScope::AllInboxes => (true, None),
+        mnemis_types::MailScope::Mailbox { channel_id } => (false, Some(channel_id)),
+    };
+    let folders: Vec<(i64, i64, String, String)> = sqlx::query_as(
+        "SELECT c.id, c.source_id, c.external_id, s.name FROM channels c \
+         JOIN sources s ON s.id = c.source_id \
+         WHERE s.status != 'disabled' AND s.kind = 'imap' AND c.kind = 'mailbox' \
+           AND ((?1 AND upper(c.external_id) = 'INBOX') OR c.id = ?2) \
+         ORDER BY c.source_id, c.id",
+    )
+    .bind(all_inboxes)
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await
+    .context("listing the folders to sync")?;
+    let started = Instant::now();
+    let mut errors = Vec::new();
+    let mut i = 0;
+    while i < folders.len() {
+        let source_id = folders[i].1;
+        let source_name = folders[i].3.clone();
+        let mine: Vec<(i64, String)> = folders[i..]
+            .iter()
+            .take_while(|f| f.1 == source_id)
+            .map(|f| (f.0, f.2.clone()))
+            .collect();
+        i += mine.len();
+        let _guard = crate::mail::sync::account_lock(pool, source_id).await;
+        let result: Erased<'_, Vec<String>> = Box::pin(async {
+            let source = build_imap_source(pool, SourceId(source_id)).await?;
+            let mut session = source.mail_session().await?;
+            let synced = async {
+                let mut errors = Vec::new();
+                // The user's changes go first, so the flags read back
+                // include them.
+                if let Err(e) = crate::mail::ops::flush(pool, &mut session, source_id).await {
+                    errors.push(format!("sending mail changes: {e:#}"));
+                }
+                for (channel_id, folder) in &mine {
+                    let mut counts = SourceCounts::default();
+                    poll_channels(
+                        pool,
+                        &mut session,
+                        source_id,
+                        &source_name,
+                        Some(*channel_id),
+                        &mut counts,
+                    )
+                    .await?;
+                    errors.extend(counts.errors);
+                    crate::mail::sync::sync_folder(
+                        pool,
+                        &mut session,
+                        source_id,
+                        *channel_id,
+                        folder,
+                        Utc::now(),
+                    )
+                    .await?;
+                }
+                anyhow::Ok(errors)
+            }
+            .await;
+            session.logout().await;
+            synced
+        });
+        match result.await {
+            Ok(e) => errors.extend(e),
+            Err(e) => errors.push(format!("source '{source_name}': {e:#}")),
+        }
+    }
+    info!(
+        folders = folders.len(),
+        errors = errors.len(),
+        millis = started.elapsed().as_millis() as u64,
+        "mail on screen synced"
+    );
+    Ok(errors)
 }
 
 /// The account's folders polled for to-dos that hold mail newer than their
@@ -673,7 +809,17 @@ pub async fn discover_channels(
     source_id: i64,
 ) -> Result<usize> {
     let channels = source.list_channels().await.context("listing channels")?;
-    for ch in &channels {
+    store_channels(pool, &channels, source_id).await
+}
+
+/// Record the account's folders: one seen for the first time takes the
+/// source's default; one already known keeps what the user chose.
+async fn store_channels(
+    pool: &SqlitePool,
+    channels: &[crate::source::ChannelInfo],
+    source_id: i64,
+) -> Result<usize> {
+    for ch in channels {
         // A folder seen for the first time takes the source's default; one we
         // already know keeps whatever the user chose.
         sqlx::query(

@@ -75,6 +75,116 @@ impl ImapSource {
     }
 }
 
+/// The account's folders, on an open session.
+async fn list_on(session: &mut ImapSession) -> Result<Vec<ChannelInfo>> {
+    let names: Vec<_> = session
+        .list(Some(""), Some("*"))
+        .await?
+        .try_collect()
+        .await?;
+    let channels = names
+        .iter()
+        .map(|n| ChannelInfo {
+            // external_id is what we hand back to the server in later
+            // SELECT calls — it MUST stay in the raw modified-UTF-7
+            // form. `name` is for humans; decode it so accented and
+            // non-Latin mailboxes don't show up as `Ita&APo-`.
+            external_id: n.name().to_string(),
+            name: super::imap_utf7::decode_mailbox_name(n.name()),
+            kind: "mailbox".to_string(),
+            subscribed_by_default: subscribed_by_default(
+                n.name(),
+                n.attributes().contains(&NameAttribute::Sent),
+            ),
+        })
+        .collect();
+    Ok(channels)
+}
+
+/// New mail in a folder polled for to-dos, fetched whole, from `cursor` on
+/// (or the latest few without one), on an open session.
+async fn poll_on(
+    session: &mut ImapSession,
+    channel_external_id: &str,
+    cursor: Option<&Cursor>,
+) -> Result<PollBatch> {
+    // EXAMINE, not SELECT: the poll only reads, and a read-only open
+    // guarantees it can never change flags (notably the implicit `\Seen`
+    // a body FETCH would otherwise set).
+    let mailbox = session
+        .examine(channel_external_id)
+        .await
+        .with_context(|| format!("failed to examine mailbox: {channel_external_id}"))?;
+
+    let server_validity = mailbox.uid_validity.context("missing UIDVALIDITY")?;
+    let server_uidnext = mailbox.uid_next.context("missing UIDNEXT")?;
+
+    let search_from_uid = match cursor {
+        Some(c) => {
+            let (validity, last_uidnext) = parse_cursor(c)?;
+            if validity != server_validity {
+                server_uidnext
+                    .saturating_sub(BOOTSTRAP_MESSAGE_COUNT)
+                    .max(1)
+            } else {
+                last_uidnext
+            }
+        }
+        None => server_uidnext
+            .saturating_sub(BOOTSTRAP_MESSAGE_COUNT)
+            .max(1),
+    };
+
+    let messages = if search_from_uid >= server_uidnext {
+        Vec::new()
+    } else {
+        let query = format!("UID {search_from_uid}:*");
+        let uids: Vec<u32> = session
+            .uid_search(&query)
+            .await
+            .context("IMAP search failed")?
+            .into_iter()
+            .filter(|uid| *uid >= search_from_uid)
+            .collect();
+
+        if uids.is_empty() {
+            Vec::new()
+        } else {
+            let mut sorted = uids;
+            sorted.sort_unstable();
+            let uid_set = compress_uid_set(&sorted);
+            let fetches: Vec<_> = session
+                .uid_fetch(&uid_set, "(UID FLAGS INTERNALDATE BODY.PEEK[])")
+                .await?
+                .try_collect()
+                .await?;
+
+            fetches
+                .iter()
+                .filter_map(|fetch| {
+                    let mut m = imported(
+                        fetch.body().unwrap_or_default(),
+                        fetch.uid.unwrap_or(0),
+                        server_validity,
+                        parse_flags(fetch.flags().map(|f| format!("{f:?}"))),
+                        false,
+                    )?;
+                    if let Some(mail) = m.mail.as_mut() {
+                        mail.received_at = fetch.internal_date().map(|d| d.with_timezone(&Utc));
+                    }
+                    Some(m)
+                })
+                .collect()
+        }
+    };
+
+    Ok(PollBatch {
+        messages,
+        next_cursor: make_cursor(server_validity, server_uidnext),
+        more_available: false,
+    })
+}
+
 fn parse_cursor(c: &Cursor) -> Result<(u32, u32)> {
     let (validity, next) = c.0.split_once(':').context("malformed IMAP cursor")?;
     let validity: u32 = validity
@@ -100,111 +210,16 @@ impl Source for ImapSource {
 
     async fn list_channels(&self) -> Result<Vec<ChannelInfo>> {
         let mut session = self.connect().await?;
-        let names: Vec<_> = session
-            .list(Some(""), Some("*"))
-            .await?
-            .try_collect()
-            .await?;
-        let channels = names
-            .iter()
-            .map(|n| ChannelInfo {
-                // external_id is what we hand back to the server in later
-                // SELECT calls — it MUST stay in the raw modified-UTF-7
-                // form. `name` is for humans; decode it so accented and
-                // non-Latin mailboxes don't show up as `Ita&APo-`.
-                external_id: n.name().to_string(),
-                name: super::imap_utf7::decode_mailbox_name(n.name()),
-                kind: "mailbox".to_string(),
-                subscribed_by_default: subscribed_by_default(
-                    n.name(),
-                    n.attributes().contains(&NameAttribute::Sent),
-                ),
-            })
-            .collect();
+        let channels = list_on(&mut session).await;
         let _ = session.logout().await;
-        Ok(channels)
+        channels
     }
 
     async fn poll(&self, channel_external_id: &str, cursor: Option<&Cursor>) -> Result<PollBatch> {
         let mut session = self.connect().await?;
-
-        // EXAMINE, not SELECT: the poll only reads, and a read-only open
-        // guarantees it can never change flags (notably the implicit `\Seen`
-        // a body FETCH would otherwise set).
-        let mailbox = session
-            .examine(channel_external_id)
-            .await
-            .with_context(|| format!("failed to examine mailbox: {channel_external_id}"))?;
-
-        let server_validity = mailbox.uid_validity.context("missing UIDVALIDITY")?;
-        let server_uidnext = mailbox.uid_next.context("missing UIDNEXT")?;
-
-        let search_from_uid = match cursor {
-            Some(c) => {
-                let (validity, last_uidnext) = parse_cursor(c)?;
-                if validity != server_validity {
-                    server_uidnext
-                        .saturating_sub(BOOTSTRAP_MESSAGE_COUNT)
-                        .max(1)
-                } else {
-                    last_uidnext
-                }
-            }
-            None => server_uidnext
-                .saturating_sub(BOOTSTRAP_MESSAGE_COUNT)
-                .max(1),
-        };
-
-        let messages = if search_from_uid >= server_uidnext {
-            Vec::new()
-        } else {
-            let query = format!("UID {search_from_uid}:*");
-            let uids: Vec<u32> = session
-                .uid_search(&query)
-                .await
-                .context("IMAP search failed")?
-                .into_iter()
-                .filter(|uid| *uid >= search_from_uid)
-                .collect();
-
-            if uids.is_empty() {
-                Vec::new()
-            } else {
-                let mut sorted = uids;
-                sorted.sort_unstable();
-                let uid_set = compress_uid_set(&sorted);
-                let fetches: Vec<_> = session
-                    .uid_fetch(&uid_set, "(UID FLAGS INTERNALDATE BODY.PEEK[])")
-                    .await?
-                    .try_collect()
-                    .await?;
-
-                fetches
-                    .iter()
-                    .filter_map(|fetch| {
-                        let mut m = imported(
-                            fetch.body().unwrap_or_default(),
-                            fetch.uid.unwrap_or(0),
-                            server_validity,
-                            parse_flags(fetch.flags().map(|f| format!("{f:?}"))),
-                            false,
-                        )?;
-                        if let Some(mail) = m.mail.as_mut() {
-                            mail.received_at = fetch.internal_date().map(|d| d.with_timezone(&Utc));
-                        }
-                        Some(m)
-                    })
-                    .collect()
-            }
-        };
-
+        let batch = poll_on(&mut session, channel_external_id, cursor).await;
         let _ = session.logout().await;
-
-        Ok(PollBatch {
-            messages,
-            next_cursor: make_cursor(server_validity, server_uidnext),
-            more_available: false,
-        })
+        batch
     }
 
     async fn fetch(
@@ -430,21 +445,55 @@ impl ImapSource {
     /// One session for the reader's sync of every folder.
     pub async fn mail_session(&self) -> Result<ImapMailSession> {
         let mut session = self.connect().await?;
-        let condstore = session
+        let caps = session
             .capabilities()
             .await
-            .context("reading server capabilities")?
-            .has_str("CONDSTORE");
-        Ok(ImapMailSession { session, condstore })
+            .context("reading server capabilities")?;
+        let mut names: Vec<String> = caps
+            .iter()
+            .map(|c| match c {
+                async_imap::types::Capability::Imap4rev1 => "IMAP4rev1".to_string(),
+                async_imap::types::Capability::Auth(a) => format!("AUTH={a}"),
+                async_imap::types::Capability::Atom(a) => a.to_string(),
+            })
+            .collect();
+        names.sort();
+        tracing::debug!(capabilities = names.join(" "), "imap session");
+        let condstore = caps.has_str("CONDSTORE");
+        Ok(ImapMailSession {
+            session,
+            condstore,
+            capabilities: names,
+        })
     }
 }
 
 pub struct ImapMailSession {
     session: ImapSession,
     condstore: bool,
+    /// What the server announced after login (`CAPABILITY`), to use the
+    /// extensions it has and do without the others.
+    capabilities: Vec<String>,
 }
 
 impl ImapMailSession {
+    /// Whether the server announced `name` (as `IDLE`, `LIST-STATUS`).
+    pub fn has(&self, name: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(name))
+    }
+
+    /// The account's folders.
+    pub async fn channels(&mut self) -> Result<Vec<ChannelInfo>> {
+        list_on(&mut self.session).await
+    }
+
+    /// New mail in a folder polled for to-dos (see [`Source::poll`]).
+    pub async fn poll(&mut self, folder: &str, cursor: Option<&Cursor>) -> Result<PollBatch> {
+        poll_on(&mut self.session, folder, cursor).await
+    }
+
     pub async fn logout(mut self) {
         let _ = self.session.logout().await;
     }

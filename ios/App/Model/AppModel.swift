@@ -303,10 +303,29 @@ final class AppModel {
         mailVersion += 1
     }
 
-    /// Pull to refresh on mail: the mail now, then to-dos in the background.
+    /// Pull to refresh on mail: the folder on screen now, then every
+    /// folder and to-dos in the background.
     func refreshMail() async {
-        await syncMail(userInitiated: true)
-        Task { await findToDos(userInitiated: false) }
+        if let engine, !isSyncingMail {
+            isSyncingMail = true
+            let finishing = FinishInBackground("mail refresh")
+            do {
+                let errors = try await engine.syncScope(scope: mailScope)
+                if !errors.isEmpty {
+                    errorMessage = errors.joined(separator: "\n")
+                }
+                mailboxes = try await engine.mailboxes()
+            } catch {
+                report(error)
+            }
+            finishing.end()
+            isSyncingMail = false
+            mailVersion += 1
+        }
+        Task {
+            await syncMail()
+            await findToDos(userInitiated: false)
+        }
     }
 
     /// Look for to-dos in mail synced but not yet read by the model, then

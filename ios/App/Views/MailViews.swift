@@ -92,7 +92,11 @@ struct MailboxListView: View {
                 }
             }
         }
-        .refreshable { await model.refreshMail() }
+        // No one folder on screen: everything, then to-dos.
+        .refreshable {
+            await model.syncMail(userInitiated: true)
+            Task { await model.findToDos(userInitiated: false) }
+        }
         .navigationDestination(for: MailScope.self) { scope in
             ThreadListView(scope: scope)
         }
