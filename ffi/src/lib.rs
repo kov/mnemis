@@ -474,15 +474,18 @@ impl Engine {
         .await
     }
 
-    /// Mark messages read or unread, then send the change to the server;
-    /// offline, it waits for the next sync.
+    /// Mark messages read or unread, and send the change to the server in
+    /// the background; offline, it waits for the next sync.
     pub async fn mark_seen(&self, message_ids: Vec<i64>, seen: bool) -> Result<(), MnemisError> {
         let pool = self.pool.clone();
         run(async move {
             mail::ops::mark_seen(&pool, &message_ids, seen).await?;
-            if let Err(e) = orchestrator::push_mail_changes(&pool).await {
-                tracing::warn!(error = %format!("{e:#}"), "mail changes not sent yet");
-            }
+            // Sent in the background: the change already shows locally.
+            tokio::spawn(async move {
+                if let Err(e) = orchestrator::push_mail_changes(&pool).await {
+                    tracing::warn!(error = %format!("{e:#}"), "mail changes not sent yet");
+                }
+            });
             Ok(())
         })
         .await
