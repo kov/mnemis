@@ -180,6 +180,9 @@ impl Harness {
         // otherwise make a second app process defer to the first, breaking
         // parallel UI tests.
         driver_cmd.env("MNEMIS_NO_SINGLE_INSTANCE", "1");
+        // Nor sync on their own: a startup sync would race the tests' own
+        // Sync now clicks.
+        driver_cmd.env("MNEMIS_NO_BACKGROUND_SYNC", "1");
         if let Some(w) = &weston {
             // Wayland routing for the headless weston compositor. Same
             // child-only rule: don't pollute the test process.

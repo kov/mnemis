@@ -7,11 +7,7 @@
 //! main window.
 #![cfg(target_os = "macos")]
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Result;
-use mnemis_engine::{config, orchestrator};
 use tauri::{
     AppHandle, Manager,
     menu::{Menu, MenuItem},
@@ -77,22 +73,7 @@ fn spawn_sync(app: &AppHandle) {
                 return;
             }
         };
-        let Some(stack) = state.current_llm() else {
-            warn!("tray sync: no LLM configured");
-            return;
-        };
-        let traces = config::traces_dir_for(&state.db_path);
-        match orchestrator::sync_now(
-            &state.pool,
-            &stack.llm,
-            Arc::clone(&stack.embedder),
-            &stack.chat_model,
-            stack.window_char_budget,
-            Duration::from_secs(stack.chat_idle_timeout_secs),
-            Some(&traces),
-        )
-        .await
-        {
+        match crate::background::full_sync(&state).await {
             Ok(o) => info!(
                 sources_synced = o.sources_synced,
                 actions_created = o.actions_created,

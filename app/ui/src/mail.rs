@@ -84,7 +84,8 @@ struct SeenArgs {
 }
 
 /// Set up the reader's shared state, and keep mail current while the app is
-/// open: a mail-only sync now and every few minutes.
+/// open: a mail-only sync every few minutes, between the full syncs (the
+/// backend runs one at startup).
 pub fn provide() {
     let tick = MailTick(RwSignal::new(0));
     provide_context(tick);
@@ -102,7 +103,6 @@ pub fn provide() {
             tick.0.update(|v| *v += 1);
         })
     };
-    sync();
     if let Ok(handle) =
         set_interval_with_handle(sync, std::time::Duration::from_secs(SYNC_EVERY_SECS))
     {

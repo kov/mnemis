@@ -170,6 +170,64 @@ pub fn watch_appearance() {
     });
 }
 
+/// A sync is running, whoever started it (Sync now, the tray, or the app's
+/// own schedule).
+#[derive(Clone, Copy)]
+pub struct Syncing(pub RwSignal<bool>);
+
+#[derive(Deserialize)]
+struct SyncEnvelope {
+    #[serde(default)]
+    end: bool,
+    message: Option<SyncEventMsg>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SyncEventMsg {
+    Started,
+    Finished,
+}
+
+#[derive(Serialize)]
+struct WatchSyncArgs {
+    on_event: String,
+}
+
+/// Follow every sync the backend runs: show it as running, and reload what
+/// it may have changed once it ends. Same channel wiring as
+/// [`watch_appearance`].
+fn watch_sync(syncing: RwSignal<bool>, sync_tick: RwSignal<u32>, mail_tick: RwSignal<u32>) {
+    let closure = Closure::wrap(Box::new(move |payload: JsValue| {
+        let Some(s) = js_sys::JSON::stringify(&payload)
+            .ok()
+            .and_then(|v| v.as_string())
+        else {
+            return;
+        };
+        let Ok(env) = serde_json::from_str::<SyncEnvelope>(&s) else {
+            return;
+        };
+        match env.message {
+            Some(SyncEventMsg::Started) if !env.end => syncing.set(true),
+            Some(SyncEventMsg::Finished) if !env.end => {
+                syncing.set(false);
+                sync_tick.update(|v| *v += 1);
+                mail_tick.update(|v| *v += 1);
+            }
+            _ => {}
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    let id = transformCallback(&closure, false);
+    closure.forget();
+    let on_event = format!("__CHANNEL__:{}", id as u64);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(args) = serde_wasm_bindgen::to_value(&WatchSyncArgs { on_event }) {
+            let _ = invoke("watch_sync", args).await;
+        }
+    });
+}
+
 pub async fn run_sync_now() -> Result<SyncOutcome, String> {
     let raw = invoke("sync_now", JsValue::NULL)
         .await
@@ -809,6 +867,15 @@ fn App() -> impl IntoView {
     // Keep tracking the OS appearance: re-theme live when the system accent or
     // light/dark preference changes while the app is open.
     watch_appearance();
+    let syncing = RwSignal::new(false);
+    provide_context(Syncing(syncing));
+    watch_sync(
+        syncing,
+        use_context::<SyncTick>().expect("sync tick context").0,
+        use_context::<mail::MailTick>()
+            .expect("mail tick context")
+            .0,
+    );
 
     view! {
         <Router>

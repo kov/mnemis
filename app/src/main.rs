@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod appearance;
+mod background;
 
 #[cfg(target_os = "linux")]
 mod glcheck;
@@ -48,6 +49,11 @@ pub(crate) struct AppState {
     /// runs one send per chat at a time, so a plain replace-on-insert /
     /// remove-on-finish keyed by chat id is enough.
     pub chat_cancels: Mutex<HashMap<i64, CancellationToken>>,
+    /// Held for the length of a full sync, so Sync now and the background
+    /// loop never overlap.
+    pub sync_lock: tokio::sync::Mutex<()>,
+    /// The UI's subscriptions to sync events (see [`background`]).
+    pub sync_watchers: Mutex<Vec<Channel<background::SyncEvent>>>,
 }
 
 pub(crate) struct LlmStack {
@@ -665,21 +671,7 @@ async fn submit_dismissal_feedback(
 
 #[tauri::command]
 async fn sync_now(state: State<'_, AppState>) -> Result<SyncOutcome, String> {
-    let stack = state
-        .current_llm()
-        .ok_or_else(|| "No LLM configured. Set it in Settings → LLM.".to_string())?;
-    let traces = config::traces_dir_for(&state.db_path);
-    orchestrator::sync_now(
-        &state.pool,
-        &stack.llm,
-        Arc::clone(&stack.embedder),
-        &stack.chat_model,
-        stack.window_char_budget,
-        Duration::from_secs(stack.chat_idle_timeout_secs),
-        Some(&traces),
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))
+    background::full_sync(&state).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -952,7 +944,10 @@ fn main() {
                 llm_stack: RwLock::new(llm_stack),
                 db_path: app_data,
                 chat_cancels: Mutex::new(HashMap::new()),
+                sync_lock: tokio::sync::Mutex::new(()),
+                sync_watchers: Mutex::new(Vec::new()),
             });
+            background::spawn(app.handle().clone());
 
             // macOS: tray-resident. Linux/Windows: window-only for now.
             // Linux runtime tray detection is Phase 7.
@@ -984,6 +979,7 @@ fn main() {
             get_message,
             get_status,
             sync_now,
+            background::watch_sync,
             update_action,
             submit_dismissal_feedback,
             list_pending_resolutions,

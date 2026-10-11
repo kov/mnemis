@@ -835,7 +835,8 @@ pub fn StatusPanel() -> impl IntoView {
         let _ = sync_tick.get();
         async move { fetch_status().await }
     });
-    let syncing = RwSignal::new(false);
+    // Shared: a sync the app started on its own shows here too.
+    let crate::Syncing(syncing) = use_context::<crate::Syncing>().expect("syncing context");
     let last_outcome: RwSignal<Option<Result<SyncOutcome, String>>> = RwSignal::new(None);
 
     // The embed queue drains in the background, between syncs, so poll just
