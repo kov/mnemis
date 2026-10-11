@@ -42,6 +42,7 @@ uuid = { version = "1.27.0", features = ["v4"] }
 # In-process embeddings (ONNX Runtime). Defaults off: no image models, and
 # rustls for both the model download and the ORT binary fetch, matching reqwest.
 fastembed = { version = "7.1.1", optional = true, default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+ammonia = "4.2.3"
 
 # Secret storage is OS-keychain-backed, with a per-platform backend behind the
 # `secrets` module's async API. Kept target-specific so neither backend's deps
