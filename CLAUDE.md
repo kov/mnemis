@@ -125,6 +125,21 @@ codesign -d --entitlements - ./target/release/bundle/macos/mnemis.app
 security find-generic-password -s mnemis -g     # also shows items
 ```
 
+### Google sign-in
+
+Google accounts sign in with OAuth clients from the builder's own Google Cloud
+project, baked in at build time by `engine/build.rs` (on every build machine):
+
+```
+git config --global mnemis.googleDesktopClientId <id>
+git config --global mnemis.googleDesktopClientSecret <secret>
+git config --global mnemis.googleIosClientId <id>
+```
+
+Without them, adding a Google account says sign-in isn't configured. Keep the
+consent screen **In production**: in Testing, Google expires the refresh
+tokens after 7 days.
+
 The `mnemis-cli` binary is **not** signed by this flow, so it cannot read or
 write secrets on macOS. CLI-driven credential management is unsupported on
 the Mac for now — use the app's settings UI.

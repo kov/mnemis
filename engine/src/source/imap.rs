@@ -135,6 +135,14 @@ async fn list_on(session: &mut ImapSession) -> Result<Vec<ChannelInfo>> {
         .await?;
     let channels = names
         .iter()
+        // Hierarchy-only names (Gmail's "[Gmail]") can't be opened.
+        .filter(|n| {
+            !n.attributes().iter().any(|a| match a {
+                NameAttribute::NoSelect => true,
+                NameAttribute::Extension(e) => e.eq_ignore_ascii_case("\\NonExistent"),
+                _ => false,
+            })
+        })
         .map(|n| ChannelInfo {
             // external_id is what we hand back to the server in later
             // SELECT calls — it MUST stay in the raw modified-UTF-7

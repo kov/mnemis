@@ -365,6 +365,11 @@ pub async fn set_source_muted(pool: &SqlitePool, source_id: i64, muted: bool) ->
 /// source was removed; `action_evidence` rows will dangle and the UI
 /// gracefully handles "(unknown source)" for those.
 pub async fn delete_source(pool: &SqlitePool, source_id: i64) -> Result<()> {
+    let config_ref: Option<String> =
+        sqlx::query_scalar("SELECT config_ref FROM sources WHERE id = ?")
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await?;
     let mut tx = pool.begin().await?;
     // Order matters: child rows first.
     sqlx::query(
@@ -405,6 +410,12 @@ pub async fn delete_source(pool: &SqlitePool, source_id: i64) -> Result<()> {
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // Its password or Google sign-in goes too; best-effort, the account is
+    // gone either way.
+    if let Some(reference) = config_ref.filter(|r| !r.is_empty()) {
+        crate::oauth::forget(&reference);
+        let _ = secrets::delete(&reference).await;
+    }
     Ok(())
 }
 
