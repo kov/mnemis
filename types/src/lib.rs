@@ -613,6 +613,127 @@ pub struct SmtpSettingsDto {
     pub saved: bool,
 }
 
+/// What a mail folder is for, from its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxRole {
+    Inbox,
+    Drafts,
+    Sent,
+    Archive,
+    Junk,
+    Trash,
+    Other,
+}
+
+/// A mail folder for the reader's sidebar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxDto {
+    pub channel_id: i64,
+    pub source_id: i64,
+    pub account: String,
+    /// Display name (the leaf of `path`).
+    pub name: String,
+    /// The full folder path, decoded; `/` or `.` separate levels.
+    pub path: String,
+    pub role: MailboxRole,
+    pub unread: i64,
+}
+
+/// Which threads a list shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MailScope {
+    /// Every account's inbox.
+    AllInboxes,
+    Mailbox {
+        channel_id: i64,
+    },
+}
+
+/// A row of a thread list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummaryDto {
+    pub thread_id: i64,
+    pub subject: String,
+    /// Who wrote in it, earliest first; "Me" for the user.
+    pub participants: Vec<String>,
+    /// The start of the latest message, quotes left out.
+    pub snippet: String,
+    /// Unix seconds of the latest message.
+    pub latest_at: i64,
+    pub message_count: i64,
+    pub unread_count: i64,
+    pub has_attachments: bool,
+    pub flagged: bool,
+    /// Open to-dos that came from its mail.
+    pub todo_count: i64,
+    pub account: String,
+}
+
+/// One message of a thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMessageDto {
+    pub message_id: i64,
+    pub from_name: Option<String>,
+    pub from_address: Option<String>,
+    /// "Name <address>" or the address, as the headers had them.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub posted_at: i64,
+    pub subject: String,
+    pub snippet: String,
+    pub seen: bool,
+    pub flagged: bool,
+    pub answered: bool,
+    pub has_attachments: bool,
+    /// The folders holding it.
+    pub folders: Vec<String>,
+    /// The full message is in the cache: it renders without the network.
+    pub downloaded: bool,
+    /// Written by the user.
+    pub from_me: bool,
+}
+
+/// An open to-do that came from a thread's mail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadTodoDto {
+    pub action_id: i64,
+    pub title: String,
+    pub status: ActionStatus,
+    pub due_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadDto {
+    pub thread_id: i64,
+    pub subject: String,
+    /// Oldest first.
+    pub messages: Vec<ThreadMessageDto>,
+    pub todos: Vec<ThreadTodoDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentDto {
+    /// The part to ask for when opening it.
+    pub part: u32,
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+/// A message as a page for a web view (see the engine's `mail::render`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderedMessageDto {
+    pub html: String,
+    /// Remote resources held back; offer "Load images" only when non-zero.
+    pub remote_resources: u32,
+    pub attachments: Vec<AttachmentDto>,
+    /// False when this is the stored text alone: fetch the thread, then
+    /// render again.
+    pub complete: bool,
+}
+
 /// One turn in a chat transcript. A single model response may produce several
 /// turns: an assistant message, plus one row per tool call (role `'assistant'`,
 /// `tool_name`/`tool_call_id` set, `content` = arguments) and one per tool

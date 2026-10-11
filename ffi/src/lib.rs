@@ -19,10 +19,12 @@ use mnemis_engine::llm::{ForeignClient, ForeignLlm, LlmBackend};
 use mnemis_engine::source::SourceId;
 use mnemis_engine::{chat, config, db, mail, memory, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, Confidence, DraftDto,
-    DraftKind, DraftStatus, FeedbackKind, LlmConfigDto, LlmProvider, MessageActionRef,
-    MessageDetailDto, ProfileIdentifier, SmtpSettingsDto, SourceHealth, SourceRowDto, SourceStatus,
-    StatusSnapshot, SyncOutcome, ThinkingLevel, UserProfileDto,
+    ActionDto, ActionStatus, AttachmentDto, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto,
+    Confidence, DraftDto, DraftKind, DraftStatus, FeedbackKind, LlmConfigDto, LlmProvider,
+    MailScope, MailboxDto, MailboxRole, MessageActionRef, MessageDetailDto, ProfileIdentifier,
+    RenderedMessageDto, SmtpSettingsDto, SourceHealth, SourceRowDto, SourceStatus, StatusSnapshot,
+    SyncOutcome, ThinkingLevel, ThreadDto, ThreadMessageDto, ThreadSummaryDto, ThreadTodoDto,
+    UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
@@ -408,6 +410,89 @@ impl Engine {
     pub async fn discard_draft(&self, draft_id: i64) -> Result<(), MnemisError> {
         let pool = self.pool.clone();
         run(async move { mail::discard_draft(&pool, draft_id).await }).await
+    }
+
+    /// Every account's mail folders, for the reader's sidebar.
+    pub async fn mailboxes(&self) -> Result<Vec<MailboxDto>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::view::mailboxes(&pool).await }).await
+    }
+
+    /// A page of threads, latest first; pass the last `latest_at` as
+    /// `before` for the next page.
+    pub async fn mail_threads(
+        &self,
+        scope: MailScope,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<ThreadSummaryDto>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::view::threads(&pool, scope, before, limit).await }).await
+    }
+
+    pub async fn mail_thread(&self, thread_id: i64) -> Result<ThreadDto, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mail::view::thread(&pool, thread_id).await }).await
+    }
+
+    /// Download the thread's messages that aren't cached; call when it opens,
+    /// then render again the messages that came back incomplete.
+    pub async fn fetch_thread(&self, thread_id: i64) -> Result<u32, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { Ok(orchestrator::fetch_thread(&pool, thread_id).await? as u32) }).await
+    }
+
+    /// A message as a page for a web view; remote images only when
+    /// `allow_remote`.
+    pub async fn render_message(
+        &self,
+        message_id: i64,
+        allow_remote: bool,
+    ) -> Result<RenderedMessageDto, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            let r = mail::render::render_message(&pool, message_id, allow_remote).await?;
+            Ok(r.into())
+        })
+        .await
+    }
+
+    pub async fn attachment(
+        &self,
+        message_id: i64,
+        part: u32,
+    ) -> Result<AttachmentData, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            let (a, data) = mail::render::attachment(&pool, message_id, part).await?;
+            Ok(AttachmentData {
+                name: a.name,
+                mime_type: a.mime_type,
+                data,
+            })
+        })
+        .await
+    }
+
+    /// Mark messages read or unread, then send the change to the server;
+    /// offline, it waits for the next sync.
+    pub async fn mark_seen(&self, message_ids: Vec<i64>, seen: bool) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            mail::ops::mark_seen(&pool, &message_ids, seen).await?;
+            if let Err(e) = orchestrator::push_mail_changes(&pool).await {
+                tracing::warn!(error = %format!("{e:#}"), "mail changes not sent yet");
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Bring the folders up to date for reading, without extracting to-dos;
+    /// returns the errors.
+    pub async fn sync_mail(&self) -> Result<Vec<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { orchestrator::sync_mail(&pool).await }).await
     }
 
     /// The source's folders, refreshed from the server first so ones created
@@ -930,6 +1015,108 @@ pub struct SmtpSettingsDto {
     pub from_address: String,
     pub save_sent: bool,
     pub saved: bool,
+}
+
+#[uniffi::remote(Enum)]
+pub enum MailboxRole {
+    Inbox,
+    Drafts,
+    Sent,
+    Archive,
+    Junk,
+    Trash,
+    Other,
+}
+
+#[uniffi::remote(Record)]
+pub struct MailboxDto {
+    pub channel_id: i64,
+    pub source_id: i64,
+    pub account: String,
+    pub name: String,
+    pub path: String,
+    pub role: MailboxRole,
+    pub unread: i64,
+}
+
+#[uniffi::remote(Enum)]
+pub enum MailScope {
+    AllInboxes,
+    Mailbox { channel_id: i64 },
+}
+
+#[uniffi::remote(Record)]
+pub struct ThreadSummaryDto {
+    pub thread_id: i64,
+    pub subject: String,
+    pub participants: Vec<String>,
+    pub snippet: String,
+    pub latest_at: i64,
+    pub message_count: i64,
+    pub unread_count: i64,
+    pub has_attachments: bool,
+    pub flagged: bool,
+    pub todo_count: i64,
+    pub account: String,
+}
+
+#[uniffi::remote(Record)]
+pub struct ThreadMessageDto {
+    pub message_id: i64,
+    pub from_name: Option<String>,
+    pub from_address: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub posted_at: i64,
+    pub subject: String,
+    pub snippet: String,
+    pub seen: bool,
+    pub flagged: bool,
+    pub answered: bool,
+    pub has_attachments: bool,
+    pub folders: Vec<String>,
+    pub downloaded: bool,
+    pub from_me: bool,
+}
+
+#[uniffi::remote(Record)]
+pub struct ThreadTodoDto {
+    pub action_id: i64,
+    pub title: String,
+    pub status: ActionStatus,
+    pub due_at: Option<i64>,
+}
+
+#[uniffi::remote(Record)]
+pub struct ThreadDto {
+    pub thread_id: i64,
+    pub subject: String,
+    pub messages: Vec<ThreadMessageDto>,
+    pub todos: Vec<ThreadTodoDto>,
+}
+
+#[uniffi::remote(Record)]
+pub struct AttachmentDto {
+    pub part: u32,
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+#[uniffi::remote(Record)]
+pub struct RenderedMessageDto {
+    pub html: String,
+    pub remote_resources: u32,
+    pub attachments: Vec<AttachmentDto>,
+    pub complete: bool,
+}
+
+/// An attachment's contents, to show or share.
+#[derive(uniffi::Record)]
+pub struct AttachmentData {
+    pub name: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
 }
 
 #[uniffi::remote(Record)]

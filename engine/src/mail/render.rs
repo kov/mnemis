@@ -39,6 +39,26 @@ pub struct Attachment {
     pub size: u64,
 }
 
+impl From<Rendered> for mnemis_types::RenderedMessageDto {
+    fn from(r: Rendered) -> Self {
+        Self {
+            html: r.html,
+            remote_resources: r.remote_resources,
+            attachments: r
+                .attachments
+                .into_iter()
+                .map(|a| mnemis_types::AttachmentDto {
+                    part: a.part,
+                    name: a.name,
+                    mime_type: a.mime_type,
+                    size: a.size,
+                })
+                .collect(),
+            complete: r.complete,
+        }
+    }
+}
+
 /// Render the message stored as `message_id`: from the cache when it's
 /// there (and note that it was read, which keeps it cached), else from its
 /// stored text.

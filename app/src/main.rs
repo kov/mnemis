@@ -20,9 +20,10 @@ use mnemis_engine::llm::LlmBackend;
 use mnemis_engine::{chat, config, db, mail, mutations, orchestrator, queries, settings};
 use mnemis_types::{
     ActionDto, ActionStatus, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto, ChannelRowDto,
-    ChatDto, ChatEvent, ChatTurnDto, DraftDto, DraftKind, FeedbackKind, LlmConfigDto,
-    MessageDetailDto, MessageDto, PendingResolutionDto, SmtpSettingsDto, SourceRowDto,
-    StatusSnapshot, SyncOutcome, UserProfileDto,
+    ChatDto, ChatEvent, ChatTurnDto, DraftDto, DraftKind, FeedbackKind, LlmConfigDto, MailScope,
+    MailboxDto, MessageDetailDto, MessageDto, PendingResolutionDto, RenderedMessageDto,
+    SmtpSettingsDto, SourceRowDto, StatusSnapshot, SyncOutcome, ThreadDto, ThreadSummaryDto,
+    UserProfileDto,
 };
 use sqlx::SqlitePool;
 use tauri::ipc::Channel;
@@ -276,6 +277,110 @@ async fn start_draft(
 ) -> Result<i64, String> {
     let postbox = mail::Network { pool: &state.pool };
     mail::start_draft(&state.pool, &postbox, kind, message_id, None, false)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn mailboxes(state: State<'_, AppState>) -> Result<Vec<MailboxDto>, String> {
+    mail::view::mailboxes(&state.pool)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn mail_threads(
+    state: State<'_, AppState>,
+    scope: MailScope,
+    before: Option<i64>,
+    limit: i64,
+) -> Result<Vec<ThreadSummaryDto>, String> {
+    mail::view::threads(&state.pool, scope, before, limit)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn mail_thread(state: State<'_, AppState>, thread_id: i64) -> Result<ThreadDto, String> {
+    mail::view::thread(&state.pool, thread_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Download the thread's messages that aren't cached.
+#[tauri::command(rename_all = "snake_case")]
+async fn fetch_thread(state: State<'_, AppState>, thread_id: i64) -> Result<usize, String> {
+    orchestrator::fetch_thread(&state.pool, thread_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn render_message(
+    state: State<'_, AppState>,
+    message_id: i64,
+    allow_remote: bool,
+) -> Result<RenderedMessageDto, String> {
+    mail::render::render_message(&state.pool, message_id, allow_remote)
+        .await
+        .map(Into::into)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Save an attachment to the cache directory and open it with its default
+/// app.
+#[tauri::command(rename_all = "snake_case")]
+async fn open_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    message_id: i64,
+    part: u32,
+) -> Result<(), String> {
+    let (attachment, data) = mail::render::attachment(&state.pool, message_id, part)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("{e:#}"))?
+        .join("attachments")
+        .join(format!("{message_id}-{part}"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{e:#}"))?;
+    // Keep only the file name the sender chose, never a path.
+    let name = std::path::Path::new(&attachment.name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "attachment".to_string());
+    let path = dir.join(name);
+    std::fs::write(&path, data).map_err(|e| format!("{e:#}"))?;
+    tauri_plugin_opener::open_path(path, None::<&str>).map_err(|e| format!("{e:#}"))
+}
+
+/// Mark messages read or unread, then send the change to the server in the
+/// background; offline, it waits for the next sync.
+#[tauri::command(rename_all = "snake_case")]
+async fn mark_seen(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    seen: bool,
+) -> Result<(), String> {
+    mail::ops::mark_seen(&state.pool, &message_ids, seen)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let pool = state.pool.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = orchestrator::push_mail_changes(&pool).await {
+            warn!(error = %format!("{e:#}"), "mail changes not sent yet");
+        }
+    });
+    Ok(())
+}
+
+/// Bring the folders up to date for reading, without extracting to-dos;
+/// returns the errors.
+#[tauri::command(rename_all = "snake_case")]
+async fn sync_mail(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    orchestrator::sync_mail(&state.pool)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -884,6 +989,14 @@ fn main() {
             save_smtp_settings,
             start_draft,
             prefetch_original,
+            mailboxes,
+            mail_threads,
+            mail_thread,
+            fetch_thread,
+            render_message,
+            open_attachment,
+            mark_seen,
+            sync_mail,
             get_draft,
             save_draft,
             send_draft,

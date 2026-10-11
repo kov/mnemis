@@ -30,6 +30,7 @@ pub mod ops;
 pub mod render;
 pub mod sync;
 pub mod thread;
+pub mod view;
 
 /// How long composing waits for the original's headers before going on
 /// without them.
@@ -491,7 +492,7 @@ fn forwarded(original: &Original) -> String {
 
 /// The user's own addresses, never to be replied to: their profile's and
 /// every account's.
-async fn own_addresses(pool: &SqlitePool) -> Result<Vec<String>> {
+pub(crate) async fn own_addresses(pool: &SqlitePool) -> Result<Vec<String>> {
     let mut out: Vec<String> = sqlx::query_as::<_, (String,)>(
         "SELECT ci.value FROM contact_identifiers ci JOIN contacts c ON c.id = ci.contact_id \
          WHERE c.relationship = 'self' AND ci.kind = 'email'",
