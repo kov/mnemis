@@ -292,9 +292,6 @@ impl Source for ImapSource {
 }
 
 impl ImapSource {
-    /// The links of every message in a mailbox dated `since` or later, by
-    /// Message-ID: one session, bodies fetched in chunks. For filling in
-    /// messages ingested before links were kept.
     /// A message's raw RFC 822 bytes, for replying with its headers and
     /// forwarding it whole.
     pub async fn fetch_raw(
@@ -351,6 +348,9 @@ impl ImapSource {
         Ok(())
     }
 
+    /// The links of every message in a mailbox dated `since` or later, by
+    /// Message-ID: one session, bodies fetched in chunks. For filling in
+    /// messages ingested before links were kept.
     pub async fn links_since(
         &self,
         channel_external_id: &str,
