@@ -33,6 +33,7 @@ pub mod suspicion;
 pub mod sync;
 pub mod thread;
 pub mod view;
+pub mod watch;
 
 /// How far after its arrival a Date header may claim before it reads as
 /// forged: clock and time-zone slips stay well within a day, while phishing

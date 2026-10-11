@@ -25,9 +25,6 @@ use crate::{SyncTick, open_external};
 const PAGE: i64 = 50;
 /// How long an unread message is on screen before it counts as read.
 const READ_AFTER_MS: u64 = 1500;
-/// How often the mail-only sync runs while the app is open.
-const SYNC_EVERY_SECS: u64 = 300;
-
 /// Bumped when mail changed (a mail sync, a message marked read), so the
 /// folder counts and thread lists reload.
 #[derive(Clone, Copy)]
@@ -83,31 +80,11 @@ struct SeenArgs {
     seen: bool,
 }
 
-/// Set up the reader's shared state, and keep mail current while the app is
-/// open: a mail-only sync every few minutes, between the full syncs (the
-/// backend runs one at startup).
+/// Set up the reader's shared state. The backend keeps mail current (push,
+/// or timed syncs) and says when it changed (see `watch_sync`).
 pub fn provide() {
-    let tick = MailTick(RwSignal::new(0));
-    provide_context(tick);
+    provide_context(MailTick(RwSignal::new(0)));
     provide_context(Mailboxes(RwSignal::new(Vec::new())));
-    let sync = move || {
-        spawn_local(async move {
-            match call::<Vec<String>>("sync_mail", NoArgs {}).await {
-                Ok(errors) => {
-                    for e in errors {
-                        gloo_console::warn!(format!("mail sync: {e}"));
-                    }
-                }
-                Err(e) => gloo_console::warn!(format!("mail sync failed: {e}")),
-            }
-            tick.0.update(|v| *v += 1);
-        })
-    };
-    if let Ok(handle) =
-        set_interval_with_handle(sync, std::time::Duration::from_secs(SYNC_EVERY_SECS))
-    {
-        on_cleanup(move || handle.clear());
-    }
 }
 
 fn mail_tick() -> RwSignal<u32> {

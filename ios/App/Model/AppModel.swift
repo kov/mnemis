@@ -105,6 +105,8 @@ final class AppModel {
             await refresh()
             // Always a full sync at launch: new mail, then to-dos.
             Task { await sync(userInitiated: false) }
+            // The app went active before the engine was open.
+            startWatching()
             #if DEBUG
             // `-MnemisOpenURL mnemis://…` at launch opens that screen, so the
             // simulator can be driven without taps (and without the
@@ -324,6 +326,38 @@ final class AppModel {
         }
         Task {
             await syncMail()
+            await findToDos(userInitiated: false)
+        }
+    }
+
+    /// While the app is in front, the mail servers push changes; the
+    /// engine syncs the folders they touch and says so here.
+    func startWatching() {
+        guard let engine else { return }
+        let relay = MailChangeRelay(self)
+        Task {
+            do {
+                try await engine.startWatching(listener: relay)
+            } catch {
+                print("[mail] push unavailable: \(error)")
+            }
+        }
+    }
+
+    func stopWatching() {
+        engine?.stopWatching()
+    }
+
+    /// Pushed mail synced: show it, and look for to-dos in it.
+    func mailChanged(toDos: Bool) async {
+        guard let engine else { return }
+        do {
+            mailboxes = try await engine.mailboxes()
+        } catch {
+            report(error)
+        }
+        mailVersion += 1
+        if toDos {
             await findToDos(userInitiated: false)
         }
     }
@@ -646,5 +680,20 @@ final class AppModel {
         name = UserDefaults.standard.string(forKey: "MnemisDataDir") ?? name
         #endif
         return name
+    }
+}
+
+/// Hands the engine's push notices to the model on the main actor.
+final class MailChangeRelay: MailListener, @unchecked Sendable {
+    private weak var model: AppModel?
+
+    init(_ model: AppModel) {
+        self.model = model
+    }
+
+    func mailChanged(toDos: Bool) {
+        Task { @MainActor [weak model] in
+            await model?.mailChanged(toDos: toDos)
+        }
     }
 }

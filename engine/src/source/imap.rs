@@ -458,14 +458,30 @@ impl ImapSource {
             })
             .collect();
         names.sort();
+        // `MNEMIS_IMAP_WITHOUT=NOTIFY,LIST-STATUS` pretends the server
+        // lacks those, to try the fallbacks against any server.
+        if let Ok(without) = std::env::var("MNEMIS_IMAP_WITHOUT") {
+            names.retain(|n| !without.split(',').any(|w| w.trim().eq_ignore_ascii_case(n)));
+        }
         tracing::debug!(capabilities = names.join(" "), "imap session");
-        let condstore = caps.has_str("CONDSTORE");
+        let condstore = names.iter().any(|n| n == "CONDSTORE");
         Ok(ImapMailSession {
             session,
             condstore,
             capabilities: names,
         })
     }
+}
+
+/// What ended an [`ImapMailSession::idle`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// NOTIFY reported changes in these folders.
+    Folders(Vec<String>),
+    /// The open folder changed.
+    Selected,
+    /// Time to renew, or a keepalive.
+    Nothing,
 }
 
 pub struct ImapMailSession {
@@ -482,6 +498,65 @@ impl ImapMailSession {
         self.capabilities
             .iter()
             .any(|c| c.eq_ignore_ascii_case(name))
+    }
+
+    /// Ask the server to report changes in every folder (NOTIFY), new and
+    /// removed mail and, where it allows, flag changes; the reports arrive
+    /// while idling ([`Self::idle`]).
+    pub async fn notify_all(&mut self) -> Result<()> {
+        let with_flags = "NOTIFY SET (personal (MessageNew MessageExpunge FlagChange))";
+        if self
+            .session
+            .run_command_and_check_ok(with_flags)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.session
+            .run_command_and_check_ok("NOTIFY SET (personal (MessageNew MessageExpunge))")
+            .await
+            .context("NOTIFY failed")
+    }
+
+    /// Idle until the server reports a change or `renew` passes (IDLE
+    /// must be renewed before the server drops it): the folders NOTIFY
+    /// named, [`Wake::Selected`] for the open folder, or nothing.
+    pub async fn idle(mut self, renew: std::time::Duration) -> Result<(Self, Wake)> {
+        use async_imap::extensions::idle::IdleResponse;
+        use async_imap::imap_proto::{MailboxDatum, Response};
+        let mut idle = self.session.idle();
+        idle.init().await.context("IDLE failed")?;
+        let wake = {
+            let (wait, _stop) = idle.wait_with_timeout(renew);
+            match wait.await.context("IDLE dropped")? {
+                IdleResponse::NewData(data) => match data.parsed() {
+                    Response::MailboxData(MailboxDatum::Status { mailbox, .. }) => {
+                        Wake::Folders(vec![mailbox.to_string()])
+                    }
+                    Response::MailboxData(MailboxDatum::Exists(_))
+                    | Response::MailboxData(MailboxDatum::Recent(_))
+                    | Response::Expunge(_)
+                    | Response::Fetch(..)
+                    | Response::Vanished { .. } => Wake::Selected,
+                    // Keepalives ("* OK still here") and the like.
+                    _ => Wake::Nothing,
+                },
+                _ => Wake::Nothing,
+            }
+        };
+        self.session = idle.done().await.context("ending IDLE")?;
+        // More reports may have queued behind the first.
+        let mut wake = wake;
+        while let Ok(response) = self.session.unsolicited_responses.try_recv() {
+            if let async_imap::types::UnsolicitedResponse::Status { mailbox, .. } = response {
+                match &mut wake {
+                    Wake::Folders(folders) => folders.push(mailbox),
+                    _ => wake = Wake::Folders(vec![mailbox]),
+                }
+            }
+        }
+        Ok((self, wake))
     }
 
     /// The account's folders.

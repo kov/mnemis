@@ -195,6 +195,7 @@ enum SyncEventMsg {
     Started,
     MailSynced,
     Finished,
+    Changed,
 }
 
 #[derive(Serialize)]
@@ -227,6 +228,11 @@ fn watch_sync(syncing: RwSignal<SyncPhase>, sync_tick: RwSignal<u32>, mail_tick:
             Some(SyncEventMsg::Finished) if !env.end => {
                 syncing.set(SyncPhase::Idle);
                 sync_tick.update(|v| *v += 1);
+            }
+            // Pushed mail, or to-dos found in it.
+            Some(SyncEventMsg::Changed) if !env.end => {
+                sync_tick.update(|v| *v += 1);
+                mail_tick.update(|v| *v += 1);
             }
             _ => {}
         }

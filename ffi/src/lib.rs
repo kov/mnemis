@@ -159,6 +159,17 @@ pub struct Engine {
     apple: Option<Arc<dyn AppleModel>>,
     /// Stop handles for in-flight chat sends, by chat id (one send per chat).
     chat_cancels: Mutex<HashMap<i64, CancellationToken>>,
+    /// The push watch over every account, while the app is in front.
+    watch: Mutex<Option<mnemis_engine::mail::watch::MailWatch>>,
+}
+
+/// Hears when pushed mail changed, once its folders synced. Implemented in
+/// Swift; called from engine threads.
+#[uniffi::export(with_foreign)]
+pub trait MailListener: Send + Sync {
+    /// `to_dos`: folders polled for to-dos changed, so new mail there wants
+    /// extraction.
+    fn mail_changed(&self, to_dos: bool);
 }
 
 /// Receives a chat turn's events as the engine produces them. Implemented in
@@ -227,6 +238,7 @@ impl Engine {
                 llm: RwLock::new(llm),
                 apple,
                 chat_cancels: Mutex::new(HashMap::new()),
+                watch: Mutex::new(None),
             }))
         })
         .await
@@ -515,6 +527,23 @@ impl Engine {
     pub async fn sync_mail(&self) -> Result<Vec<String>, MnemisError> {
         let pool = self.pool.clone();
         run(async move { orchestrator::sync_mail(&pool).await }).await
+    }
+
+    /// Have the mail servers push changes (see `mail::watch`) until
+    /// [`Self::stop_watching`]; `listener` hears of each.
+    pub async fn start_watching(&self, listener: Arc<dyn MailListener>) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        let on_change: mnemis_engine::mail::watch::OnChange =
+            Arc::new(move |change| listener.mail_changed(change.to_dos));
+        let watch =
+            run(async move { mnemis_engine::mail::watch::start(pool, on_change).await }).await?;
+        *self.watch.lock().expect("watch lock") = Some(watch);
+        Ok(())
+    }
+
+    /// Stop the push watch (the app is leaving the foreground).
+    pub fn stop_watching(&self) {
+        self.watch.lock().expect("watch lock").take();
     }
 
     /// Sync only the folder (or every inbox) on screen; the errors.

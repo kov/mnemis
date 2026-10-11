@@ -20,7 +20,11 @@ struct MnemisApp: App {
                 .task { await model.start() }
         }
         .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                model.startWatching()
+            }
             if phase == .background {
+                model.stopWatching()
                 AppModel.scheduleBackgroundSync()
             }
         }
