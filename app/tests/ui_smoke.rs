@@ -336,6 +336,11 @@ async fn loads_actions_into_visible_list() -> Result<()> {
                 srcdoc: document.querySelector('iframe.msg-frame').getAttribute('srcdoc') || '',
                 sandbox: document.querySelector('iframe.msg-frame').getAttribute('sandbox'),
                 height: document.querySelector('iframe.msg-frame').getAttribute('height'),
+                toolsFirst: !!(document.querySelector('.msg-card.open .msg-tools')
+                    .compareDocumentPosition(document.querySelector('.msg-card.open iframe.msg-frame'))
+                    & Node.DOCUMENT_POSITION_FOLLOWING),
+                menuBefore: !!document.querySelector('[data-action="mark-unread"]'),
+                menuAfter: (document.querySelector('[data-action="more"]').click(), true),
                 bodyText: document.querySelector('iframe.msg-frame').contentDocument?.body?.textContent || '',
             });"#,
             vec![],
@@ -356,6 +361,27 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     assert_eq!(
         shown["sandbox"], "allow-same-origin",
         "scripts never run: {shown}"
+    );
+    assert_eq!(
+        shown["toolsFirst"], true,
+        "the buttons sit above the message: {shown}"
+    );
+    assert_eq!(
+        shown["menuBefore"], false,
+        "Mark unread waits in the More menu: {shown}"
+    );
+    let in_menu = client
+        .execute(
+            r#"const found = !!document.querySelector('.menu [data-action="mark-unread"]');
+               document.querySelector('.menu-backdrop')?.click();
+               return found && !document.querySelector('.menu');"#,
+            vec![],
+        )
+        .await?;
+    assert_eq!(
+        in_menu,
+        serde_json::Value::Bool(true),
+        "More opens a menu with Mark unread, and a click outside closes it"
     );
     assert!(
         shown["bodyText"]

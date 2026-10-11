@@ -444,6 +444,7 @@ fn MessageCard(
             );
         }
     });
+    let more_open = RwSignal::new(false);
     let mark_unread = move |_| {
         seen.set(false);
         open.update(|ids| {
@@ -506,16 +507,25 @@ fn MessageCard(
             </div>
             <Show when=expanded fallback=|| ()>
                 {(!recipients.is_empty()).then(|| view! { <div class="msg-to">{recipients.clone()}</div> })}
-                <MessageBody message_id=id downloaded=downloaded />
                 <div class="msg-tools">
                     // The thread view downloads the mail itself.
                     <ReplyButtons message_id=id prefetch=false />
-                    <TalkAboutButton kind="message" id=id />
                     <span class="spacer"></span>
-                    <button class="btn btn-ghost btn-sm" data-action="mark-unread" on:click=mark_unread>
-                        "Mark unread"
-                    </button>
+                    <span class="more-wrap">
+                        <button class="btn btn-ghost btn-sm more-button" data-action="more" title="More"
+                            on:click=move |_| more_open.update(|o| *o = !*o)>"\u{22EF}"</button>
+                        <Show when=move || more_open.get() fallback=|| ()>
+                            <div class="menu-backdrop" on:click=move |_| more_open.set(false)></div>
+                            <div class="menu" on:click=move |_| more_open.set(false)>
+                                <TalkAboutButton kind="message" id=id />
+                                <button class="btn btn-ghost" data-action="mark-unread" on:click=mark_unread>
+                                    "Mark unread"
+                                </button>
+                            </div>
+                        </Show>
+                    </span>
                 </div>
+                <MessageBody message_id=id downloaded=downloaded />
             </Show>
         </div>
     }
