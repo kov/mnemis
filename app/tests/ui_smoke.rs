@@ -243,7 +243,7 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         pool.close().await;
     }
 
-    // 7. Navigate to the inbox via the nav link. We click programmatically
+    // 7. Navigate to All Inboxes via the nav link. We click programmatically
     //    rather than using fantoccini's click (which goes through the W3C
     //    perform-actions endpoint and was rejecting clicks on the SPA link
     //    with no useful diagnostic).
@@ -266,9 +266,9 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     client
         .wait()
         .at_most(SETTLE_TIMEOUT)
-        .for_element(Locator::Css(".list .row[data-message-id]"))
+        .for_element(Locator::Css(".list .trow[data-thread-id]"))
         .await
-        .context("waiting for inbox list to render")?;
+        .context("waiting for the thread list to render")?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Read the list pane's full text via textContent, so the CSS ellipsis on
@@ -294,21 +294,93 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         inbox_text.contains("fyi no action"),
         "expected the action-less message subject in the inbox. text: {inbox_text}"
     );
-    // Exactly two messages are linked to actions in the seed; the third should
-    // not carry an action pill. Count the list rows' action pills directly —
-    // a dedicated class, so a subject like "fyi no action" can't inflate it.
+    // Two messages are linked to actions in the seed, but the roadmap one was
+    // marked Done above: threads count open to-dos only, so one pill. Count
+    // the rows' pills directly — a dedicated class, so a subject like "fyi no
+    // action" can't inflate it.
     let badge_count_raw = client
         .execute(
-            r#"return String(document.querySelectorAll('.list .row .pill.action').length);"#,
+            r#"return String(document.querySelectorAll('.list .trow .pill.action').length);"#,
             vec![],
         )
         .await?;
     let badge_count: usize = badge_count_raw.as_str().unwrap_or("0").parse().unwrap_or(0);
     assert_eq!(
-        badge_count, 2,
-        "expected exactly 2 'action' badges in the inbox (one per action-linked message), \
-         got {badge_count}. text: {inbox_text}"
+        badge_count, 1,
+        "expected exactly 1 open to-do pill in the inbox, got {badge_count}. text: {inbox_text}"
     );
+
+    // Open the to-do-less thread. Its full message isn't downloaded (and
+    // can't be: no server), so the stored text shows, with a note saying so;
+    // being on screen marks it read.
+    client
+        .execute(
+            r#"
+            const row = Array.from(document.querySelectorAll('.list .trow'))
+                .find(r => r.textContent.toLowerCase().includes('fyi no action'));
+            row.click();
+            "#,
+            vec![],
+        )
+        .await?;
+    client
+        .wait()
+        .at_most(SETTLE_TIMEOUT)
+        .for_element(Locator::Css(".thread-wrap .msg-card.open iframe.msg-frame"))
+        .await
+        .context("waiting for the open thread")?;
+    let shown = client
+        .execute(
+            r#"return JSON.stringify({
+                note: !!document.querySelector('[data-field="not-downloaded"]'),
+                srcdoc: document.querySelector('iframe.msg-frame').getAttribute('srcdoc') || '',
+                sandbox: document.querySelector('iframe.msg-frame').getAttribute('sandbox'),
+                height: document.querySelector('iframe.msg-frame').getAttribute('height'),
+                bodyText: document.querySelector('iframe.msg-frame').contentDocument?.body?.textContent || '',
+            });"#,
+            vec![],
+        )
+        .await?;
+    let shown: serde_json::Value = serde_json::from_str(shown.as_str().unwrap_or("{}"))?;
+    assert_eq!(
+        shown["note"], true,
+        "the not-downloaded note shows: {shown}"
+    );
+    assert!(
+        shown["srcdoc"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Just sharing."),
+        "the stored text shows in the frame: {shown}"
+    );
+    assert_eq!(
+        shown["sandbox"], "allow-same-origin",
+        "scripts never run: {shown}"
+    );
+    assert!(
+        shown["bodyText"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Just sharing."),
+        "the frame's page is readable from the app, which sizes it: {shown}"
+    );
+    assert!(
+        shown["height"]
+            .as_str()
+            .and_then(|h| h.parse::<i64>().ok())
+            .is_some_and(|h| h >= 40),
+        "the frame is sized to its page: {shown}"
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let flags: i64 =
+            sqlx::query_scalar("SELECT flags FROM messages WHERE external_id = 'msg-fyi'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(flags & 1, 1, "opened and on screen: read");
+        pool.close().await;
+    }
 
     // 8. Click the Sync now button and assert the expected error toast
     //    (no LLM configured — see MNEMIS_DISABLE_LLM in step 2).
@@ -449,7 +521,7 @@ async fn settings_sources_per_channel_mute_round_trips() -> Result<()> {
         .await?;
     client
         .execute(
-            r#"document.querySelector('nav.nav a[href="/settings"]').click(); return 'ok';"#,
+            r#"document.querySelector('.sidebar a[href="/settings"]').click(); return 'ok';"#,
             vec![],
         )
         .await?;
@@ -713,7 +785,7 @@ async fn settings_channel_toggle_preserves_scroll() -> Result<()> {
         .await?;
     client
         .execute(
-            r#"document.querySelector('nav.nav a[href="/settings"]').click(); return 'ok';"#,
+            r#"document.querySelector('.sidebar a[href="/settings"]').click(); return 'ok';"#,
             vec![],
         )
         .await?;
@@ -1615,7 +1687,7 @@ async fn settings_sources_lists_and_modal_opens() -> Result<()> {
     let go = client
         .execute(
             r#"
-            const a = document.querySelector('nav.nav a[href="/settings"]');
+            const a = document.querySelector('.sidebar a[href="/settings"]');
             if (!a) { return 'missing-nav'; }
             a.click();
             return 'ok';
@@ -2910,6 +2982,24 @@ async fn seed(pool: &SqlitePool) -> Result<()> {
         .await?;
     }
 
+    // Each message is a thread of its own, as the reader files them.
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM messages WHERE channel_id = ?")
+        .bind(channel_id)
+        .fetch_all(pool)
+        .await?;
+    for id in ids {
+        let thread: i64 =
+            sqlx::query_scalar("INSERT INTO mail_threads (source_id) VALUES (?) RETURNING id")
+                .bind(source_id)
+                .fetch_one(pool)
+                .await?;
+        sqlx::query("UPDATE messages SET thread_id = ? WHERE id = ?")
+            .bind(thread)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -3078,7 +3168,7 @@ async fn settings_reminders_shows_connect_form_when_unconfigured() -> Result<()>
         .await?;
     client
         .execute(
-            r#"document.querySelector('nav.nav a[href="/settings"]').click(); return 'ok';"#,
+            r#"document.querySelector('.sidebar a[href="/settings"]').click(); return 'ok';"#,
             vec![],
         )
         .await?;

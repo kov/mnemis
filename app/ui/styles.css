@@ -1357,3 +1357,131 @@ h1 {
 .sending-form { margin-top: 14px; }
 .settings-check { display: flex; align-items: center; gap: 8px; }
 .settings-subhead { font-weight: 600; margin-top: 4px; }
+
+/* ============================ MAIL READER ============================ */
+.side-item .count {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: var(--fs-11);
+  font-variant-numeric: tabular-nums;
+}
+.side-item.folder .folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-label.side-account {
+  margin-top: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.side-footer-status > .side-item { margin: 2px 0 4px; }
+
+.row.trow:not(.read) .from,
+.row.trow:not(.read) .subj { font-weight: 650; }
+.row.trow:not(.read) .from { color: var(--fg); }
+.row.trow.read .from { font-weight: 500; }
+.row.trow .tcount {
+  margin-left: 6px;
+  color: var(--fg-faint);
+  font-weight: 500;
+  font-size: var(--fs-11);
+}
+.list .load-more {
+  display: block;
+  margin: 10px auto 16px;
+}
+
+.thread-wrap { padding: 20px 26px 40px; max-width: 900px; }
+.thread-todos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -4px 0 16px;
+}
+.thread-todos .pill { height: 20px; text-decoration: none; }
+
+.msg-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-10);
+  margin-bottom: 10px;
+  overflow: hidden;
+  background: var(--bg-content);
+}
+.msg-card.unread { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.msg-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.msg-head:hover { background: var(--bg-hover); }
+.msg-who {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.msg-who .name { font-weight: 600; }
+.msg-card.unread .msg-who .name::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+}
+.msg-who .snip,
+.msg-who .addr {
+  color: var(--fg-muted);
+  font-size: var(--fs-12);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.msg-head .when {
+  color: var(--fg-faint);
+  font-size: var(--fs-12);
+  white-space: nowrap;
+}
+.msg-to {
+  color: var(--fg-muted);
+  font-size: var(--fs-12);
+  padding: 0 14px 8px 58px;
+  overflow-wrap: anywhere;
+}
+.msg-frame {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  min-height: 40px;
+}
+.msg-note {
+  color: var(--fg-muted);
+  font-size: var(--fs-12);
+  padding: 6px 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--hairline);
+}
+.msg-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--hairline);
+}
+.msg-tools .spacer { flex: 1; }

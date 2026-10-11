@@ -1,12 +1,12 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Route, Router, Routes};
-use leptos_router::hooks::use_location;
+use leptos_router::hooks::{use_location, use_params_map};
 use leptos_router::path;
 use mnemis_types::{
     ActionDto, ActionStatus, AppearanceDto, CaldavAccountDto, CaldavCollectionDto, CaldavSyncDto,
     ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto, ColorScheme, Confidence, FeedbackKind,
-    LlmConfigDto, MessageDetailDto, MessageDto, PendingResolutionDto, SourceRowDto, StatusSnapshot,
+    LlmConfigDto, MailScope, MessageDetailDto, PendingResolutionDto, SourceRowDto, StatusSnapshot,
     SyncOutcome, UserProfileDto,
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use wasm_bindgen::prelude::*;
 
 mod components;
 mod compose;
+mod mail;
 mod markdown;
 
 #[wasm_bindgen]
@@ -38,11 +39,6 @@ struct ListActionsArgs {
     include_resolved: bool,
 }
 
-#[derive(Serialize)]
-struct ListMessagesArgs {
-    limit: Option<i64>,
-}
-
 async fn fetch_actions(include_resolved: bool) -> Result<Vec<ActionDto>, String> {
     let args = serde_wasm_bindgen::to_value(&ListActionsArgs { include_resolved })
         .map_err(|e| e.to_string())?;
@@ -50,15 +46,6 @@ async fn fetch_actions(include_resolved: bool) -> Result<Vec<ActionDto>, String>
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     serde_wasm_bindgen::from_value::<Vec<ActionDto>>(raw).map_err(|e| e.to_string())
-}
-
-async fn fetch_messages(limit: Option<i64>) -> Result<Vec<MessageDto>, String> {
-    let args =
-        serde_wasm_bindgen::to_value(&ListMessagesArgs { limit }).map_err(|e| e.to_string())?;
-    let raw = invoke("list_messages", args)
-        .await
-        .map_err(|e| format!("invoke failed: {:?}", e))?;
-    serde_wasm_bindgen::from_value::<Vec<MessageDto>>(raw).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -804,6 +791,7 @@ fn App() -> impl IntoView {
     };
     provide_context(chat_ui);
     provide_context(compose::Composer::new());
+    mail::provide();
     // Remember "show reasoning" across runs (stored in the DB settings table).
     let show_reasoning = chat_ui.show_reasoning;
     spawn_local(async move {
@@ -832,7 +820,8 @@ fn App() -> impl IntoView {
                         <components::FirstRunBanner />
                         <Routes fallback=|| view! { <div class="empty">"Not found"</div> }>
                     <Route path=path!("/") view=ActionsPage />
-                    <Route path=path!("/inbox") view=InboxPage />
+                    <Route path=path!("/inbox") view=AllInboxesPage />
+                    <Route path=path!("/mail/:id") view=MailboxPage />
                     <Route path=path!("/chats") view=ChatsListPage />
                     <Route path=path!("/chats/:id") view=ChatDetailPage />
                     <Route path=path!("/settings") view=SettingsPage />
@@ -860,50 +849,15 @@ fn Sidebar() -> impl IntoView {
                 <nav class="nav side-nav">
                     <div class="side-label">"Smart views"</div>
                     <A href="/" attr:class="side-item"><span class="ico">"\u{25CE}"</span>"To-dos"</A>
-                    <A href="/inbox" attr:class="side-item"><span class="ico">"\u{2709}"</span>"Inbox"</A>
                     <A href="/chats" attr:class="side-item"><span class="ico">"\u{25C8}"</span>"Chats"</A>
-                    <A href="/settings" attr:class="side-item"><span class="ico">"\u{2699}"</span>"Settings"</A>
                 </nav>
-                <AccountsNav />
+                <mail::MailNav />
             </div>
             <div class="side-footer-status">
+                <A href="/settings" attr:class="side-item"><span class="ico">"\u{2699}"</span>"Settings"</A>
                 <components::StatusPanel />
             </div>
         </aside>
-    }
-}
-
-/// Lists configured sources under an "Accounts" header. Reacts to `SyncTick` so
-/// a newly added source appears after a sync without a reload. Each entry links
-/// to the inbox for now (per-source filtering is a later step).
-#[component]
-fn AccountsNav() -> impl IntoView {
-    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
-    let sources = LocalResource::new(move || {
-        let _ = sync_tick.get();
-        async move { fetch_settings_sources().await }
-    });
-    view! {
-        <Suspense fallback=|| view! { <></> }>
-            {move || sources.get().and_then(|res| match res {
-                Ok(rows) if rows.is_empty() => None,
-                Ok(rows) => Some(view! {
-                    <div class="side-section">
-                        <div class="side-label">"Accounts"</div>
-                        <For
-                            each=move || rows.clone()
-                            key=|s| s.id
-                            children=move |s: SourceRowDto| view! {
-                                <A href="/inbox" attr:class="side-item account">
-                                    <span class="acc-dot"></span>{s.name.clone()}
-                                </A>
-                            }
-                        />
-                    </div>
-                }.into_any()),
-                Err(_) => None,
-            })}
-        </Suspense>
     }
 }
 
@@ -914,16 +868,16 @@ fn Toolbar() -> impl IntoView {
     let location = use_location();
     let title = move || {
         let p = location.pathname.get();
-        if p == "/" {
-            "To-dos"
-        } else if p.starts_with("/inbox") {
-            "Inbox"
+        if let Some(t) = mail::title_for(&p) {
+            t
+        } else if p == "/" {
+            "To-dos".to_string()
         } else if p.starts_with("/chats") {
-            "Chats"
+            "Chats".to_string()
         } else if p.starts_with("/settings") {
-            "Settings"
+            "Settings".to_string()
         } else {
-            "mnemis"
+            "mnemis".to_string()
         }
     };
     view! {
@@ -975,33 +929,25 @@ fn ChatDetailPage() -> impl IntoView {
 }
 
 #[component]
-fn InboxPage() -> impl IntoView {
-    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
-    let messages = LocalResource::new(move || {
-        // Subscribing to sync_tick here makes the resource re-fetch whenever
-        // StatusPanel bumps it after a successful sync.
-        let _ = sync_tick.get();
-        async move { fetch_messages(None).await }
-    });
-    view! {
-        <Suspense fallback=|| view! {
-            <div class="body">
-                <div class="list"></div>
-                <div class="reading"><div class="reading-empty">"Loading…"</div></div>
-            </div>
-        }>
-            {move || messages.get().map(|res| match res {
-                Ok(rows) => view! { <components::InboxPane rows=rows /> }.into_any(),
-                Err(e) => view! {
-                    <div class="reading-empty">{format!("Error: {e}")}</div>
-                }.into_any(),
-            })}
-        </Suspense>
+fn AllInboxesPage() -> impl IntoView {
+    view! { <mail::MailPage scope=MailScope::AllInboxes /> }
+}
+
+/// One folder's threads; a new folder id remounts the page.
+#[component]
+fn MailboxPage() -> impl IntoView {
+    let params = use_params_map();
+    move || {
+        params
+            .read()
+            .get("id")
+            .and_then(|id| id.parse::<i64>().ok())
+            .map(|channel_id| {
+                view! { <mail::MailPage scope=MailScope::Mailbox { channel_id } /> }
+            })
     }
 }
 
-/// Pure-frontend helpers for action presentation. Lives here for now so we
-/// don't pull serde or chrono into the wasm crate just for two strings.
 pub(crate) fn confidence_class(c: Confidence) -> &'static str {
     match c {
         Confidence::High => "badge badge-high",
