@@ -175,7 +175,7 @@ async fn draft_email(pool: &SqlitePool, chat_id: i64, arguments: &str) -> anyhow
     crate::mail::save_draft(pool, &draft).await?;
     Ok(json!({
         "draft_id": id,
-        "from": draft.from,
+        "from": draft.from_address,
         "to": draft.to,
         "cc": draft.cc,
         "subject": draft.subject,

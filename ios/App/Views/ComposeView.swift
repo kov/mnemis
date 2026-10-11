@@ -16,8 +16,6 @@ struct ComposeView: View {
         _showsCopies = State(initialValue: !draft.cc.isEmpty || !draft.bcc.isEmpty)
     }
 
-    private var accounts: [SourceRowDto] { model.sources.filter { $0.kind == "imap" } }
-
     private var title: String {
         switch draft.kind {
         case .new: "New email"
@@ -30,14 +28,17 @@ struct ComposeView: View {
         NavigationStack {
             Form {
                 Section {
-                    if accounts.count > 1 {
-                        Picker("From", selection: $draft.sourceId) {
-                            ForEach(accounts) { account in
-                                Text(account.name).tag(Optional(account.id))
+                    if draft.fromChoices.count > 1 {
+                        Picker("From", selection: $draft.fromAddress) {
+                            ForEach(draft.fromChoices, id: \.self) { address in
+                                Text(address).tag(address)
                             }
                         }
                     } else {
-                        LabeledContent("From", value: draft.from.isEmpty ? "No sender address" : draft.from)
+                        LabeledContent(
+                            "From",
+                            value: draft.fromAddress.isEmpty ? "No sender address" : draft.fromAddress
+                        )
                     }
                     addressField("To", text: $draft.to)
                     if showsCopies {

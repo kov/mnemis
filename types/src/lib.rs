@@ -571,9 +571,12 @@ pub struct DraftDto {
     pub message_id: Option<i64>,
     /// The chat whose agent drafted it.
     pub chat_id: Option<i64>,
-    /// The sender as it will appear, "Name <address>"; empty when the account
-    /// can't send.
-    pub from: String,
+    /// The name mail goes out under.
+    pub from_name: String,
+    /// The address it is sent as; empty when there is none to send as.
+    pub from_address: String,
+    /// The user's addresses to pick from: their profile's and each account's.
+    pub from_choices: Vec<String>,
     /// Comma-separated addresses, as typed.
     pub to: String,
     pub cc: String,

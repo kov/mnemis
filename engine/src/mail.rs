@@ -152,14 +152,6 @@ pub async fn save_smtp_settings(
     .await
 }
 
-impl SmtpAccount {
-    fn mailbox(&self) -> Option<Mailbox> {
-        let address = self.from_address.parse().ok()?;
-        let name = Some(self.from_name.clone()).filter(|n| !n.trim().is_empty());
-        Some(Mailbox::new(name, address))
-    }
-}
-
 /// What the network side of sending does; [`Network`] in the apps, a
 /// recorder in tests.
 #[async_trait]
@@ -492,6 +484,77 @@ async fn own_addresses(pool: &SqlitePool) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The addresses the user can send as: their profile's, then each account's
+/// sender address, without repeats.
+async fn sender_addresses(pool: &SqlitePool) -> Result<Vec<String>> {
+    let mut candidates: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT ci.value FROM contact_identifiers ci JOIN contacts c ON c.id = ci.contact_id \
+         WHERE c.relationship = 'self' AND ci.kind = 'email' ORDER BY ci.id",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(v,)| v.trim().to_string())
+    .collect();
+    for id in mail_accounts(pool).await? {
+        if let Ok((account, _)) = load_account(pool, id).await {
+            candidates.push(account.from_address);
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for address in candidates {
+        if address.parse::<lettre::Address>().is_ok()
+            && !out.iter().any(|a| a.eq_ignore_ascii_case(&address))
+        {
+            out.push(address);
+        }
+    }
+    Ok(out)
+}
+
+async fn mail_accounts(pool: &SqlitePool) -> Result<Vec<i64>> {
+    let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM sources WHERE kind = 'imap' ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    Ok(ids.into_iter().map(|(id,)| id).collect())
+}
+
+/// The account that sends as `address`: the one whose sender or login it
+/// is, else `fallback`, else the first.
+async fn account_for(
+    pool: &SqlitePool,
+    address: &str,
+    fallback: Option<i64>,
+) -> Result<Option<i64>> {
+    let accounts = mail_accounts(pool).await?;
+    for &id in &accounts {
+        if let Ok((account, _)) = load_account(pool, id).await
+            && (account.from_address.eq_ignore_ascii_case(address)
+                || account.username.eq_ignore_ascii_case(address))
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(fallback.or(accounts.first().copied()))
+}
+
+/// The name mail goes out under: the account's, else the profile's.
+async fn sender_name(pool: &SqlitePool, source_id: Option<i64>) -> Result<String> {
+    if let Some(id) = source_id
+        && let Ok((account, _)) = load_account(pool, id).await
+        && !account.from_name.trim().is_empty()
+    {
+        return Ok(account.from_name);
+    }
+    Ok(crate::settings::get_user_profile(pool).await?.display_name)
+}
+
+/// The account's own sender address, when it has one.
+async fn account_address(pool: &SqlitePool, source_id: Option<i64>) -> Option<String> {
+    let (account, _) = load_account(pool, source_id?).await.ok()?;
+    Some(account.from_address).filter(|a| !a.is_empty())
+}
+
 /// A new draft, prefilled for its kind: a reply goes to the original's
 /// Reply-To or sender (a reply-all also to its other recipients, minus the
 /// user) with the original quoted; a forward carries the original's text.
@@ -510,6 +573,9 @@ pub async fn start_draft(
     let mut body = String::new();
     let mut in_reply_to = None;
     let mut references = None;
+    // Addresses the original went to (or came from, for mail the user sent),
+    // to answer from the same one.
+    let mut addressed: Vec<String> = Vec::new();
     let source_id = match (kind, message_id) {
         (DraftKind::New, _) => {
             let first: Option<(i64,)> =
@@ -521,6 +587,16 @@ pub async fn start_draft(
         (_, None) => bail!("a reply or forward needs the message it answers"),
         (kind, Some(message_id)) => {
             let original = load_original(pool, message_id).await?;
+            addressed.extend(original.author_address.clone());
+            for kind in ["to", "cc"] {
+                addressed.extend(
+                    original
+                        .recipients
+                        .iter()
+                        .filter(|r| r.kind == kind)
+                        .filter_map(|r| r.address.clone()),
+                );
+            }
             if kind == DraftKind::Forward {
                 subject = prefixed("Fwd:", &original.subject);
                 body = format!("\n\n{}", forwarded(&original));
@@ -575,11 +651,23 @@ pub async fn start_draft(
             Some(original.source_id)
         }
     };
+    let senders = sender_addresses(pool).await?;
+    let from_addr = addressed
+        .iter()
+        .find_map(|a| senders.iter().find(|s| s.eq_ignore_ascii_case(a)))
+        .cloned()
+        .or(account_address(pool, source_id).await)
+        .or_else(|| senders.first().cloned());
+    let source_id = match &from_addr {
+        Some(address) => account_for(pool, address, source_id).await?,
+        None => source_id,
+    };
     let now = Utc::now().timestamp();
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO drafts (source_id, kind, message_id, chat_id, to_addrs, cc_addrs, subject, \
-                             body, in_reply_to, \"references\", created_by, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                             body, in_reply_to, \"references\", created_by, created_at, updated_at, \
+                             from_addr) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(source_id)
     .bind(kind.as_str())
@@ -594,6 +682,7 @@ pub async fn start_draft(
     .bind(if by_agent { "agent" } else { "user" })
     .bind(now)
     .bind(now)
+    .bind(&from_addr)
     .fetch_one(pool)
     .await
     .context("inserting draft")?;
@@ -619,13 +708,14 @@ struct DraftRow {
     created_by: String,
     updated_at: i64,
     sent_at: Option<i64>,
+    from_addr: Option<String>,
 }
 
 async fn load_draft(pool: &SqlitePool, id: i64) -> Result<DraftRow> {
     sqlx::query_as(
         "SELECT id, source_id, kind, message_id, chat_id, to_addrs, cc_addrs, bcc_addrs, \
                 subject, body, in_reply_to, \"references\", status, error, created_by, \
-                updated_at, sent_at \
+                updated_at, sent_at, from_addr \
          FROM drafts WHERE id = ?",
     )
     .bind(id)
@@ -636,22 +726,29 @@ async fn load_draft(pool: &SqlitePool, id: i64) -> Result<DraftRow> {
 
 pub async fn get_draft(pool: &SqlitePool, id: i64) -> Result<DraftDto> {
     let row = load_draft(pool, id).await?;
-    let from = match row.source_id {
-        Some(source_id) => load_account(pool, source_id)
+    let from_address = match row.from_addr.clone() {
+        Some(address) => address,
+        None => account_address(pool, row.source_id)
             .await
-            .ok()
-            .and_then(|(account, _)| account.mailbox())
-            .map(|m| m.to_string())
             .unwrap_or_default(),
-        None => String::new(),
     };
+    let mut from_choices = sender_addresses(pool).await?;
+    if !from_address.is_empty()
+        && !from_choices
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(&from_address))
+    {
+        from_choices.insert(0, from_address.clone());
+    }
     Ok(DraftDto {
         id: row.id,
         source_id: row.source_id,
         kind: DraftKind::parse(&row.kind).unwrap_or(DraftKind::New),
         message_id: row.message_id,
         chat_id: row.chat_id,
-        from,
+        from_name: sender_name(pool, row.source_id).await?,
+        from_address,
+        from_choices,
         to: row.to_addrs,
         cc: row.cc_addrs,
         bcc: row.bcc_addrs,
@@ -665,15 +762,22 @@ pub async fn get_draft(pool: &SqlitePool, id: i64) -> Result<DraftDto> {
     })
 }
 
-/// Store the user's edits: the account, addressees, subject and body. A sent
-/// or discarded draft is left as it is.
+/// Store the user's edits: the sender address, addressees, subject and body.
+/// The address picks the account that sends it. A sent or discarded draft is
+/// left as it is.
 pub async fn save_draft(pool: &SqlitePool, draft: &DraftDto) -> Result<()> {
+    let from_addr = Some(draft.from_address.trim().to_string()).filter(|a| !a.is_empty());
+    let source_id = match &from_addr {
+        Some(address) => account_for(pool, address, draft.source_id).await?,
+        None => draft.source_id,
+    };
     sqlx::query(
-        "UPDATE drafts SET source_id = ?, to_addrs = ?, cc_addrs = ?, bcc_addrs = ?, \
-                           subject = ?, body = ?, updated_at = ? \
+        "UPDATE drafts SET source_id = ?, from_addr = ?, to_addrs = ?, cc_addrs = ?, \
+                           bcc_addrs = ?, subject = ?, body = ?, updated_at = ? \
          WHERE id = ? AND status = 'draft'",
     )
-    .bind(draft.source_id)
+    .bind(source_id)
+    .bind(&from_addr)
     .bind(&draft.to)
     .bind(&draft.cc)
     .bind(&draft.bcc)
@@ -794,13 +898,18 @@ async fn send_inner(pool: &SqlitePool, postbox: &dyn Postbox, id: i64) -> Result
     if row.status != "draft" {
         bail!("this draft was already {}", row.status);
     }
-    let source_id = row.source_id.context("choose an account to send from")?;
+    let source_id = row.source_id.context("add a mail account to send from")?;
     let (account, _) = load_account(pool, source_id).await?;
-    let from = account
-        .mailbox()
-        .context("set the account's sender address in its sending settings")?;
-    let domain = account
-        .from_address
+    let address = match row.from_addr.clone() {
+        Some(address) => address,
+        None => account.from_address.clone(),
+    };
+    let parsed: lettre::Address = address
+        .parse()
+        .map_err(|_| anyhow::anyhow!("choose a sender address"))?;
+    let name = sender_name(pool, Some(source_id)).await?;
+    let from = Mailbox::new(Some(name).filter(|n| !n.trim().is_empty()), parsed);
+    let domain = address
         .rsplit('@')
         .next()
         .unwrap_or("mnemis.invalid")
@@ -970,7 +1079,7 @@ mod tests {
         assert_eq!(d.cc, "bob@example.net, carol@example.net");
         assert_eq!(d.subject, "Re: Revisão do contrato");
         assert!(d.body.contains("> Pode revisar até sexta?"), "{}", d.body);
-        assert_eq!(d.from, "me@example.org");
+        assert_eq!(d.from_address, "me@example.org");
 
         let mut edited = d.clone();
         edited.body = format!("Sim, reviso.{}", d.body);
@@ -1065,6 +1174,58 @@ mod tests {
         .unwrap();
         let d = get_draft(&pool, id).await.unwrap();
         assert_eq!(d.to, "Projeto <projeto@example.com>");
+    }
+
+    #[tokio::test]
+    async fn answers_from_the_address_the_original_was_sent_to() {
+        let (_tmp, pool) = setup().await;
+        sqlx::query(
+            "INSERT INTO contacts (id, display_name, relationship, created_at, updated_at) \
+             VALUES (1, 'Me', 'self', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for address in ["other@example.org", "Alias@example.org"] {
+            sqlx::query(
+                "INSERT INTO contact_identifiers (contact_id, kind, value) VALUES (1, 'email', ?)",
+            )
+            .bind(address)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE messages SET recipients_json = ? WHERE id = 1")
+            .bind(r#"[{"kind":"to","address":"alias@example.org"}]"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let postbox = Recorder::default();
+        let id = start_draft(&pool, &postbox, DraftKind::Reply, Some(1), None, false)
+            .await
+            .unwrap();
+        let d = get_draft(&pool, id).await.unwrap();
+        assert_eq!(d.from_address, "Alias@example.org");
+        assert_eq!(
+            d.from_choices,
+            ["other@example.org", "Alias@example.org", "me@example.org"]
+        );
+        assert_eq!(d.source_id, Some(1));
+
+        let sent = send_draft(&pool, &postbox, id).await.unwrap();
+        assert_eq!(sent.status, DraftStatus::Sent);
+        let (_, raw) = postbox.sent.lock().unwrap()[0].clone();
+        assert!(raw.contains("From: Alias@example.org"), "{raw}");
+
+        // A new mail starts from the account's own address.
+        let id = start_draft(&pool, &postbox, DraftKind::New, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_draft(&pool, id).await.unwrap().from_address,
+            "me@example.org"
+        );
     }
 
     #[tokio::test]

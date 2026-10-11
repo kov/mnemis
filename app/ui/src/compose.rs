@@ -4,11 +4,9 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use mnemis_types::{DraftDto, DraftKind, DraftStatus, SmtpSettingsDto, SourceRowDto};
+use mnemis_types::{DraftDto, DraftKind, DraftStatus, SmtpSettingsDto};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-
-use crate::fetch_settings_sources;
 
 /// The draft open in the composer, if any.
 #[derive(Clone, Copy)]
@@ -132,33 +130,25 @@ pub fn ComposeHost() -> impl IntoView {
 fn ComposeLoader(draft_id: i64) -> impl IntoView {
     let c = composer();
     let draft = LocalResource::new(move || get_draft(draft_id));
-    let accounts = LocalResource::new(fetch_settings_sources);
     view! {
         <Suspense fallback=|| ()>
-            {move || match (draft.get(), accounts.get()) {
-                (Some(Ok(d)), Some(a)) => {
-                    let accounts: Vec<SourceRowDto> = a
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|s| s.kind == "imap")
-                        .collect();
-                    view! { <ComposeForm draft=d accounts=accounts /> }.into_any()
-                }
-                (Some(Err(e)), _) => {
+            {move || match draft.get() {
+                Some(Ok(d)) => view! { <ComposeForm draft=d /> }.into_any(),
+                Some(Err(e)) => {
                     c.error.set(Some(format!("Couldn't open the draft: {e}")));
                     c.draft.set(None);
                     ().into_any()
                 }
-                _ => ().into_any(),
+                None => ().into_any(),
             }}
         </Suspense>
     }
 }
 
 #[component]
-fn ComposeForm(draft: DraftDto, accounts: Vec<SourceRowDto>) -> impl IntoView {
+fn ComposeForm(draft: DraftDto) -> impl IntoView {
     let c = composer();
-    let source_id = RwSignal::new(draft.source_id);
+    let from_address = RwSignal::new(draft.from_address.clone());
     let to = RwSignal::new(draft.to.clone());
     let cc = RwSignal::new(draft.cc.clone());
     let bcc = RwSignal::new(draft.bcc.clone());
@@ -176,13 +166,13 @@ fn ComposeForm(draft: DraftDto, accounts: Vec<SourceRowDto>) -> impl IntoView {
     let is_forward = draft.kind == DraftKind::Forward;
     let keepable = draft.chat_id.is_some();
     let by_agent = draft.by_agent;
-    let from = draft.from.clone();
+    let choices = draft.from_choices.clone();
     let id = draft.id;
     let base = StoredValue::new(draft);
 
     let current = move || {
         let mut d = base.get_value();
-        d.source_id = source_id.get_untracked();
+        d.from_address = from_address.get_untracked();
         d.to = to.get_untracked();
         d.cc = cc.get_untracked();
         d.bcc = bcc.get_untracked();
@@ -234,21 +224,24 @@ fn ComposeForm(draft: DraftDto, accounts: Vec<SourceRowDto>) -> impl IntoView {
         });
     };
 
-    let from_field = if accounts.len() > 1 {
+    let from_field = if choices.len() > 1 {
         view! {
             <select class="settings-select" data-field="compose-from"
-                on:change=move |ev| source_id.set(event_target_value(&ev).parse().ok())>
-                {accounts.into_iter().map(|a| view! {
-                    <option value=a.id.to_string() selected=Some(a.id) == source_id.get_untracked()>{a.name}</option>
+                on:change=move |ev| from_address.set(event_target_value(&ev))>
+                {choices.into_iter().map(|address| {
+                    let selected = address.eq_ignore_ascii_case(&from_address.get_untracked());
+                    let label = address.clone();
+                    view! { <option value=address selected=selected>{label}</option> }
                 }).collect_view()}
             </select>
         }
         .into_any()
     } else {
-        let shown = if from.is_empty() {
-            "No sender address: set one in Settings → Sources".to_string()
+        let address = from_address.get_untracked();
+        let shown = if address.is_empty() {
+            "No sender address: add yours in Settings → Profile".to_string()
         } else {
-            from
+            address
         };
         view! { <span class="compose-from" data-field="compose-from">{shown}</span> }.into_any()
     };
