@@ -278,6 +278,19 @@ final class AppModel {
         mailVersion += 1
     }
 
+    /// Ask the agent to turn an email into a to-do; true once it has.
+    func toDo(fromMessage id: Int64) async -> Bool {
+        guard let engine else { return false }
+        do {
+            _ = try await engine.toDoFromMessage(messageId: id)
+            await refresh()
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     /// Fetching mail ahead only off metered and Low Data networks.
     private func watchNetwork(_ engine: Engine) {
         // Off until the first path update says otherwise, so a launch on

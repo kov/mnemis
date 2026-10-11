@@ -339,7 +339,9 @@ async fn loads_actions_into_visible_list() -> Result<()> {
                 toolsFirst: !!(document.querySelector('.msg-card.open .msg-tools')
                     .compareDocumentPosition(document.querySelector('.msg-card.open iframe.msg-frame'))
                     & Node.DOCUMENT_POSITION_FOLLOWING),
-                menuBefore: !!document.querySelector('[data-action="mark-unread"]'),
+                mainRow: Array.from(document.querySelectorAll('.msg-card.open .msg-tools > button'))
+                    .map(b => b.dataset.action).join(','),
+                menuBefore: !!document.querySelector('[data-action="mark-unread"], [data-action="reply-all"]'),
                 menuAfter: (document.querySelector('[data-action="more"]').click(), true),
                 bodyText: document.querySelector('iframe.msg-frame').contentDocument?.body?.textContent || '',
             });"#,
@@ -370,9 +372,14 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         shown["menuBefore"], false,
         "Mark unread waits in the More menu: {shown}"
     );
+    assert_eq!(
+        shown["mainRow"], "reply,forward,talk,to-do",
+        "Reply, Forward, chat and To-do up front, the rest under More: {shown}"
+    );
     let in_menu = client
         .execute(
-            r#"const found = !!document.querySelector('.menu [data-action="mark-unread"]');
+            r#"const found = !!document.querySelector('.menu [data-action="mark-unread"]')
+                   && !!document.querySelector('.menu [data-action="reply-all"]');
                document.querySelector('.menu-backdrop')?.click();
                return found && !document.querySelector('.menu');"#,
             vec![],
@@ -381,7 +388,7 @@ async fn loads_actions_into_visible_list() -> Result<()> {
     assert_eq!(
         in_menu,
         serde_json::Value::Bool(true),
-        "More opens a menu with Mark unread, and a click outside closes it"
+        "More opens a menu with Reply all and Mark unread, and a click outside closes it"
     );
     assert!(
         shown["bodyText"]

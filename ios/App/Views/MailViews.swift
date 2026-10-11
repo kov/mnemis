@@ -275,7 +275,8 @@ struct ThreadView: View {
                                     }
                                 }
                             ),
-                            downloaded: downloaded
+                            downloaded: downloaded,
+                            onToDo: { await load() }
                         )
                     }
                 }
@@ -324,8 +325,11 @@ private struct MessageCard: View {
     let message: ThreadMessageDto
     @Binding var expanded: Bool
     let downloaded: Int
+    /// Called once the agent made a to-do from it, to show it atop the thread.
+    let onToDo: () async -> Void
 
     @State private var seen: Bool?
+    @State private var makingToDo = false
 
     private var isSeen: Bool { seen ?? message.seen }
 
@@ -391,18 +395,39 @@ private struct MessageCard: View {
         return parts.joined(separator: " · ")
     }
 
-    /// Reply, Reply all and Forward (labelled when they fit), and the
-    /// rest in a menu at the far end.
+    /// Reply, Forward, a chat about it and To-do; Reply all and Mark
+    /// unread in a menu at the far end.
     private var tools: some View {
         HStack(spacing: 8) {
-            ViewThatFits(in: .horizontal) {
-                replyRow.labelStyle(.titleAndIcon)
-                replyRow.labelStyle(.iconOnly)
+            Button("Reply", systemImage: "arrowshape.turn.up.left") {
+                Task { await model.compose(.reply, messageId: message.messageId) }
             }
+            .labelStyle(.iconOnly)
+            Button("Forward", systemImage: "arrowshape.turn.up.right") {
+                Task { await model.compose(.forward, messageId: message.messageId) }
+            }
+            .labelStyle(.iconOnly)
+            Button("Talk about this", systemImage: "bubble.left.and.text.bubble.right") {
+                Task { await model.talkAbout(messageId: message.messageId) }
+            }
+            .labelStyle(.iconOnly)
+            Button {
+                Task { await makeToDo() }
+            } label: {
+                if makingToDo {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("To-do")
+                    }
+                } else {
+                    Label("To-do", systemImage: "checklist")
+                }
+            }
+            .disabled(makingToDo)
             Spacer(minLength: 0)
             Menu {
-                Button("Talk about this", systemImage: "bubble.left.and.text.bubble.right") {
-                    Task { await model.talkAbout(messageId: message.messageId) }
+                Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {
+                    Task { await model.compose(.replyAll, messageId: message.messageId) }
                 }
                 Button("Mark unread", systemImage: "envelope.badge") {
                     seen = false
@@ -416,24 +441,17 @@ private struct MessageCard: View {
             }
             .menuStyle(.button)
         }
+        .lineLimit(1)
         .buttonStyle(.glass)
         .font(.subheadline.weight(.semibold))
     }
 
-    private var replyRow: some View {
-        HStack(spacing: 8) {
-            Button("Reply", systemImage: "arrowshape.turn.up.left") {
-                Task { await model.compose(.reply, messageId: message.messageId) }
-            }
-            Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {
-                Task { await model.compose(.replyAll, messageId: message.messageId) }
-            }
-            Button("Forward", systemImage: "arrowshape.turn.up.right") {
-                Task { await model.compose(.forward, messageId: message.messageId) }
-            }
+    private func makeToDo() async {
+        makingToDo = true
+        defer { makingToDo = false }
+        if await model.toDo(fromMessage: message.messageId) {
+            await onToDo()
         }
-        .lineLimit(1)
-        .fixedSize()
     }
 }
 

@@ -8,7 +8,7 @@ use leptos::task::spawn_local;
 use leptos::web_sys::{Element, HtmlIFrameElement, MouseEvent};
 use leptos_router::components::A;
 use mnemis_types::{
-    MailScope, MailboxDto, MailboxRole, RenderedMessageDto, ThreadDto, ThreadMessageDto,
+    DraftKind, MailScope, MailboxDto, MailboxRole, RenderedMessageDto, ThreadDto, ThreadMessageDto,
     ThreadSummaryDto,
 };
 use serde::Serialize;
@@ -17,7 +17,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
 use crate::components::TalkAboutButton;
-use crate::compose::ReplyButtons;
+use crate::compose::compose;
 use crate::markdown::is_safe_href;
 use crate::{SyncTick, open_external};
 
@@ -70,6 +70,11 @@ struct RenderArgs {
 struct AttachmentArgs {
     message_id: i64,
     part: u32,
+}
+
+#[derive(Serialize)]
+struct MessageIdArgs {
+    message_id: i64,
 }
 
 #[derive(Serialize)]
@@ -321,14 +326,22 @@ fn ThreadRow(thread: ThreadSummaryDto, selected: RwSignal<Option<i64>>) -> impl 
     }
 }
 
+/// Bumped from a message card when it made a to-do, so the thread's list of
+/// to-dos reloads.
+#[derive(Clone, Copy)]
+struct ThreadTodosChanged(RwSignal<u32>);
+
 /// The open thread: its to-dos, then its messages, oldest first.
 #[component]
 fn ThreadView(thread_id: i64) -> impl IntoView {
     // Bumped when the thread's missing mail has arrived, so incomplete
     // messages render again.
     let downloaded = RwSignal::new(0u32);
+    // Bumped when the thread gained a to-do.
+    let todos_changed = RwSignal::new(0u32);
+    provide_context(ThreadTodosChanged(todos_changed));
     let thread = LocalResource::new(move || {
-        let _ = downloaded.get();
+        let _ = (downloaded.get(), todos_changed.get());
         call::<ThreadDto>("mail_thread", ThreadArgs { thread_id })
     });
     spawn_local(async move {
@@ -508,8 +521,12 @@ fn MessageCard(
             <Show when=expanded fallback=|| ()>
                 {(!recipients.is_empty()).then(|| view! { <div class="msg-to">{recipients.clone()}</div> })}
                 <div class="msg-tools">
-                    // The thread view downloads the mail itself.
-                    <ReplyButtons message_id=id prefetch=false />
+                    <button class="btn btn-ghost btn-sm btn-icon" data-action="reply" title="Reply"
+                        on:click=move |_| compose(DraftKind::Reply, Some(id))>{icon(REPLY)}</button>
+                    <button class="btn btn-ghost btn-sm btn-icon" data-action="forward" title="Forward"
+                        on:click=move |_| compose(DraftKind::Forward, Some(id))>{icon(FORWARD)}</button>
+                    <TalkAboutButton kind="message" id=id compact=true />
+                    <ToDoButton message_id=id />
                     <span class="spacer"></span>
                     <span class="more-wrap">
                         <button class="btn btn-ghost btn-sm more-button" data-action="more" title="More"
@@ -517,7 +534,8 @@ fn MessageCard(
                         <Show when=move || more_open.get() fallback=|| ()>
                             <div class="menu-backdrop" on:click=move |_| more_open.set(false)></div>
                             <div class="menu" on:click=move |_| more_open.set(false)>
-                                <TalkAboutButton kind="message" id=id />
+                                <button class="btn btn-ghost" data-action="reply-all"
+                                    on:click=move |_| compose(DraftKind::ReplyAll, Some(id))>"Reply all"</button>
                                 <button class="btn btn-ghost" data-action="mark-unread" on:click=mark_unread>
                                     "Mark unread"
                                 </button>
@@ -528,6 +546,57 @@ fn MessageCard(
                 <MessageBody message_id=id downloaded=downloaded />
             </Show>
         </div>
+    }
+}
+
+/// "To-do": the agent writes a to-do from the email, which then shows atop
+/// the thread.
+#[component]
+fn ToDoButton(message_id: i64) -> impl IntoView {
+    let SyncTick(sync_tick) = use_context::<SyncTick>().expect("sync tick context");
+    let changed = use_context::<ThreadTodosChanged>().map(|c| c.0);
+    let working = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let on_click = move |_| {
+        working.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match call::<i64>("to_do_from_message", MessageIdArgs { message_id }).await {
+                Ok(_) => {
+                    if let Some(changed) = changed {
+                        changed.update(|v| *v += 1);
+                    }
+                    sync_tick.update(|v| *v += 1);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            working.set(false);
+        });
+    };
+    view! {
+        <button class="btn btn-ghost btn-sm" data-action="to-do" title="Make this email a to-do"
+            disabled=move || working.get() on:click=on_click>
+            {icon(TODO)}
+            {move || if working.get() { " Writing to-do\u{2026}" } else { " To-do" }}
+        </button>
+        {move || error.get().map(|e| view! {
+            <span class="msg-error" title=e.clone()>"Couldn't make a to-do"</span>
+        })}
+    }
+}
+
+// Line icons (24-unit grid, drawn in the text colour).
+const REPLY: &str = "M9 17l-5-5 5-5M20 18v-2a4 4 0 0 0-4-4H4";
+const FORWARD: &str = "M15 17l5-5-5-5M4 18v-2a4 4 0 0 1 4-4h12";
+pub(crate) const CHAT: &str = "M7.9 20A9 9 0 1 0 4 16.1L2 22z";
+const TODO: &str = "M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11";
+
+pub(crate) fn icon(path: &'static str) -> impl IntoView {
+    view! {
+        <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d=path />
+        </svg>
     }
 }
 

@@ -87,7 +87,7 @@ async fn get_draft(draft_id: i64) -> Result<DraftDto, String> {
 
 /// Start a mail of `kind`, from `message_id` for a reply or forward, and open
 /// the composer on it.
-fn compose(kind: DraftKind, message_id: Option<i64>) {
+pub(crate) fn compose(kind: DraftKind, message_id: Option<i64>) {
     let c = composer();
     spawn_local(async move {
         match call::<i64>("start_draft", StartDraftArgs { kind, message_id }).await {

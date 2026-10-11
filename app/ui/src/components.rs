@@ -1818,7 +1818,13 @@ fn render_node(node: ChannelNode, muted_signals: Arc<HashMap<i64, RwSignal<bool>
 /// "Talk about this" button: opens a new chat seeded from an entity and
 /// navigates to it. `kind` is `"action"` or `"message"`, `id` the entity's id.
 #[component]
-pub(crate) fn TalkAboutButton(kind: &'static str, id: i64) -> impl IntoView {
+pub(crate) fn TalkAboutButton(
+    kind: &'static str,
+    id: i64,
+    /// A chat icon instead of the words.
+    #[prop(default = false)]
+    compact: bool,
+) -> impl IntoView {
     let navigate = use_navigate();
     let on_click = move |_| {
         let navigate = navigate.clone();
@@ -1828,7 +1834,16 @@ pub(crate) fn TalkAboutButton(kind: &'static str, id: i64) -> impl IntoView {
             }
         });
     };
-    view! { <button class="btn btn-ghost" on:click=on_click>"Talk about this"</button> }
+    if compact {
+        view! {
+            <button class="btn btn-ghost btn-sm btn-icon" data-action="talk" title="Talk about this"
+                on:click=on_click>{crate::mail::icon(crate::mail::CHAT)}</button>
+        }
+        .into_any()
+    } else {
+        view! { <button class="btn btn-ghost" on:click=on_click>"Talk about this"</button> }
+            .into_any()
+    }
 }
 
 /// An inline, collapsible chat grounded in an action — "start a chat just by

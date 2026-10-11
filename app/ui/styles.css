@@ -1491,6 +1491,10 @@ h1 {
 }
 .msg-tools .spacer { flex: 1; }
 .more-wrap { position: relative; }
+.msg-tools .btn { gap: 4px; }
+.msg-tools .btn-icon { padding-left: 8px; padding-right: 8px; }
+.msg-tools .icon { display: block; flex: none; }
+.msg-error { color: var(--danger, #c33); font-size: var(--fs-12); }
 .more-button { font-size: 16px; line-height: 1; }
 .menu-backdrop {
   position: fixed;
