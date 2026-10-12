@@ -946,7 +946,17 @@ fn build_message(
     if to.is_empty() && cc.is_empty() && bcc.is_empty() {
         bail!("add at least one recipient");
     }
+    // Given, not left to lettre to read back from the headers: that re-checks
+    // each address and drops the long ones `parse_list` lets through.
+    let recipients = to
+        .iter()
+        .chain(&cc)
+        .chain(&bcc)
+        .map(|m| m.email.clone())
+        .collect();
+    let envelope = lettre::address::Envelope::new(Some(from.email.clone()), recipients)?;
     let mut builder = Message::builder()
+        .envelope(envelope)
         .from(from)
         .subject(row.subject.trim())
         .message_id(Some(message_id.to_string()));
@@ -1094,6 +1104,44 @@ mod tests {
         assert!(super::parse_list("To", &format!("{long} with spaces@x.org")).is_err());
         assert!(super::parse_list("To", &format!("{long}@")).is_err());
         assert!(super::parse_list("To", "not an address").is_err());
+
+        // And the mail goes to it.
+        let row = super::DraftRow {
+            id: 1,
+            source_id: Some(1),
+            kind: "reply".to_string(),
+            message_id: None,
+            chat_id: None,
+            to_addrs: format!("{long}@alioth-lists.debian.net"),
+            cc_addrs: "ana@example.com".to_string(),
+            bcc_addrs: String::new(),
+            subject: "Re: confirm".to_string(),
+            body: "confirm".to_string(),
+            in_reply_to: None,
+            references: None,
+            status: "draft".to_string(),
+            error: None,
+            created_by: "agent".to_string(),
+            updated_at: 0,
+            sent_at: None,
+            from_addr: None,
+        };
+        let from = "kov@debian.org".parse().unwrap();
+        let message = super::build_message(&row, from, "<id@debian.org>", None).unwrap();
+        let to: Vec<String> = message
+            .envelope()
+            .to()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(
+            to,
+            [
+                format!("{long}@alioth-lists.debian.net"),
+                "ana@example.com".to_string()
+            ]
+        );
+        assert!(String::from_utf8_lossy(&message.formatted()).contains(long));
     }
 
     #[test]
