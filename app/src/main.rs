@@ -866,6 +866,9 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mnemis_engine=info")),
         )
+        // A closed stdout (the terminal that launched it went away) must
+        // drop log lines, not panic the task logging through `eprintln!`.
+        .log_internal_errors(false)
         .init();
 
     // On limited/software GL stacks (some VMs cap at OpenGL 3.2) WebKit's

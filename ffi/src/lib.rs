@@ -49,6 +49,17 @@ where
 {
     match RUNTIME.spawn(fut).await {
         Ok(result) => result.map_err(MnemisError::from),
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown cause".to_string());
+            Err(MnemisError::Failed {
+                message: format!("engine task panicked: {what}"),
+            })
+        }
         Err(e) => Err(MnemisError::Failed {
             message: format!("engine task failed: {e}"),
         }),
@@ -1136,7 +1147,18 @@ fn init_logging() {
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
             .with_ansi(false)
+            // Once a debugger's console detaches, stdout and stderr fail
+            // (EIO); reporting the failed write with `eprintln!` would then
+            // panic whichever task logged. Lines are dropped instead.
+            .log_internal_errors(false)
             .try_init();
+        // Where a panic happened, in the log; its message also reaches the
+        // app through `run`.
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(panic = %info, "engine panicked");
+            default(info);
+        }));
     });
 }
 
