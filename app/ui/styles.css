@@ -1393,6 +1393,8 @@ h1 {
 }
 
 .thread-wrap { padding: 20px 26px 40px; max-width: 900px; }
+/* A to-do's thread sits inside the to-do's own padded pane. */
+.read-wrap .thread-wrap { padding: 8px 0 16px; }
 .thread-todos {
   display: flex;
   flex-wrap: wrap;

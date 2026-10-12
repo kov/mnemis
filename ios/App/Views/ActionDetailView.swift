@@ -67,7 +67,10 @@ struct ActionDetailView: View {
                     }
                 }
 
-                if let message {
+                if let threadId = action.sourceThreadId {
+                    // The email as the reader shows it, with its controls.
+                    ThreadContent(threadId: threadId, viewing: action.id)
+                } else if let message {
                     Card {
                         Label("Original email", systemImage: "envelope")
                             .font(.footnote.weight(.semibold))
@@ -197,7 +200,8 @@ struct ActionDetailView: View {
 
     private func loadMessage() async {
         message = nil
-        guard let engine = model.engine, let id = action.sourceMessageId else { return }
+        guard action.sourceThreadId == nil, let engine = model.engine,
+              let id = action.sourceMessageId else { return }
         do {
             message = try await engine.getMessage(messageId: id)
             if !isWarning {

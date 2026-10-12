@@ -982,6 +982,7 @@ pub struct ActionDto {
     pub due_at: Option<i64>,
     pub source_posted_at: Option<i64>,
     pub source_message_id: Option<i64>,
+    pub source_thread_id: Option<i64>,
     pub evidence_count: i64,
     pub channel_name: Option<String>,
     pub source_name: Option<String>,

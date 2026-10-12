@@ -235,6 +235,9 @@ pub struct ActionDto {
     /// Internal id of that same message, for showing the original email.
     #[serde(default)]
     pub source_message_id: Option<i64>,
+    /// The mail thread that message belongs to, shown whole with the to-do.
+    #[serde(default)]
+    pub source_thread_id: Option<i64>,
     /// Number of evidence messages linked.
     pub evidence_count: i64,
     /// Channel name (e.g. `INBOX`) for context.

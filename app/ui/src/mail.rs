@@ -320,8 +320,9 @@ fn ThreadRow(thread: ThreadSummaryDto, selected: RwSignal<Option<i64>>) -> impl 
 struct ThreadTodosChanged(RwSignal<u32>);
 
 /// The open thread: its to-dos, then its messages, oldest first.
+/// `viewing`: the to-do the thread is shown under, left out of its to-dos.
 #[component]
-fn ThreadView(thread_id: i64) -> impl IntoView {
+pub fn ThreadView(thread_id: i64, #[prop(optional)] viewing: Option<i64>) -> impl IntoView {
     // Bumped when the thread's missing mail has arrived, so incomplete
     // messages render again.
     let downloaded = RwSignal::new(0u32);
@@ -357,6 +358,8 @@ fn ThreadView(thread_id: i64) -> impl IntoView {
                                 .collect(),
                         ));
                     }
+                    let mut t = t;
+                    t.todos.retain(|todo| Some(todo.action_id) != viewing);
                     view! { <ThreadBody thread=t open=open downloaded=downloaded /> }.into_any()
                 }
                 Err(e) => view! { <div class="reading-empty">{format!("Error: {e}")}</div> }.into_any(),

@@ -27,7 +27,7 @@ pub struct ActionFilter {
 pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec<ActionDto>> {
     let sql = if filter.include_resolved {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id, m.thread_id \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -37,7 +37,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          ORDER BY a.extracted_at DESC"
     } else {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
-                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id, m.thread_id \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
          LEFT JOIN messages m ON m.id = ae.message_id \
@@ -61,6 +61,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         Option<String>,
         Option<i64>,
         Option<i64>,
+        Option<i64>,
     )> = sqlx::query_as(sql)
         .fetch_all(pool)
         .await
@@ -80,6 +81,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         sync_status,
         source_posted_at,
         source_message_id,
+        source_thread_id,
     ) in rows
     {
         let evidence_count: (i64,) =
@@ -98,6 +100,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
             due_at,
             source_posted_at,
             source_message_id,
+            source_thread_id,
             evidence_count: evidence_count.0,
             channel_name: if channel_name.is_empty() {
                 None

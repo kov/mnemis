@@ -236,10 +236,30 @@ struct ThreadRow: View {
     }
 }
 
-/// The open thread: its to-dos, then its messages, oldest first.
+/// The open thread, in the mail reader.
 struct ThreadView: View {
+    let threadId: Int64
+
+    var body: some View {
+        ScrollView {
+            ThreadContent(threadId: threadId)
+                .padding()
+                .frame(maxWidth: 860)
+                .frame(maxWidth: .infinity)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// A thread: its to-dos, then its messages, oldest first. The reader shows
+/// it on its own; a to-do shows the thread it came from beneath it.
+struct ThreadContent: View {
     @Environment(AppModel.self) private var model
     let threadId: Int64
+    /// The to-do the thread is shown under, left out of its to-dos.
+    var viewing: Int64?
 
     @State private var thread: ThreadDto?
     /// Which messages are open; decided once, when the thread first loads
@@ -250,15 +270,16 @@ struct ThreadView: View {
     @State private var downloaded = 0
 
     var body: some View {
-        ScrollView {
+        Group {
             if let thread, let open {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(thread.subject.isEmpty ? "(no subject)" : thread.subject)
                         .font(.title3.weight(.bold))
                         .fixedSize(horizontal: false, vertical: true)
-                    if !thread.todos.isEmpty {
+                    let todos = thread.todos.filter { $0.actionId != viewing }
+                    if !todos.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
-                            ForEach(thread.todos, id: \.actionId) { todo in
+                            ForEach(todos, id: \.actionId) { todo in
                                 Button {
                                     model.showAction(todo.actionId)
                                 } label: {
@@ -288,18 +309,15 @@ struct ThreadView: View {
                         )
                     }
                 }
-                .padding()
-                .frame(maxWidth: 860)
-                .frame(maxWidth: .infinity)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .padding()
             }
         }
-        .overlay {
-            if thread == nil { ProgressView() }
-        }
-        .background(Color(.systemGroupedBackground))
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
-        .task {
+        .task(id: threadId) {
+            thread = nil
+            open = nil
             await load()
             guard let engine = model.engine else { return }
             do {

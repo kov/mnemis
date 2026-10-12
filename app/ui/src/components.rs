@@ -576,6 +576,10 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
     let details = action.details.clone();
     let sent = action.source_posted_at.map(email_full_date);
     let source_message_id = action.source_message_id;
+    // With a thread, the email is shown as the reader shows it, with its
+    // controls; the bare email and reply buttons are for mail without one.
+    let source_thread_id = action.source_thread_id;
+    let bare_message_id = source_message_id.filter(|_| source_thread_id.is_none());
     let id = action.id;
     let current_status = action.status;
 
@@ -659,10 +663,10 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
                 {sent.map(|s| view! { <span data-field="email-date">{format!("Email sent {s} · ")}</span> })}
                 {format!("{source} · {channel} · {evidence} evidence")}
             </div>
-            {source_message_id.map(|message_id| view! { <SourceEmail message_id=message_id /> })}
+            {bare_message_id.map(|message_id| view! { <SourceEmail message_id=message_id /> })}
             <div class="action-actions">
                 // No replying to an impostor from here.
-                {source_message_id.filter(|_| !is_warning).map(|message_id| view! {
+                {bare_message_id.filter(|_| !is_warning).map(|message_id| view! {
                     <crate::compose::ReplyButtons message_id=message_id />
                 })}
                 // A warning is taken as a to-do or dropped; dropping it has
@@ -717,6 +721,7 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
                     }
                 }
             </Show>
+            {source_thread_id.map(|thread_id| view! { <crate::mail::ThreadView thread_id=thread_id viewing=id /> })}
             <ActionInlineChat action_id=id />
         </div>
     }

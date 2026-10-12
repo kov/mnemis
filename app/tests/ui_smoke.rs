@@ -153,32 +153,28 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "expected the low-confidence revealer to be visible. got text: {body_text}"
     );
 
-    // 6b. The original email is collapsed until revealed, then shows the
-    //     seeded body.
-    assert!(
-        !body_text.contains("take a pass by eod"),
-        "the source email should start collapsed. got text: {body_text}"
-    );
-    client
-        .find(Locator::Css("[data-field='source-email-toggle']"))
-        .await
-        .context("source email revealer")?
-        .click()
-        .await?;
-    let email = client
+    // 6b. The email's thread shows beneath the to-do as the reader shows
+    //     it, with its controls.
+    let thread = client
         .wait()
         .at_most(SETTLE_TIMEOUT)
-        .for_element(Locator::Css("[data-field='source-email']"))
+        .for_element(Locator::Css(".read-wrap [data-field='thread']"))
         .await
-        .context("waiting for the revealed source email")?
+        .context("waiting for the to-do's thread")?
         .text()
         .await
         .unwrap_or_default()
         .to_lowercase();
     assert!(
-        email.contains("take a pass by eod") && email.contains("q3 roadmap draft"),
-        "revealed email should show its subject and body. got: {email}"
+        thread.contains("q3 roadmap draft"),
+        "the thread should show the email's subject. got: {thread}"
     );
+    client
+        .find(Locator::Css(
+            ".read-wrap [data-field='thread'] button[data-action='reply']",
+        ))
+        .await
+        .context("the thread's Reply button")?;
 
     // 6a. Click "Done" on the visible high-confidence action; assert the
     //     list refreshes and the action is no longer rendered.
