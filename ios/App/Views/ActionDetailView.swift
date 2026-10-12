@@ -4,6 +4,7 @@ struct ActionDetailView: View {
     @Environment(AppModel.self) private var model
     let action: ActionDto
     @State private var message: MessageDetailDto?
+    @State private var settingReminder = false
 
     private var isWarning: Bool { action.status == .suspicious }
 
@@ -19,7 +20,7 @@ struct ActionDetailView: View {
                         HStack(spacing: 6) {
                             ConfidenceBadge(confidence: action.confidence)
                             if let due = action.dueAt {
-                                DueBadge(due: due)
+                                DueBadge(due: due, minutes: action.remindMinutes, showsTime: true)
                             }
                         }
                     }
@@ -46,10 +47,11 @@ struct ActionDetailView: View {
                 } else {
                     GlassEffectContainer(spacing: 10) {
                         // One row when it fits; otherwise Done and Dismiss share a
-                        // row and "Talk about this" takes the next.
+                        // row and the reminder and "Talk about this" the next.
                         ViewThatFits(in: .horizontal) {
                             HStack(spacing: 10) {
                                 doneButton
+                                reminderButton
                                 talkButton
                                 dismissButton
                             }
@@ -58,7 +60,10 @@ struct ActionDetailView: View {
                                     doneButton
                                     dismissButton
                                 }
-                                talkButton
+                                HStack(spacing: 10) {
+                                    reminderButton
+                                    talkButton
+                                }
                             }
                         }
                         .controlSize(.large)
@@ -107,6 +112,21 @@ struct ActionDetailView: View {
         .navigationTitle(isWarning ? "Suspicious email" : "To-do")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: action.id) { await loadMessage() }
+        .sheet(isPresented: $settingReminder) {
+            ReminderSheet(action: action)
+        }
+    }
+
+    private var reminderButton: some View {
+        Button {
+            settingReminder = true
+        } label: {
+            Label(action.dueAt == nil ? "Set reminder" : "Change reminder", systemImage: "bell")
+                .lineLimit(1)
+                .fixedSize()
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glass)
     }
 
     private var doneButton: some View {
@@ -210,6 +230,97 @@ struct ActionDetailView: View {
             }
         } catch {
             model.report(error)
+        }
+    }
+}
+
+/// Set a to-do's reminder, or move or remove the one it has.
+struct ReminderSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let action: ActionDto
+
+    @State private var when: Date
+
+    init(action: ActionDto) {
+        self.action = action
+        let day = action.dueAt ?? ReminderTime.day(ofLocal: Date().addingTimeInterval(86_400))
+        _when = State(initialValue: ReminderTime.alert(day: day, minutes: action.remindMinutes))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    DatePicker("Day", selection: $when, displayedComponents: .date)
+                        .datePickerStyle(.graphical)
+                    DatePicker("Alert", selection: $when, displayedComponents: .hourAndMinute)
+                } footer: {
+                    if ReminderDestination.saved == nil {
+                        Text("Choose a reminders list or calendar in Settings to get it there too.")
+                    }
+                }
+                Section {
+                    // Three hours from now, on the half hour, while it's still today.
+                    if let later = laterToday {
+                        quick("Later today", systemImage: "clock", at: later)
+                    }
+                    quick("Tomorrow", systemImage: "sunrise", at: shifted(days: 1))
+                    quick("Next week", systemImage: "calendar", at: shifted(days: 7))
+                }
+                if action.dueAt != nil {
+                    Section {
+                        Button("Remove reminder", systemImage: "bell.slash", role: .destructive) {
+                            Task {
+                                await model.clearReminder(action)
+                                dismiss()
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(action.dueAt == nil ? "Set reminder" : "Change reminder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save(when) }
+                }
+            }
+        }
+    }
+
+    private var laterToday: Date? {
+        let minutes = (ReminderTime.minutes(of: Date()) + 180 + 29) / 30 * 30
+        guard minutes < 24 * 60 else { return nil }
+        return ReminderTime.alert(day: ReminderTime.day(ofLocal: Date()), minutes: minutes)
+    }
+
+    /// `days` from today, at the time chosen.
+    private func shifted(days: Int) -> Date {
+        let day = Calendar.current.date(byAdding: .day, value: days, to: Date()) ?? Date()
+        return ReminderTime.alert(day: ReminderTime.day(ofLocal: day), minutes: ReminderTime.minutes(of: when))
+    }
+
+    private func quick(_ title: String, systemImage: String, at date: Date) -> some View {
+        Button {
+            save(date)
+        } label: {
+            HStack {
+                Label(title, systemImage: systemImage)
+                Spacer()
+                Text(date, format: .dateTime.weekday().day().month().hour().minute())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func save(_ date: Date) {
+        Task {
+            await model.setReminder(action, day: ReminderTime.day(ofLocal: date), minutes: ReminderTime.minutes(of: date))
+            dismiss()
         }
     }
 }

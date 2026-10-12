@@ -36,17 +36,20 @@ struct ConfidenceBadge: View {
 
 /// When it's due; red once past, orange within two days.
 struct DueBadge: View {
+    /// The day, as stored (midnight UTC of the date).
     let due: Int64
+    /// The reminder's time, shown when given.
+    var minutes: Int64?
+    var showsTime = false
 
     var body: some View {
-        let date = Date.fromUnix(due)
-        let remaining = date.timeIntervalSinceNow
+        let alert = ReminderTime.alert(day: due, minutes: minutes)
+        let remaining = alert.timeIntervalSinceNow
         let tint: Color = remaining < 0 ? .red : remaining < 2 * 86_400 ? .orange : .blue
-        Badge(
-            text: date.formatted(.dateTime.day().month(.abbreviated)),
-            systemImage: "calendar",
-            tint: tint
-        )
+        let text = showsTime
+            ? alert.formatted(.dateTime.day().month(.abbreviated).hour().minute())
+            : alert.formatted(.dateTime.day().month(.abbreviated))
+        Badge(text: text, systemImage: showsTime ? "bell" : "calendar", tint: tint)
     }
 }
 

@@ -39,8 +39,12 @@
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>mnemis puts the to-dos you set reminders on in the calendar you choose, and keeps them in step.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>mnemis can talk to a language model or mail server on your local network.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>mnemis puts the to-dos you set reminders on in the list you choose, and marks them done when you tick them off.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -96,6 +96,16 @@ struct SettingsView: View {
 
                 Section {
                     NavigationLink {
+                        ReminderSettingsView()
+                    } label: {
+                        Label("Reminders", systemImage: "bell")
+                    }
+                } footer: {
+                    Text("Where to-dos with reminders go on this device.")
+                }
+
+                Section {
+                    NavigationLink {
                         MemoryView()
                     } label: {
                         Label("Memory", systemImage: "brain")

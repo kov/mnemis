@@ -1,4 +1,5 @@
 import BackgroundTasks
+import EventKit
 import Foundation
 import Network
 import Observation
@@ -79,6 +80,9 @@ final class AppModel {
     private(set) var isSyncingMail = false
     private(set) var isFindingToDos = false
     private let network = NWPathMonitor()
+    /// The device's calendars and reminders lists (one store for the app).
+    let eventStore = EKEventStore()
+    private var eventStoreObserver: NSObjectProtocol?
     /// `start` ran (a background wake-up opens the engine without it).
     private var started = false
 
@@ -94,7 +98,69 @@ final class AppModel {
         self.engine = engine
         try await defaultToAppleIntelligence(engine)
         watchNetwork(engine)
+        configureReminders()
         return engine
+    }
+
+    /// Hand the engine the reminders list or calendar chosen in Settings,
+    /// when it's still there and mnemis may use it; none otherwise.
+    func configureReminders() {
+        guard let engine else { return }
+        if let destination = ReminderDestination.saved,
+           ReminderDestination.hasAccess(destination.kind),
+           eventStore.calendar(withIdentifier: destination.calendarId) != nil {
+            engine.setReminderStore(store: EventKitReminders(store: eventStore, destination: destination))
+        } else {
+            engine.setReminderStore(store: nil)
+        }
+        // Ticked off or moved in Reminders or Calendar: in step at once.
+        if eventStoreObserver == nil {
+            eventStoreObserver = NotificationCenter.default.addObserver(
+                forName: .EKEventStoreChanged, object: eventStore, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    await self?.syncReminders()
+                    await self?.refresh()
+                }
+            }
+        }
+    }
+
+    /// Bring the device's reminders and the to-dos in line, both ways.
+    func syncReminders() async {
+        guard let engine else { return }
+        do {
+            let errors = try await engine.syncReminders()
+            if !errors.isEmpty {
+                print("[reminders] \(errors.joined(separator: "; "))")
+            }
+        } catch {
+            print("[reminders] \(error)")
+        }
+    }
+
+    /// Remind about `action` on `day` (midnight UTC of the date) at
+    /// `minutes` after local midnight.
+    func setReminder(_ action: ActionDto, day: Int64, minutes: Int64) async {
+        guard let engine else { return }
+        do {
+            try await engine.promoteToReminder(actionId: action.id, dueAt: day, remindMinutes: minutes)
+        } catch {
+            report(error)
+        }
+        await syncReminders()
+        await refresh()
+    }
+
+    func clearReminder(_ action: ActionDto) async {
+        guard let engine else { return }
+        do {
+            try await engine.clearReminder(actionId: action.id)
+        } catch {
+            report(error)
+        }
+        await syncReminders()
+        await refresh()
     }
 
     func start() async {
@@ -383,6 +449,7 @@ final class AppModel {
             print("[sync] to-dos: \(error)")
             if userInitiated { report(error) }
         }
+        await syncReminders()
         await refresh()
     }
 
@@ -477,6 +544,8 @@ final class AppModel {
         } catch {
             report(error)
         }
+        // A done to-do's reminder is ticked off now, not at the next sync.
+        await syncReminders()
         await refresh()
     }
 
