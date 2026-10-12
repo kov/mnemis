@@ -50,7 +50,7 @@ pub async fn update_action_status(
     let event_kind = event_kind_for(current, new_status)?;
     let now = Utc::now().timestamp();
 
-    let mut tx = pool.begin().await.context("begin tx")?;
+    let mut tx = crate::db::begin_write(pool).await.context("begin tx")?;
 
     // Status + timestamps.
     match new_status {
@@ -134,7 +134,7 @@ pub async fn record_suspicious(
     details: &str,
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await.context("begin tx")?;
+    let mut tx = crate::db::begin_write(pool).await.context("begin tx")?;
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO actions (title, details, confidence, rationale, status, extracted_at) \
          VALUES (?, ?, 'low', 'suspicious sender', 'suspicious', ?) RETURNING id",
@@ -175,7 +175,7 @@ pub async fn record_suspicious(
 /// so the new due date pushes to the calendar.
 pub async fn promote_to_reminder(pool: &SqlitePool, action_id: i64, due_at: i64) -> Result<()> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await.context("begin tx")?;
+    let mut tx = crate::db::begin_write(pool).await.context("begin tx")?;
     let affected = sqlx::query(
         "UPDATE actions SET due_at = ?, \
          sync_status = CASE WHEN external_calendar_uid IS NOT NULL THEN 'dirty' ELSE sync_status END \

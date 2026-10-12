@@ -370,7 +370,7 @@ async fn write_embedding(
     let insert_sql = AssertSqlSafe(format!(
         "INSERT INTO {vec_table}(rowid, embedding) VALUES (?, vec_f32(?))"
     ));
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     sqlx::query(delete_sql)
         .bind(rowid)
         .execute(&mut *tx)

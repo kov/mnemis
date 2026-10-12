@@ -87,7 +87,7 @@ async fn fill_missing(
     .collect();
     for chunk in undated.chunks(500) {
         let received = server.received(chunk).await?;
-        let mut tx = pool.begin().await?;
+        let mut tx = crate::db::begin_write(pool).await?;
         for (uid, at) in received {
             sqlx::query(
                 "UPDATE messages SET received_at = ? \
@@ -116,7 +116,7 @@ async fn fill_missing(
     .collect();
     for chunk in unchecked.chunks(500) {
         let headers = server.auth_headers(chunk).await?;
-        let mut tx = pool.begin().await?;
+        let mut tx = crate::db::begin_write(pool).await?;
         for (uid, header) in headers {
             let auth = super::suspicion::Auth::from_headers(&header);
             sqlx::query(
@@ -505,7 +505,7 @@ async fn sync_folder_known(
     } else {
         server.flags(since).await?
     };
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     for (uid, flags) in flags {
         let changed = sqlx::query(
             "UPDATE messages SET flags = ? \

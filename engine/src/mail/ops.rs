@@ -17,7 +17,7 @@ const MAX_ATTEMPTS: i64 = 10;
 /// Mark messages read or unread: every copy of each email in the account
 /// (the same mail in Inbox and Archive, say).
 pub async fn mark_seen(pool: &SqlitePool, message_ids: &[i64], seen: bool) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let copies: Vec<(i64, i64, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT DISTINCT m2.id, m2.channel_id, m2.uid, m2.uidvalidity \
          FROM messages m \

@@ -29,6 +29,16 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
     open_with_cache(path, &path.with_file_name(format!("{stem}-cache.db"))).await
 }
 
+/// Start a transaction that writes, holding the write lock from the start.
+/// A deferred one that reads first fails at its first write, without
+/// waiting (SQLITE_BUSY_SNAPSHOT, 517), when another connection wrote in
+/// between; this one waits its turn instead (the busy timeout).
+pub async fn begin_write(
+    pool: &SqlitePool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 /// Open the database at `path` and attach the mail cache at `cache_path` as
 /// schema `cache`. The cache holds only what can be fetched again (full
 /// message bodies), so it belongs in the OS cache directory, where the

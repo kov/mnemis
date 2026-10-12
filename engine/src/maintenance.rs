@@ -56,7 +56,7 @@ pub async fn count_user_data(pool: &SqlitePool) -> Result<Vec<(&'static str, i64
 /// columns are rewound so the next sync re-bootstraps.
 pub async fn reset_data(pool: &SqlitePool) -> Result<ResetCounts> {
     let before = count_user_data(pool).await?;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     for t in CLEAR_TABLES {
         let sql = format!("DELETE FROM {t}");
         sqlx::query(sqlx::AssertSqlSafe(sql))

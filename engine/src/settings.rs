@@ -49,7 +49,7 @@ pub async fn get_user_profile(pool: &SqlitePool) -> Result<UserProfileDto> {
 /// so prompt rendering reflects the latest name.
 pub async fn save_user_profile(pool: &SqlitePool, profile: &UserProfileDto) -> Result<()> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     sqlx::query(
         "INSERT INTO user_profile (id, display_name, custom_prompt, updated_at) \
@@ -370,7 +370,7 @@ pub async fn delete_source(pool: &SqlitePool, source_id: i64) -> Result<()> {
             .bind(source_id)
             .fetch_optional(pool)
             .await?;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     // Order matters: child rows first.
     sqlx::query(
         "DELETE FROM extraction_runs WHERE channel_id IN (SELECT id FROM channels WHERE source_id = ?)",

@@ -244,7 +244,9 @@ async fn apply_remote(pool: &SqlitePool, row: &LocalRow, rt: &RemoteTask) -> Res
         rt.summary.clone()
     };
 
-    let mut tx = pool.begin().await.context("begin caldav reconcile tx")?;
+    let mut tx = crate::db::begin_write(pool)
+        .await
+        .context("begin caldav reconcile tx")?;
 
     sqlx::query(
         "UPDATE actions SET title = ?, details = ?, due_at = ?, external_etag = ?, \
@@ -273,7 +275,7 @@ async fn apply_remote(pool: &SqlitePool, row: &LocalRow, rt: &RemoteTask) -> Res
 
 async fn mark_pushed(pool: &SqlitePool, action_id: i64, new_etag: &str) -> Result<()> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     sqlx::query(
         "UPDATE actions SET external_etag = ?, sync_status = 'synced', sync_error = NULL \
          WHERE id = ?",
@@ -310,7 +312,7 @@ async fn mark_needs_review(pool: &SqlitePool, action_id: i64) -> Result<()> {
 /// action and its status.
 async fn unpromote(pool: &SqlitePool, action_id: i64) -> Result<()> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     sqlx::query(
         "UPDATE actions SET due_at = NULL, external_calendar_uid = NULL, external_href = NULL, \
          external_etag = NULL, sync_status = NULL, sync_error = NULL WHERE id = ?",
@@ -337,7 +339,7 @@ async fn link_created(
     etag: &str,
 ) -> Result<()> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     sqlx::query(
         "UPDATE actions SET external_calendar_uid = ?, external_href = ?, external_etag = ?, \
          sync_status = 'synced', sync_error = NULL WHERE id = ?",
@@ -364,7 +366,7 @@ async fn link_created(
 /// [`unpromote`], the action stays "done with a date", just no longer synced.
 async fn clear_link(pool: &SqlitePool, action_id: i64) -> Result<()> {
     let now = Utc::now().timestamp();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     sqlx::query(
         "UPDATE actions SET external_calendar_uid = NULL, external_href = NULL, \
          external_etag = NULL, sync_status = NULL, sync_error = NULL WHERE id = ?",

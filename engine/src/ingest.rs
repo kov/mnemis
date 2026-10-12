@@ -15,7 +15,9 @@ pub async fn ingest_batch(
     channel_id: i64,
     batch: &PollBatch,
 ) -> Result<usize> {
-    let mut tx = pool.begin().await.context("starting ingest transaction")?;
+    let mut tx = crate::db::begin_write(pool)
+        .await
+        .context("starting ingest transaction")?;
     let inserted = ingest_messages(&mut tx, source_id, channel_id, &batch.messages, false).await?;
 
     sqlx::query("UPDATE channels SET cursor = ?, last_synced_at = ? WHERE id = ?")
@@ -40,10 +42,7 @@ pub async fn ingest_for_reading(
     channel_id: i64,
     messages: &[ImportedMessage],
 ) -> Result<usize> {
-    // Writing from the start: folders sync side by side, and a transaction
-    // that reads first fails, rather than waits, when another one wrote.
-    let mut tx = pool
-        .begin_with("BEGIN IMMEDIATE")
+    let mut tx = crate::db::begin_write(pool)
         .await
         .context("starting ingest transaction")?;
     let inserted = ingest_messages(&mut tx, source_id, channel_id, messages, true).await?;

@@ -963,7 +963,7 @@ async fn record_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> 
         "agent_queued"
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     let (action_id,): (i64,) = sqlx::query_as(
         "INSERT INTO actions \
@@ -1105,7 +1105,7 @@ async fn update_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> 
         anyhow::bail!("invalid confidence: {c}");
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     // Make sure the action exists. Scope check: it must have at least one
     // evidence message from this source, OR no evidence yet (newly created
@@ -1275,7 +1275,7 @@ async fn resolve_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) ->
         anyhow::bail!("evidence_external_ids must contain at least one id");
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT status FROM actions WHERE id = ? AND status NOT IN ('done', 'dismissed', 'cancelled')",
