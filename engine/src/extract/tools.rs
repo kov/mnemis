@@ -1017,6 +1017,7 @@ async fn record_action(pool: &SqlitePool, scope: ToolScope, arguments: &str) -> 
         tx.rollback().await.ok();
         anyhow::bail!("none of the evidence_external_ids resolved to known messages");
     }
+    super::followup::start(&mut tx, action_id).await?;
 
     let event_data = json!({
         "title": args.title,

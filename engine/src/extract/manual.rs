@@ -83,8 +83,18 @@ pub async fn to_do_from_message(
     bail!("the model didn't write a valid to-do")
 }
 
-/// The email as the model sees it: headers, then the text.
+/// The email as the model sees it, after today's date.
 async fn describe(pool: &SqlitePool, message_id: i64) -> Result<String> {
+    Ok(format!(
+        "Today is {}.\n\n{}",
+        Local::now().format("%A %Y-%m-%d"),
+        email(pool, message_id, BODY_CHARS).await?
+    ))
+}
+
+/// An email as the model sees it: headers, then the text, cut at
+/// `max_chars`.
+pub(super) async fn email(pool: &SqlitePool, message_id: i64, max_chars: usize) -> Result<String> {
     #[allow(clippy::type_complexity)]
     let row: Option<(
         i64,
@@ -121,7 +131,7 @@ async fn describe(pool: &SqlitePool, message_id: i64) -> Result<String> {
             .map(|m| m.body)
             .unwrap_or_default()
     };
-    let body: String = match body.char_indices().nth(BODY_CHARS) {
+    let body: String = match body.char_indices().nth(max_chars) {
         Some((cut, _)) => format!("{}…", &body[..cut]),
         None => body,
     };
@@ -135,8 +145,7 @@ async fn describe(pool: &SqlitePool, message_id: i64) -> Result<String> {
         .map(|d| d.with_timezone(&Local).to_rfc3339())
         .unwrap_or_default();
     Ok(format!(
-        "Today is {today}.\n\nEmail id: {external_id}\nFrom: {from}\nDate: {date}\nSubject: {subject}\n\n{body}",
-        today = Local::now().format("%A %Y-%m-%d"),
+        "Email id: {external_id}\nFrom: {from}\nDate: {date}\nSubject: {subject}\n\n{body}",
         subject = subject.unwrap_or_default(),
     ))
 }

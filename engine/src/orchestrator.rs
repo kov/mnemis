@@ -432,6 +432,57 @@ async fn sync_one_source_with(
     Ok(counts)
 }
 
+/// Follow up the account's threads of open to-dos with new mail (see
+/// [`crate::extract::followup`]). Failures are counted; the thread is tried
+/// again on the next sync.
+async fn follow_up_threads(
+    pool: &SqlitePool,
+    source_id: i64,
+    source_name: &str,
+    llm: &dyn LlmTransport,
+    window_char_budget: usize,
+    counts: &mut SourceCounts,
+) {
+    use crate::extract::followup;
+    let threads = match followup::pending(pool, source_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            counts
+                .errors
+                .push(format!("source '{source_name}': follow-ups: {e:#}"));
+            return;
+        }
+    };
+    for thread in threads {
+        let started = Instant::now();
+        // Mail synced for reading only has no body yet.
+        let result = match complete_messages(pool, &thread.message_ids).await {
+            Ok(()) => followup::run(pool, llm, &thread, window_char_budget).await,
+            Err(e) => Err(e.context("downloading the thread's new mail")),
+        };
+        match result {
+            Ok(recorded) => {
+                counts.actions_created += recorded as i64;
+                info!(
+                    thread_id = thread.thread_id,
+                    to_dos = thread.action_ids.len(),
+                    messages = thread.message_ids.len(),
+                    recorded,
+                    secs = started.elapsed().as_secs(),
+                    "to-do thread followed up"
+                );
+            }
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), thread_id = thread.thread_id, "to-do follow-up failed");
+                counts.errors.push(format!(
+                    "source '{source_name}': following up thread {}: {e:#}",
+                    thread.thread_id
+                ));
+            }
+        }
+    }
+}
+
 /// Embed then extract one source's folders with mail not yet extracted.
 #[allow(clippy::too_many_arguments)]
 async fn extract_source(
@@ -446,6 +497,17 @@ async fn extract_source(
     traces_dir: Option<&std::path::Path>,
 ) -> Result<SourceCounts> {
     let mut counts = SourceCounts::default();
+    // First the threads of open to-dos: their new mail may be in any folder,
+    // and channel extraction leaves it to them.
+    follow_up_threads(
+        pool,
+        source_id,
+        source_name,
+        llm,
+        window_char_budget,
+        &mut counts,
+    )
+    .await;
     let to_extract = channels_pending_extraction(pool, source_id).await?;
     if to_extract.is_empty() {
         return Ok(counts);

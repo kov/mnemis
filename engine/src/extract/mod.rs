@@ -10,6 +10,7 @@ use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 use crate::source::Recipient;
 
 pub mod eval;
+pub mod followup;
 pub mod manual;
 pub mod prompt;
 mod staged;
@@ -139,13 +140,22 @@ pub async fn extract_for_channel(
 ) -> Result<ExtractionOutcome> {
     let channel = load_channel(pool, channel_id).await?;
     let watermark = load_watermark(pool, channel_id).await?;
-    let window = load_window(pool, channel_id, watermark).await?;
+    let loaded = load_window(pool, channel_id, watermark).await?;
+    // Mail on the thread of a to-do is that to-do's follow-up's (see
+    // `followup`); the watermark still passes it.
+    let loaded_up_to = loaded.last().map(|row| row.id);
+    let ids: Vec<i64> = loaded.iter().map(|row| row.id).collect();
+    let owned = followup::owned(pool, &ids).await?;
+    let window: Vec<WindowRow> = loaded
+        .into_iter()
+        .filter(|row| !owned.contains(&row.id))
+        .collect();
 
     if window.is_empty() {
         record_run(
             pool,
             channel_id,
-            None,
+            loaded_up_to,
             model_name,
             "no_activity",
             0,
@@ -156,7 +166,7 @@ pub async fn extract_for_channel(
         return Ok(ExtractionOutcome {
             result: "no_activity",
             actions_created: 0,
-            up_to_message_id: watermark,
+            up_to_message_id: loaded_up_to.or(watermark),
             summary: None,
         });
     }
@@ -254,6 +264,12 @@ pub async fn extract_for_channel(
                 queue.push_front(left);
             }
         }
+    }
+
+    // Mail left to follow-ups after the last batch.
+    if loaded_up_to > last_up_to {
+        record_run(pool, channel_id, loaded_up_to, model_name, "ok", 0, 0, None).await?;
+        last_up_to = loaded_up_to;
     }
 
     Ok(ExtractionOutcome {
@@ -718,13 +734,16 @@ async fn load_existing_actions(pool: &SqlitePool, channel_id: i64) -> Result<Vec
         .collect())
 }
 
-struct UserProfile {
+pub(super) struct UserProfile {
     display_name: Option<String>,
     custom_prompt: Option<String>,
-    identifiers: Vec<String>,
+    pub(super) identifiers: Vec<String>,
 }
 
-async fn load_user_profile_for(pool: &SqlitePool, source_kind: &str) -> Result<UserProfile> {
+pub(super) async fn load_user_profile_for(
+    pool: &SqlitePool,
+    source_kind: &str,
+) -> Result<UserProfile> {
     let row: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT display_name, custom_prompt FROM user_profile WHERE id = 1")
             .fetch_optional(pool)
