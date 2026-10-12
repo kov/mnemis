@@ -89,13 +89,9 @@ private struct SplitLayout: View {
                 VStack(alignment: .leading, spacing: 12) {
                     LearningNote()
                     // Floats at the sidebar's foot, as in the Claude app.
-                    Button { model.selectedTab = .settings } label: {
-                        ProfileBadge()
-                            .frame(width: 48, height: 48)
-                            .glassEffect(.regular.interactive(), in: .circle)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Settings")
+                    Button { model.selectedTab = .settings } label: { ProfileBadge() }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Settings")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
@@ -132,7 +128,7 @@ private struct CompactLayout: View {
                 NavigationStack(path: $model.mailPath) {
                     MailboxListView()
                         .navigationTitle("Mail")
-                        .toolbar { SettingsItem() }
+                        .profilePill()
                 }
             }
             .badge(model.inboxUnread)
@@ -153,8 +149,8 @@ private struct ActionsStack: View {
             ActionListView(selection: $model.actionSelection)
                 .navigationTitle("To-dos")
                 .navigationBarTitleDisplayMode(.inline)
+                .profilePill(showsSettings)
                 .toolbar {
-                    if showsSettings { SettingsItem() }
                     ToolbarItem(placement: .topBarTrailing) {
                         NavigationLink {
                             ResolvedActionsView()
@@ -182,8 +178,8 @@ private struct ChatsStack: View {
             ChatListView(selection: $model.chatSelection)
                 .navigationTitle("Chats")
                 .navigationBarTitleDisplayMode(.inline)
+                .profilePill(showsSettings)
                 .toolbar {
-                    if showsSettings { SettingsItem() }
                     NewChatItem()
                 }
                 .navigationDestination(item: $model.chatSelection) { id in
@@ -195,31 +191,44 @@ private struct ChatsStack: View {
     }
 }
 
-/// iPhone: the profile button, pushing Settings onto the tab's stack.
-private struct SettingsItem: ToolbarContent {
-    var body: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            NavigationLink {
-                SettingsView()
-            } label: {
-                ProfileBadge()
+extension View {
+    /// iPhone: the profile pill floating at the bottom left, above the tab
+    /// bar, pushing Settings onto the tab's stack. Only on a tab's list, so
+    /// it never sits over a conversation's composer.
+    func profilePill(_ shown: Bool = true) -> some View {
+        overlay(alignment: .bottomLeading) {
+            if shown {
+                NavigationLink {
+                    SettingsView()
+                } label: {
+                    ProfileBadge()
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Settings")
+                .padding(.leading, 16)
+                .padding(.bottom, 8)
             }
-            .accessibilityLabel("Settings")
         }
     }
 }
 
-/// The user's initials, or a gear until they give their name.
+/// A floating glass circle with the user's initials, or a gear until they
+/// give their name.
 private struct ProfileBadge: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        if model.initials.isEmpty {
-            Image(systemName: "gearshape")
-        } else {
-            Text(model.initials)
-                .font(.subheadline.weight(.semibold))
+        Group {
+            if model.initials.isEmpty {
+                Image(systemName: "gearshape")
+            } else {
+                Text(model.initials)
+                    .font(.headline)
+            }
         }
+        .frame(width: 48, height: 48)
+        .contentShape(.circle)
+        .glassEffect(.regular.interactive(), in: .circle)
     }
 }
 
