@@ -24,9 +24,6 @@ struct ContentView: View {
         .sheet(item: $model.composing, onDismiss: { model.draftChanged() }) { draft in
             ComposeView(draft: draft)
         }
-        .sheet(isPresented: $model.showingSettings, onDismiss: { Task { await model.refresh() } }) {
-            SettingsView()
-        }
         .alert(
             "Something went wrong",
             isPresented: Binding(
@@ -88,12 +85,26 @@ private struct SplitLayout: View {
                 }
             }
             .navigationTitle("mnemis")
-            .toolbar { SettingsItem() }
-            .safeAreaInset(edge: .bottom) { LearningNote().padding() }
+            .safeAreaInset(edge: .bottom) {
+                VStack(alignment: .leading, spacing: 12) {
+                    LearningNote()
+                    // Floats at the sidebar's foot, as in the Claude app.
+                    Button { model.selectedTab = .settings } label: {
+                        ProfileBadge()
+                            .frame(width: 48, height: 48)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Settings")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+            }
         } detail: {
             switch model.selectedTab {
             case .actions: ActionsStack(showsSettings: false)
             case .chat: ChatsStack(showsSettings: false)
+            case .settings: NavigationStack { SettingsView() }
             case .mail:
                 // A new folder starts a new stack, rather than pushing.
                 NavigationStack { ThreadListView(scope: model.mailScope) }
@@ -184,12 +195,30 @@ private struct ChatsStack: View {
     }
 }
 
+/// iPhone: the profile button, pushing Settings onto the tab's stack.
 private struct SettingsItem: ToolbarContent {
-    @Environment(AppModel.self) private var model
-
     var body: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
-            Button("Settings", systemImage: "gearshape") { model.showingSettings = true }
+            NavigationLink {
+                SettingsView()
+            } label: {
+                ProfileBadge()
+            }
+            .accessibilityLabel("Settings")
+        }
+    }
+}
+
+/// The user's initials, or a gear until they give their name.
+private struct ProfileBadge: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if model.initials.isEmpty {
+            Image(systemName: "gearshape")
+        } else {
+            Text(model.initials)
+                .font(.subheadline.weight(.semibold))
         }
     }
 }

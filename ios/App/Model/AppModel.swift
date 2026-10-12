@@ -30,6 +30,8 @@ enum AppTab: Hashable {
     case actions
     case chat
     case mail
+    /// iPad only; on iPhone Settings is pushed onto the current tab.
+    case settings
 }
 
 /// The app's view of the engine: what the screens show, and the calls that
@@ -46,6 +48,9 @@ final class AppModel {
     private(set) var isSyncing = false
     private(set) var lastSync: SyncOutcome?
     private(set) var chats: [ChatDto] = []
+    /// The user's initials (from their name in Settings), for the profile
+    /// button; empty until they give a name.
+    private(set) var initials = ""
     var errorMessage: String?
 
     var selectedTab: AppTab = .actions
@@ -54,7 +59,6 @@ final class AppModel {
     /// Shared by both sections' split views, driven by the header's toggle.
     var columnVisibility: NavigationSplitViewVisibility = .all
     var chatSelection: ChatDto.ID?
-    var showingSettings = false
     /// The action just dismissed, while the "why?" sheet is up.
     var pendingDismissal: ActionDto?
     /// A dismissal reason is being merged into memory.
@@ -343,6 +347,10 @@ final class AppModel {
             let llm = try await engine.llmConfig()
             needsSetup = sources.isEmpty || llm.chatModel.isEmpty
             mailboxes = try await engine.mailboxes()
+            let words = try await engine.userProfile().displayName.split(whereSeparator: \.isWhitespace)
+            initials = [words.first, words.count > 1 ? words.last : nil]
+                .compactMap { $0?.first.map { String($0).uppercased() } }
+                .joined()
         } catch {
             report(error)
         }

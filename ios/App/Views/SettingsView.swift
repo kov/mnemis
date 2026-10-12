@@ -2,10 +2,9 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-
     @State private var loaded = false
     @State private var saving = false
+    @State private var saved = false
 
     // Profile
     @State private var displayName = ""
@@ -22,7 +21,7 @@ struct SettingsView: View {
     @State private var apiKeySet = false
 
     var body: some View {
-        NavigationStack {
+        Group {
             Form {
                 Section {
                     TextField("Name", text: $displayName)
@@ -127,12 +126,13 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
                 ToolbarItem(placement: .confirmationAction) {
                     if saving {
                         ProgressView()
+                    } else if saved {
+                        Label("Saved", systemImage: "checkmark")
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(.secondary)
                     } else {
                         Button("Save") { Task { await save() } }
                             .disabled(!loaded)
@@ -215,7 +215,12 @@ struct SettingsView: View {
                 anthropicApiKeySet: apiKeySet,
                 configPath: ""
             ))
-            dismiss()
+            await model.refresh()
+            saved = true
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                saved = false
+            }
         } catch {
             model.report(error)
         }
