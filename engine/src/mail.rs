@@ -882,12 +882,54 @@ fn parse_list(field: &str, list: &str) -> Result<Vec<Mailbox>> {
     if list.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: Mailboxes = list
-        .trim()
-        .trim_end_matches(',')
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{field}: {e}"))?;
-    Ok(parsed.into_iter().collect())
+    let list = list.trim().trim_end_matches(',');
+    match list.parse::<Mailboxes>() {
+        Ok(parsed) => Ok(parsed.into_iter().collect()),
+        // lettre holds the part before the @ to the standard's 64 characters,
+        // but Mailman's confirmation addresses run past it and servers take
+        // them: try each address again with only that check off.
+        Err(e) => list
+            .split(',')
+            .filter(|item| !item.trim().is_empty())
+            .map(|item| long_mailbox(item).ok_or_else(|| anyhow::anyhow!("{field}: {e}")))
+            .collect(),
+    }
+}
+
+/// `item` ("Name <user@domain>" or "user@domain") as a mailbox, even when
+/// its user part is over 64 characters.
+fn long_mailbox(item: &str) -> Option<Mailbox> {
+    let item = item.trim();
+    if let Ok(mailbox) = item.parse() {
+        return Some(mailbox);
+    }
+    let (name, address) = match item.rfind('<') {
+        Some(open) if item.ends_with('>') => {
+            let name = item[..open].trim().trim_matches('"').trim();
+            (
+                (!name.is_empty()).then(|| name.to_string()),
+                &item[open + 1..item.len() - 1],
+            )
+        }
+        _ => (None, item),
+    };
+    let (user, domain) = address.trim().rsplit_once('@')?;
+    // Everything but the length must hold: a dot-atom (RFC 5322 atext and
+    // single inner dots), at a valid domain.
+    let atext = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c);
+    if user.is_empty()
+        || user.starts_with('.')
+        || user.ends_with('.')
+        || user.contains("..")
+        || !user.chars().all(|c| c == '.' || atext(c))
+    {
+        return None;
+    }
+    lettre::Address::new("x", domain).ok()?;
+    Some(Mailbox::new(
+        name,
+        lettre::Address::new_dangerous(user, domain),
+    ))
 }
 
 /// The finished message for a draft. `original` is the forwarded mail,
@@ -1032,6 +1074,28 @@ async fn send_inner(pool: &SqlitePool, postbox: &dyn Postbox, id: i64) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sends_to_addresses_with_a_long_user_part() {
+        // Mailman's confirmation address: 71 characters before the @.
+        let long = "pkg-webkit-maintainers-confirm+c3c136da8ec83bc441f13d78a25808618f0ddf7b";
+        let to = super::parse_list(
+            "To",
+            &format!("{long}@alioth-lists.debian.net, ana@example.com"),
+        )
+        .unwrap();
+        assert_eq!(to.len(), 2);
+        assert_eq!(
+            to[0].email.to_string(),
+            format!("{long}@alioth-lists.debian.net")
+        );
+        let named = super::parse_list("To", &format!("\"Mailman\" <{long}@x.org>")).unwrap();
+        assert_eq!(named[0].name.as_deref(), Some("Mailman"));
+        // Still not anything goes.
+        assert!(super::parse_list("To", &format!("{long} with spaces@x.org")).is_err());
+        assert!(super::parse_list("To", &format!("{long}@")).is_err());
+        assert!(super::parse_list("To", "not an address").is_err());
+    }
+
     #[test]
     fn a_date_far_from_arrival_reads_as_forged() {
         let arrived = 1_790_000_000;
