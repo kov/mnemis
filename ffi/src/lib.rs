@@ -788,20 +788,23 @@ impl Engine {
             let system_prompt = chat::prompt::build_system_prompt(&pool, chat_id).await?;
             let traces = config::traces_dir_for(&engine.data_dir.join("mnemis.db"));
             let sink = move |e: ChatEvent| listener.on_event(e);
-            chat::run_chat_turn(
-                &pool,
-                &stack.llm,
-                &system_prompt,
-                chat_id,
-                &text,
-                stack.window_char_budget,
-                stack.max_context_tokens,
-                stack.idle_timeout,
-                Some(cancel),
-                &sink,
-                Some(&traces),
-            )
-            .await?;
+            // Boxed: left concrete, the turn's nested futures overflow the
+            // compiler's `Send` check.
+            let turn: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> =
+                Box::pin(chat::run_chat_turn(
+                    &pool,
+                    &stack.llm,
+                    &system_prompt,
+                    chat_id,
+                    &text,
+                    stack.window_char_budget,
+                    stack.max_context_tokens,
+                    stack.idle_timeout,
+                    Some(cancel),
+                    &sink,
+                    Some(&traces),
+                ));
+            turn.await?;
             // A blank chat gets a real title from its first message. Detached:
             // the turn is over, and the list picks the title up on its next load.
             let llm = stack.llm.clone();
