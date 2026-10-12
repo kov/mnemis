@@ -521,10 +521,10 @@ fn MessageCard(
                 <div class="msg-tools">
                     <button class="btn btn-ghost btn-sm btn-icon" data-action="reply" title="Reply"
                         on:click=move |_| compose(DraftKind::Reply, Some(id))>{icon(REPLY)}</button>
-                    <button class="btn btn-ghost btn-sm btn-icon" data-action="forward" title="Forward"
-                        on:click=move |_| compose(DraftKind::Forward, Some(id))>{icon(FORWARD)}</button>
                     <TalkAboutButton kind="message" id=id compact=true />
                     <ToDoButton message_id=id />
+                    <button class="btn btn-ghost btn-sm btn-icon" data-action="forward" title="Forward"
+                        on:click=move |_| compose(DraftKind::Forward, Some(id))>{icon(FORWARD)}</button>
                     <span class="spacer"></span>
                     <span class="more-wrap">
                         <button class="btn btn-ghost btn-sm more-button" data-action="more" title="More"

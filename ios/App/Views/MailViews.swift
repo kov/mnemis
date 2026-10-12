@@ -432,16 +432,12 @@ private struct MessageCard: View {
         return parts.joined(separator: " · ")
     }
 
-    /// Reply, Forward, a chat about it and To-do; Reply all and Mark
+    /// Reply, a chat about it, To-do and Forward; Reply all and Mark
     /// unread in a menu at the far end.
     private var tools: some View {
         HStack(spacing: 8) {
             Button("Reply", systemImage: "arrowshape.turn.up.left") {
                 Task { await model.compose(.reply, messageId: message.messageId) }
-            }
-            .labelStyle(.iconOnly)
-            Button("Forward", systemImage: "arrowshape.turn.up.right") {
-                Task { await model.compose(.forward, messageId: message.messageId) }
             }
             .labelStyle(.iconOnly)
             Button("Talk about this", systemImage: "bubble.left.and.text.bubble.right") {
@@ -459,6 +455,10 @@ private struct MessageCard: View {
             }
             .accessibilityLabel("Make this email a to-do")
             .disabled(makingToDo)
+            Button("Forward", systemImage: "arrowshape.turn.up.right") {
+                Task { await model.compose(.forward, messageId: message.messageId) }
+            }
+            .labelStyle(.iconOnly)
             Spacer(minLength: 0)
             Menu {
                 Button("Reply all", systemImage: "arrowshape.turn.up.left.2") {

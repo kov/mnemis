@@ -389,8 +389,8 @@ async fn loads_actions_into_visible_list() -> Result<()> {
         "Mark unread waits in the More menu: {shown}"
     );
     assert_eq!(
-        shown["mainRow"], "reply,forward,talk,to-do",
-        "Reply, Forward, chat and To-do up front, the rest under More: {shown}"
+        shown["mainRow"], "reply,talk,to-do,forward",
+        "Reply, chat, To-do and Forward up front, the rest under More: {shown}"
     );
     let in_menu = client
         .execute(
