@@ -98,8 +98,8 @@ private struct SplitLayout: View {
             }
         } detail: {
             switch model.selectedTab {
-            case .actions: ActionsStack(showsSettings: false)
-            case .chat: ChatsStack(showsSettings: false)
+            case .actions: ActionsStack()
+            case .chat: ChatsStack()
             case .settings: NavigationStack { SettingsView() }
             case .mail:
                 // A new folder starts a new stack, rather than pushing.
@@ -118,20 +118,28 @@ private struct CompactLayout: View {
         @Bindable var model = model
         TabView(selection: $model.selectedTab) {
             Tab("To-dos", systemImage: "checklist", value: AppTab.actions) {
-                ActionsStack(showsSettings: true)
+                ActionsStack()
             }
             .badge(model.todos.count)
             Tab("Chats", systemImage: "bubble.left.and.text.bubble.right", value: AppTab.chat) {
-                ChatsStack(showsSettings: true)
+                ChatsStack()
             }
             Tab("Mail", systemImage: "envelope", value: AppTab.mail) {
                 NavigationStack(path: $model.mailPath) {
                     MailboxListView()
                         .navigationTitle("Mail")
-                        .profilePill()
                 }
             }
             .badge(model.inboxUnread)
+            Tab(value: AppTab.settings) {
+                NavigationStack { SettingsView() }
+            } label: {
+                Label {
+                    Text("Settings")
+                } icon: {
+                    ProfileIcon()
+                }
+            }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
     }
@@ -140,8 +148,6 @@ private struct CompactLayout: View {
 /// The action list; picking one pushes its detail.
 private struct ActionsStack: View {
     @Environment(AppModel.self) private var model
-    /// On iPad Settings lives on the sidebar instead.
-    let showsSettings: Bool
 
     var body: some View {
         @Bindable var model = model
@@ -149,7 +155,6 @@ private struct ActionsStack: View {
             ActionListView(selection: $model.actionSelection)
                 .navigationTitle("To-dos")
                 .navigationBarTitleDisplayMode(.inline)
-                .profilePill(showsSettings)
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         NavigationLink {
@@ -170,7 +175,6 @@ private struct ActionsStack: View {
 /// The chat list; picking one pushes the conversation.
 private struct ChatsStack: View {
     @Environment(AppModel.self) private var model
-    let showsSettings: Bool
 
     var body: some View {
         @Bindable var model = model
@@ -178,7 +182,6 @@ private struct ChatsStack: View {
             ChatListView(selection: $model.chatSelection)
                 .navigationTitle("Chats")
                 .navigationBarTitleDisplayMode(.inline)
-                .profilePill(showsSettings)
                 .toolbar {
                     NewChatItem()
                 }
@@ -191,29 +194,40 @@ private struct ChatsStack: View {
     }
 }
 
-extension View {
-    /// iPhone: the profile pill floating at the bottom left, above the tab
-    /// bar, pushing Settings onto the tab's stack. Only on a tab's list, so
-    /// it never sits over a conversation's composer.
-    func profilePill(_ shown: Bool = true) -> some View {
-        overlay(alignment: .bottomLeading) {
-            if shown {
-                NavigationLink {
-                    SettingsView()
-                } label: {
-                    ProfileBadge()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Settings")
-                .padding(.leading, 16)
-                .padding(.bottom, 8)
-            }
+/// The tab bar's profile icon: the user's initials in a ring, or a gear
+/// until they give their name. Drawn as an image, as the tab bar shows only
+/// images there.
+private struct ProfileIcon: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if model.initials.isEmpty {
+            Image(systemName: "gearshape")
+        } else {
+            Image(uiImage: Self.ring(model.initials))
         }
+    }
+
+    private static func ring(_ initials: String) -> UIImage {
+        let size = CGSize(width: 28, height: 28)
+        let image = UIGraphicsImageRenderer(size: size).image { _ in
+            let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
+            let ring = UIBezierPath(ovalIn: bounds)
+            ring.lineWidth = 1.5
+            UIColor.black.setStroke()
+            ring.stroke()
+            let font = UIFont.systemFont(ofSize: initials.count > 1 ? 11 : 13, weight: .bold)
+            let text = NSAttributedString(string: initials, attributes: [.font: font, .foregroundColor: UIColor.black])
+            let textSize = text.size()
+            text.draw(at: CGPoint(x: (size.width - textSize.width) / 2, y: (size.height - textSize.height) / 2))
+        }
+        // Tinted like the other tabs' icons, selected or not.
+        return image.withRenderingMode(.alwaysTemplate)
     }
 }
 
-/// A floating glass circle with the user's initials, or a gear until they
-/// give their name.
+/// iPad: a floating glass circle with the user's initials, or a gear until
+/// they give their name.
 private struct ProfileBadge: View {
     @Environment(AppModel.self) private var model
 

@@ -30,7 +30,6 @@ enum AppTab: Hashable {
     case actions
     case chat
     case mail
-    /// iPad only; on iPhone Settings is pushed onto the current tab.
     case settings
 }
 
