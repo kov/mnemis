@@ -551,8 +551,16 @@ async fn promote_to_reminder(
     state: State<'_, AppState>,
     action_id: i64,
     due_at: i64,
+    remind_minutes: Option<i64>,
 ) -> Result<(), String> {
-    mutations::promote_to_reminder(&state.pool, action_id, due_at)
+    mutations::promote_to_reminder(&state.pool, action_id, due_at, remind_minutes)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn clear_reminder(state: State<'_, AppState>, action_id: i64) -> Result<(), String> {
+    mutations::clear_reminder(&state.pool, action_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1031,6 +1039,7 @@ fn main() {
             set_caldav_collection,
             sync_caldav,
             promote_to_reminder,
+            clear_reminder,
             list_source_channels,
             discover_source_channels,
             set_channel_muted,

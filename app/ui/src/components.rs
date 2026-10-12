@@ -19,15 +19,16 @@ use wasm_bindgen::JsCast;
 use crate::markdown::{is_safe_href, markdown_to_html};
 use crate::{
     ChatStream, ChatUiState, FirstRunTick, SyncTick, add_caldav_account, add_google_source,
-    add_imap_source, cancel_chat_message, confidence_class, confirm_resolution, create_chat,
-    delete_caldav_account, delete_chat, delete_source, discover_source_channels, fetch_actions,
-    fetch_caldav_account, fetch_chat_seed, fetch_chat_turns, fetch_chats, fetch_is_first_run,
-    fetch_llm_config, fetch_message, fetch_pending_resolutions, fetch_seeded_chat,
-    fetch_settings_sources, fetch_status, fetch_user_profile, list_caldav_collections,
-    open_external, promote_to_reminder, reject_resolution, run_sync_caldav, run_sync_now,
-    save_llm_config, save_user_profile, send_chat_message, set_caldav_collection,
-    set_channel_muted, set_channels_muted_bulk, set_chat_archived, set_chat_show_reasoning,
-    set_source_muted, status_label, submit_dismissal_feedback, update_action,
+    add_imap_source, cancel_chat_message, clear_reminder, confidence_class, confirm_resolution,
+    create_chat, delete_caldav_account, delete_chat, delete_source, discover_source_channels,
+    fetch_actions, fetch_caldav_account, fetch_chat_seed, fetch_chat_turns, fetch_chats,
+    fetch_is_first_run, fetch_llm_config, fetch_message, fetch_pending_resolutions,
+    fetch_seeded_chat, fetch_settings_sources, fetch_status, fetch_user_profile,
+    list_caldav_collections, open_external, promote_to_reminder, reject_resolution,
+    run_sync_caldav, run_sync_now, save_llm_config, save_user_profile, send_chat_message,
+    set_caldav_collection, set_channel_muted, set_channels_muted_bulk, set_chat_archived,
+    set_chat_show_reasoning, set_source_muted, status_label, submit_dismissal_feedback,
+    update_action,
 };
 
 #[component]
@@ -369,6 +370,26 @@ fn today_ymd() -> (i32, u32, u32) {
     )
 }
 
+/// Midnight UTC of the local date `days` from today: how a reminder's day is
+/// stored.
+fn local_day(days: i32) -> i64 {
+    let d = js_sys::Date::new_0();
+    d.set_date((d.get_date() as i32 + days) as u32);
+    (js_sys::Date::utc(d.get_full_year() as f64, d.get_month() as f64) / 1000.0) as i64
+        + (d.get_date() as i64 - 1) * 86_400
+}
+
+/// Minutes since local midnight now.
+fn local_minutes_now() -> i64 {
+    let d = js_sys::Date::new_0();
+    i64::from(d.get_hours()) * 60 + i64::from(d.get_minutes())
+}
+
+/// "09:30" for minutes after midnight.
+fn hh_mm(minutes: i64) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
 /// A short human date like "Jun 1" for the reminder badge.
 fn unix_to_short_date(secs: i64) -> String {
     let (_, month, day) = ymd_of_unix(secs);
@@ -441,10 +462,28 @@ fn weekday(year: i32, month: u32, day: u32) -> u32 {
 fn ReminderDatePicker(
     action_id: i64,
     due_at: Option<i64>,
+    remind_minutes: Option<i64>,
     label: &'static str,
     refetch: Arc<dyn Fn() + Send + Sync>,
 ) -> impl IntoView {
     let open = RwSignal::new(false);
+    // The alert time a day click sets: the reminder's, else 09:00.
+    let minutes = RwSignal::new(remind_minutes.unwrap_or(9 * 60));
+    // Set the reminder (or remove it, with `None`), then close and reload.
+    let apply = {
+        let refetch = refetch.clone();
+        Arc::new(move |change: Option<(i64, i64)>| {
+            let refetch = refetch.clone();
+            spawn_local(async move {
+                let _ = match change {
+                    Some((due, at)) => promote_to_reminder(action_id, due, Some(at)).await,
+                    None => clear_reminder(action_id).await,
+                };
+                open.set(false);
+                refetch();
+            });
+        })
+    };
     // The visible month starts on the current due date (so editing lands you on
     // the set date) or today for a fresh reminder.
     let (start_y, start_m, _) = due_at.map(ymd_of_unix).unwrap_or_else(today_ymd);
@@ -478,7 +517,7 @@ fn ReminderDatePicker(
         }
         // Rebuilt whenever the visible month changes; each day commits on click.
         let grid = {
-            let refetch = refetch.clone();
+            let apply = apply.clone();
             move || {
                 let (y, m) = (view_year.get(), view_month.get());
                 let lead = weekday(y, m, 1) as usize;
@@ -488,19 +527,13 @@ fn ReminderDatePicker(
                     .collect();
                 for day in 1..=count {
                     let is_selected = selected == Some((y, m, day));
-                    let refetch = refetch.clone();
+                    let apply = apply.clone();
                     let pick = move |_| {
                         let ms = js_sys::Date::parse(&format!("{y:04}-{m:02}-{day:02}T00:00:00Z"));
                         if ms.is_nan() {
                             return;
                         }
-                        let due = (ms / 1000.0) as i64;
-                        let refetch = refetch.clone();
-                        spawn_local(async move {
-                            let _ = promote_to_reminder(action_id, due).await;
-                            open.set(false);
-                            refetch();
-                        });
+                        apply(Some(((ms / 1000.0) as i64, minutes.get_untracked())));
                     };
                     cells.push(
                         view! {
@@ -538,6 +571,60 @@ fn ReminderDatePicker(
                         .map(|d| view! { <span class="cal-cell cal-dow">{d}</span> })
                         .collect_view()}
                     {grid}
+                </div>
+                <label class="cal-time">
+                    "Alert at "
+                    <select data-field="reminder-time" on:change={
+                        let apply = apply.clone();
+                        move |ev| {
+                            let Ok(at) = event_target_value(&ev).parse::<i64>() else { return };
+                            minutes.set(at);
+                            // An existing reminder moves to the new time at once.
+                            if let Some(due) = due_at {
+                                apply(Some((due, at)));
+                            }
+                        }
+                    }>
+                        {(0..48).map(|slot| {
+                            let at = slot * 30;
+                            view! {
+                                <option value=at.to_string() selected=move || minutes.get() == at>
+                                    {hh_mm(at)}
+                                </option>
+                            }
+                        }).collect_view()}
+                    </select>
+                </label>
+                <div class="cal-quick">
+                    {
+                        // Three hours from now, on the half hour, while it's
+                        // still today.
+                        let later = (local_minutes_now() + 180 + 29) / 30 * 30;
+                        let apply = apply.clone();
+                        (later < 24 * 60).then(|| view! {
+                            <button class="btn btn-sm btn-ghost" data-action="remind-later"
+                                on:click=move |_| apply(Some((local_day(0), later)))>
+                                "Later today"
+                            </button>
+                        })
+                    }
+                    <button class="btn btn-sm btn-ghost" data-action="remind-tomorrow" on:click={
+                        let apply = apply.clone();
+                        move |_| apply(Some((local_day(1), minutes.get_untracked())))
+                    }>"Tomorrow"</button>
+                    <button class="btn btn-sm btn-ghost" data-action="remind-next-week" on:click={
+                        let apply = apply.clone();
+                        move |_| apply(Some((local_day(7), minutes.get_untracked())))
+                    }>"Next week"</button>
+                    {due_at.map(|_| {
+                        let apply = apply.clone();
+                        view! {
+                            <button class="btn btn-sm btn-ghost" data-action="remove-reminder"
+                                on:click=move |_| apply(None)>
+                                "Remove"
+                            </button>
+                        }
+                    })}
                 </div>
             </div>
         }
@@ -636,10 +723,11 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
             | ActionStatus::Suspicious
     );
     let remind_label = if due_at.is_some() {
-        "Change date"
+        "Change reminder"
     } else {
-        "Remind"
+        "Set reminder"
     };
+    let remind_minutes = action.remind_minutes;
 
     view! {
         <div class="read-wrap">
@@ -698,6 +786,7 @@ fn ActionDetail(action: ActionDto, refetch: Arc<dyn Fn() + Send + Sync>) -> impl
                     <ReminderDatePicker
                         action_id=id
                         due_at=due_at
+                        remind_minutes=remind_minutes
                         label=remind_label
                         refetch=refetch.clone()
                     />

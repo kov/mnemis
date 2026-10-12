@@ -26,7 +26,7 @@ pub struct ActionFilter {
 #[allow(clippy::type_complexity)]
 pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec<ActionDto>> {
     let sql = if filter.include_resolved {
-        "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
+        "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, a.remind_minutes, \
                 COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id, m.thread_id \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
@@ -36,7 +36,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          GROUP BY a.id \
          ORDER BY a.extracted_at DESC"
     } else {
-        "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, \
+        "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, a.remind_minutes, \
                 COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id, m.thread_id \
          FROM actions a \
          LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
@@ -55,6 +55,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         String,
         String,
         i64,
+        Option<i64>,
         Option<i64>,
         String,
         String,
@@ -76,6 +77,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
         status,
         created_at,
         due_at,
+        remind_minutes,
         channel_name,
         source_name,
         sync_status,
@@ -98,6 +100,7 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
             status: ActionStatus::parse(&status).unwrap_or(ActionStatus::Pending),
             created_at,
             due_at,
+            remind_minutes,
             source_posted_at,
             source_message_id,
             source_thread_id,

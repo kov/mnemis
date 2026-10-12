@@ -45,6 +45,12 @@ pub struct RemoteTask {
     pub description: Option<String>,
     /// Due date as unix seconds, mirroring `actions.due_at`.
     pub due: Option<i64>,
+    /// When on its day it alerts, in minutes after local midnight, where the
+    /// backend says (`actions.remind_minutes`).
+    pub alert_minutes: Option<u32>,
+    /// Ticked off on the backend (a reminders list); always false for a
+    /// calendar event.
+    pub completed: bool,
 }
 
 /// The fields mnemis pushes when creating or updating an event. No `href`/`etag`:
@@ -52,11 +58,19 @@ pub struct RemoteTask {
 /// an update is passed separately so the conflict path is explicit.
 #[derive(Debug, Clone)]
 pub struct TaskWrite {
+    /// The action it's for, so a backend can link back to it.
+    pub action_id: i64,
     pub uid: String,
     pub summary: String,
     pub description: Option<String>,
     pub due: Option<i64>,
+    /// Minutes after local midnight on the due day to alert; `None`: the
+    /// default morning time.
+    pub alert_minutes: Option<u32>,
 }
+
+/// The alert time when an action sets none: 09:00.
+pub const DEFAULT_ALERT_MINUTES: u32 = 9 * 60;
 
 /// Where a freshly-created resource landed, plus its initial etag.
 #[derive(Debug, Clone)]
@@ -96,4 +110,10 @@ pub trait TaskBackend: Send + Sync {
 
     /// Delete an event iff `etag` still matches (sent as `If-Match`).
     async fn delete_task(&self, href: &str, etag: &str) -> Result<Conditional<()>>;
+
+    /// The action was done: a backend that can tick items off (a reminders
+    /// list) does; a calendar has no "done", so the event goes.
+    async fn complete_task(&self, href: &str, etag: &str) -> Result<Conditional<()>> {
+        self.delete_task(href, etag).await
+    }
 }

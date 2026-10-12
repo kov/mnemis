@@ -169,19 +169,30 @@ pub async fn record_suspicious(
     Ok(id)
 }
 
-/// Set (or change) an action's due date, turning it into a reminder. A new
-/// reminder gets created on the next CalDAV sync (the reconcile create path
+/// Set (or change) an action's reminder: its day (`due_at`, midnight UTC of
+/// the date) and, when given, the time on it to alert (minutes after local
+/// midnight; `None` keeps the one set, else the default morning). A new
+/// reminder gets created on the next calendar sync (the reconcile create path
 /// keys off `due_at`); an action that's already a reminder is marked `dirty`
-/// so the new due date pushes to the calendar.
-pub async fn promote_to_reminder(pool: &SqlitePool, action_id: i64, due_at: i64) -> Result<()> {
+/// so the change pushes to the calendar.
+pub async fn promote_to_reminder(
+    pool: &SqlitePool,
+    action_id: i64,
+    due_at: i64,
+    remind_minutes: Option<i64>,
+) -> Result<()> {
+    if remind_minutes.is_some_and(|m| !(0..24 * 60).contains(&m)) {
+        bail!("reminder time out of range: {remind_minutes:?} minutes");
+    }
     let now = Utc::now().timestamp();
     let mut tx = crate::db::begin_write(pool).await.context("begin tx")?;
     let affected = sqlx::query(
-        "UPDATE actions SET due_at = ?, \
+        "UPDATE actions SET due_at = ?, remind_minutes = COALESCE(?, remind_minutes), \
          sync_status = CASE WHEN external_calendar_uid IS NOT NULL THEN 'dirty' ELSE sync_status END \
          WHERE id = ?",
     )
     .bind(due_at)
+    .bind(remind_minutes)
     .bind(action_id)
     .execute(&mut *tx)
     .await
@@ -195,7 +206,41 @@ pub async fn promote_to_reminder(pool: &SqlitePool, action_id: i64, due_at: i64)
          VALUES (?, 'updated', 'user', ?, ?)",
     )
     .bind(action_id)
-    .bind(serde_json::json!({ "promoted_to_reminder": due_at }).to_string())
+    .bind(
+        serde_json::json!({ "promoted_to_reminder": due_at, "remind_minutes": remind_minutes })
+            .to_string(),
+    )
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await.context("commit tx")?;
+    Ok(())
+}
+
+/// Stop reminding: the action stays, without a day or time; a calendar entry
+/// for it goes on the next calendar sync.
+pub async fn clear_reminder(pool: &SqlitePool, action_id: i64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let mut tx = crate::db::begin_write(pool).await.context("begin tx")?;
+    let affected = sqlx::query(
+        "UPDATE actions SET due_at = NULL, remind_minutes = NULL, \
+         sync_status = CASE WHEN external_calendar_uid IS NOT NULL THEN 'dirty' ELSE NULL END \
+         WHERE id = ?",
+    )
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await
+    .context("clearing the reminder")?
+    .rows_affected();
+    if affected == 0 {
+        bail!("action {action_id} not found");
+    }
+    sqlx::query(
+        "INSERT INTO action_events (action_id, event_kind, actor, data_json, occurred_at) \
+         VALUES (?, 'updated', 'user', ?, ?)",
+    )
+    .bind(action_id)
+    .bind(serde_json::json!({ "reminder_cleared": true }).to_string())
     .bind(now)
     .execute(&mut *tx)
     .await?;
@@ -652,7 +697,7 @@ mod tests {
         // A plain action (not yet a reminder): due is set, sync_status stays
         // NULL — the next sync will *create* it because due_at is now present.
         let plain = seed_action(&pool, "pending").await?;
-        promote_to_reminder(&pool, plain, 1_780_000_000).await?;
+        promote_to_reminder(&pool, plain, 1_780_000_000, None).await?;
         let (due, sync): (Option<i64>, Option<String>) =
             sqlx::query_as("SELECT due_at, sync_status FROM actions WHERE id = ?")
                 .bind(plain)
@@ -670,7 +715,7 @@ mod tests {
         .bind(linked)
         .execute(&pool)
         .await?;
-        promote_to_reminder(&pool, linked, 1_780_000_500).await?;
+        promote_to_reminder(&pool, linked, 1_780_000_500, None).await?;
         let (sync,): (Option<String>,) =
             sqlx::query_as("SELECT sync_status FROM actions WHERE id = ?")
                 .bind(linked)

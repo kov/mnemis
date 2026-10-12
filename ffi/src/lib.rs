@@ -163,6 +163,160 @@ pub struct Engine {
     watch: Mutex<Option<mnemis_engine::mail::watch::MailWatch>>,
     /// The Google sign-in the browser is out on.
     google_sign_in: Mutex<Option<mnemis_engine::oauth::Pending>>,
+    /// Where reminders go on this device (EventKit), when the user chose.
+    reminders: Mutex<Option<Arc<dyn ReminderStore>>>,
+    /// One reminder sync at a time, so two don't both create an item.
+    reminders_syncing: tokio::sync::Mutex<()>,
+}
+
+/// A calendar or reminders list on this device (EventKit), implemented in
+/// Swift, holding mnemis's reminders. Days are midnight UTC of the date, as
+/// in `ActionDto::due_at`; times are minutes after local midnight.
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait ReminderStore: Send + Sync {
+    /// The items mnemis made, with their state.
+    async fn list(&self) -> Result<Vec<StoredReminder>, MnemisError>;
+    async fn create(&self, item: ReminderWrite) -> Result<ReminderCreated, MnemisError>;
+    /// The new etag, or `None` when the item changed since `etag`.
+    async fn update(
+        &self,
+        href: String,
+        etag: String,
+        item: ReminderWrite,
+    ) -> Result<Option<String>, MnemisError>;
+    /// False when the item changed since `etag`.
+    async fn delete(&self, href: String, etag: String) -> Result<bool, MnemisError>;
+    /// The to-do was done: tick the item off where the store can, else
+    /// delete it. False when it changed since `etag`.
+    async fn complete(&self, href: String, etag: String) -> Result<bool, MnemisError>;
+}
+
+/// An item in a [`ReminderStore`].
+#[derive(uniffi::Record)]
+pub struct StoredReminder {
+    /// The `uid` it was created with.
+    pub uid: String,
+    pub href: String,
+    pub etag: String,
+    pub title: String,
+    pub notes: Option<String>,
+    pub due: Option<i64>,
+    pub alert_minutes: Option<u32>,
+    pub completed: bool,
+}
+
+/// What a [`ReminderStore`] item should hold.
+#[derive(uniffi::Record)]
+pub struct ReminderWrite {
+    /// The to-do, to link back to it (`mnemis://action/<id>`).
+    pub action_id: i64,
+    pub uid: String,
+    pub title: String,
+    pub notes: Option<String>,
+    pub due: Option<i64>,
+    pub alert_minutes: Option<u32>,
+}
+
+#[derive(uniffi::Record)]
+pub struct ReminderCreated {
+    pub href: String,
+    pub etag: String,
+}
+
+/// A [`ReminderStore`] as the engine's reminder backend.
+struct ForeignReminders(Arc<dyn ReminderStore>);
+
+impl ForeignReminders {
+    fn write(task: &mnemis_engine::sync::TaskWrite) -> ReminderWrite {
+        ReminderWrite {
+            action_id: task.action_id,
+            uid: task.uid.clone(),
+            title: task.summary.clone(),
+            notes: task.description.clone(),
+            due: task.due,
+            alert_minutes: task.alert_minutes,
+        }
+    }
+}
+
+fn conditional(ok: bool) -> mnemis_engine::sync::Conditional<()> {
+    if ok {
+        mnemis_engine::sync::Conditional::Ok(())
+    } else {
+        mnemis_engine::sync::Conditional::Conflict
+    }
+}
+
+#[async_trait::async_trait]
+impl mnemis_engine::sync::TaskBackend for ForeignReminders {
+    async fn list_tasks(&self) -> anyhow::Result<Vec<mnemis_engine::sync::RemoteTask>> {
+        Ok(self
+            .0
+            .list()
+            .await?
+            .into_iter()
+            .map(|r| mnemis_engine::sync::RemoteTask {
+                uid: r.uid,
+                href: r.href,
+                etag: r.etag,
+                summary: r.title,
+                description: r.notes,
+                due: r.due,
+                alert_minutes: r.alert_minutes,
+                completed: r.completed,
+            })
+            .collect())
+    }
+
+    async fn create_task(
+        &self,
+        task: &mnemis_engine::sync::TaskWrite,
+    ) -> anyhow::Result<mnemis_engine::sync::Created> {
+        let created = self.0.create(Self::write(task)).await?;
+        Ok(mnemis_engine::sync::Created {
+            href: created.href,
+            etag: created.etag,
+        })
+    }
+
+    async fn update_task(
+        &self,
+        href: &str,
+        etag: &str,
+        task: &mnemis_engine::sync::TaskWrite,
+    ) -> anyhow::Result<mnemis_engine::sync::Conditional<String>> {
+        Ok(
+            match self
+                .0
+                .update(href.to_string(), etag.to_string(), Self::write(task))
+                .await?
+            {
+                Some(etag) => mnemis_engine::sync::Conditional::Ok(etag),
+                None => mnemis_engine::sync::Conditional::Conflict,
+            },
+        )
+    }
+
+    async fn delete_task(
+        &self,
+        href: &str,
+        etag: &str,
+    ) -> anyhow::Result<mnemis_engine::sync::Conditional<()>> {
+        Ok(conditional(
+            self.0.delete(href.to_string(), etag.to_string()).await?,
+        ))
+    }
+
+    async fn complete_task(
+        &self,
+        href: &str,
+        etag: &str,
+    ) -> anyhow::Result<mnemis_engine::sync::Conditional<()>> {
+        Ok(conditional(
+            self.0.complete(href.to_string(), etag.to_string()).await?,
+        ))
+    }
 }
 
 /// Where to send the browser to sign in to Google.
@@ -250,6 +404,8 @@ impl Engine {
                 chat_cancels: Mutex::new(HashMap::new()),
                 watch: Mutex::new(None),
                 google_sign_in: Mutex::new(None),
+                reminders: Mutex::new(None),
+                reminders_syncing: tokio::sync::Mutex::new(()),
             }))
         })
         .await
@@ -269,6 +425,53 @@ impl Engine {
     pub async fn get_message(&self, message_id: i64) -> Result<MessageDetailDto, MnemisError> {
         let pool = self.pool.clone();
         run(async move { queries::get_message(&pool, message_id).await }).await
+    }
+
+    /// Remind about `action_id` on the day `due_at` (midnight UTC of the
+    /// date), at `remind_minutes` after local midnight (`None` keeps the time
+    /// set). Follow with [`Self::sync_reminders`] to reach the device's
+    /// calendar now.
+    pub async fn promote_to_reminder(
+        &self,
+        action_id: i64,
+        due_at: i64,
+        remind_minutes: Option<i64>,
+    ) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            mutations::promote_to_reminder(&pool, action_id, due_at, remind_minutes).await
+        })
+        .await
+    }
+
+    /// Stop reminding about `action_id`.
+    pub async fn clear_reminder(&self, action_id: i64) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mutations::clear_reminder(&pool, action_id).await }).await
+    }
+
+    /// Where reminders go on this device; `None` stops syncing them.
+    pub fn set_reminder_store(&self, store: Option<Arc<dyn ReminderStore>>) {
+        if let Ok(mut current) = self.reminders.lock() {
+            *current = store;
+        }
+    }
+
+    /// Bring the device's reminders and the to-dos in line, both ways.
+    /// Returns the errors; a no-op without a store.
+    pub async fn sync_reminders(&self) -> Result<Vec<String>, MnemisError> {
+        let Some(store) = self.reminders.lock().ok().and_then(|s| s.clone()) else {
+            return Ok(Vec::new());
+        };
+        let _one = self.reminders_syncing.lock().await;
+        let pool = self.pool.clone();
+        run(async move {
+            let summary =
+                mnemis_engine::sync::reconcile::sync_caldav(&pool, &ForeignReminders(store))
+                    .await?;
+            Ok(summary.errors)
+        })
+        .await
     }
 
     pub async fn set_action_status(
@@ -983,6 +1186,7 @@ pub struct ActionDto {
     pub status: ActionStatus,
     pub created_at: i64,
     pub due_at: Option<i64>,
+    pub remind_minutes: Option<i64>,
     pub source_posted_at: Option<i64>,
     pub source_message_id: Option<i64>,
     pub source_thread_id: Option<i64>,

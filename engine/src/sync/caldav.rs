@@ -162,6 +162,8 @@ impl TaskBackend for CaldavBackend {
                 summary: parsed.summary.unwrap_or_default(),
                 description: parsed.description,
                 due: parsed.due,
+                alert_minutes: None,
+                completed: false,
             });
         }
         Ok(out)
@@ -713,10 +715,12 @@ END:VCALENDAR</cal:calendar-data>
         }
 
         let write = TaskWrite {
+            action_id: 0,
             uid: uid.to_string(),
             summary: "mnemis live test — safe to delete".to_string(),
             description: Some("Created by the mnemis live CalDAV test.".to_string()),
             due: Some(1_780_272_000), // 2026-06-01 (all-day)
+            alert_minutes: None,
         };
         eprintln!(
             "--- the iCalendar we PUT ---\n{}",
@@ -753,10 +757,12 @@ END:VCALENDAR</cal:calendar-data>
                 &created.href,
                 &found.etag,
                 &TaskWrite {
+                    action_id: 0,
                     uid: uid.to_string(),
                     summary: "mnemis live test — updated".to_string(),
                     description: None,
                     due: Some(1_780_272_000),
+                    alert_minutes: None,
                 },
             )
             .await?

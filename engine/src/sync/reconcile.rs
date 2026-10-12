@@ -4,12 +4,18 @@
 //! `rationale` + `evidence`, which never leave the database (they aren't part of
 //! a VEVENT), so they're preserved automatically; the calendar wins on
 //! everything it *can* express — title and due date. A calendar event has no
-//! "done" state, so completion only flows mnemis → calendar (as a deletion).
+//! "done" state, so there completion only flows mnemis → calendar (as a
+//! deletion); a reminders list can tick items off, so there it flows both
+//! ways.
 //! Concretely, per tracked action:
 //!
-//! - **Resolved locally** (`done`/`cancelled`/`dismissed`): delete the event and
-//!   drop the calendar linkage (keeping `due_at` + status) — a done item doesn't
-//!   belong on the calendar, and clearing the link stops it being re-created.
+//! - **Resolved locally** (`done`/`cancelled`/`dismissed`): delete the event (a
+//!   done one is ticked off, where the backend can) and drop the calendar
+//!   linkage (keeping `due_at` + status) — a done item doesn't belong on the
+//!   calendar, and clearing the link stops it being re-created.
+//! - **Ticked off remotely**: the action is done; the linkage goes.
+//! - **Reminder removed locally** (`due_at` cleared): delete the event and drop
+//!   the linkage.
 //! - **Remote changed** (its ETag differs from what we stored): pull the remote
 //!   title/due into the action, even if we also had a pending local edit — the
 //!   calendar's edit was a deliberate user act, so it wins.
@@ -58,6 +64,7 @@ struct LocalRow {
     title: String,
     details: Option<String>,
     due_at: Option<i64>,
+    remind_minutes: Option<i64>,
     status: ActionStatus,
     uid: Option<String>,
     href: Option<String>,
@@ -111,14 +118,19 @@ async fn reconcile_one(
             Some(rt) => {
                 let remote_changed = row.etag.as_deref() != Some(rt.etag.as_str());
                 let dirty = row.sync_status.as_deref() == Some("dirty");
-                if is_terminal(row.status) {
-                    // Resolved locally → a calendar event can't be "done", so
-                    // remove it. Use the freshly-listed etag for If-Match.
+                if is_terminal(row.status) || row.due_at.is_none() {
+                    // Resolved locally, or no longer a reminder: off the
+                    // calendar. Use the freshly-listed etag for If-Match.
                     let href = row
                         .href
                         .as_deref()
-                        .context("terminal action has no external_href")?;
-                    match backend.delete_task(href, &rt.etag).await? {
+                        .context("linked action has no external_href")?;
+                    let removed = if row.status == ActionStatus::Done {
+                        backend.complete_task(href, &rt.etag).await?
+                    } else {
+                        backend.delete_task(href, &rt.etag).await?
+                    };
+                    match removed {
                         Conditional::Ok(()) => {
                             clear_link(pool, row.id).await?;
                             Ok(Outcome::Removed)
@@ -128,6 +140,9 @@ async fn reconcile_one(
                             Ok(Outcome::Conflict)
                         }
                     }
+                } else if rt.completed {
+                    complete_from_remote(pool, row.id).await?;
+                    Ok(Outcome::Pulled)
                 } else if remote_changed {
                     apply_remote(pool, row, rt).await?;
                     Ok(Outcome::Pulled)
@@ -182,10 +197,12 @@ fn is_terminal(status: ActionStatus) -> bool {
 
 fn task_write(row: &LocalRow, uid: &str) -> TaskWrite {
     TaskWrite {
+        action_id: row.id,
         uid: uid.to_owned(),
         summary: row.title.clone(),
         description: row.details.clone(),
         due: row.due_at,
+        alert_minutes: row.remind_minutes.and_then(|m| u32::try_from(m).ok()),
     }
 }
 
@@ -194,6 +211,7 @@ type RawLocalRow = (
     i64,
     String,
     Option<String>,
+    Option<i64>,
     Option<i64>,
     String,
     Option<String>,
@@ -204,7 +222,8 @@ type RawLocalRow = (
 
 async fn load_local(pool: &SqlitePool) -> Result<Vec<LocalRow>> {
     let rows: Vec<RawLocalRow> = sqlx::query_as(
-        "SELECT id, title, details, due_at, status, external_calendar_uid, external_href, \
+        "SELECT id, title, details, due_at, remind_minutes, status, external_calendar_uid, \
+         external_href, \
          external_etag, sync_status FROM actions \
          WHERE due_at IS NOT NULL OR external_calendar_uid IS NOT NULL",
     )
@@ -214,7 +233,7 @@ async fn load_local(pool: &SqlitePool) -> Result<Vec<LocalRow>> {
 
     rows.into_iter()
         .map(
-            |(id, title, details, due_at, status, uid, href, etag, sync_status)| {
+            |(id, title, details, due_at, remind_minutes, status, uid, href, etag, sync_status)| {
                 let status = ActionStatus::parse(&status)
                     .with_context(|| format!("unknown status {status:?} on action {id}"))?;
                 Ok(LocalRow {
@@ -222,6 +241,7 @@ async fn load_local(pool: &SqlitePool) -> Result<Vec<LocalRow>> {
                     title,
                     details,
                     due_at,
+                    remind_minutes,
                     status,
                     uid,
                     href,
@@ -249,12 +269,14 @@ async fn apply_remote(pool: &SqlitePool, row: &LocalRow, rt: &RemoteTask) -> Res
         .context("begin caldav reconcile tx")?;
 
     sqlx::query(
-        "UPDATE actions SET title = ?, details = ?, due_at = ?, external_etag = ?, \
+        "UPDATE actions SET title = ?, details = ?, due_at = ?, \
+         remind_minutes = COALESCE(?, remind_minutes), external_etag = ?, \
          sync_status = 'synced', sync_error = NULL WHERE id = ?",
     )
     .bind(&title)
     .bind(&rt.description)
     .bind(rt.due)
+    .bind(rt.alert_minutes)
     .bind(&rt.etag)
     .bind(row.id)
     .execute(&mut *tx)
@@ -271,6 +293,30 @@ async fn apply_remote(pool: &SqlitePool, row: &LocalRow, rt: &RemoteTask) -> Res
     .await?;
 
     tx.commit().await.context("commit caldav reconcile tx")
+}
+
+/// Ticked off on the backend: the action is done, and off the calendar.
+async fn complete_from_remote(pool: &SqlitePool, action_id: i64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let mut tx = crate::db::begin_write(pool).await?;
+    sqlx::query(
+        "UPDATE actions SET status = 'done', resolved_at = ?, external_calendar_uid = NULL, \
+         external_href = NULL, external_etag = NULL, sync_status = NULL, sync_error = NULL \
+         WHERE id = ?",
+    )
+    .bind(now)
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await?;
+    insert_event(
+        &mut tx,
+        action_id,
+        "resolved",
+        serde_json::json!({ "caldav": "completed_remotely", "status": "done" }),
+        now,
+    )
+    .await?;
+    tx.commit().await.map_err(Into::into)
 }
 
 async fn mark_pushed(pool: &SqlitePool, action_id: i64, new_etag: &str) -> Result<()> {
@@ -458,6 +504,8 @@ mod tests {
                     summary: task.summary.clone(),
                     description: task.description.clone(),
                     due: task.due,
+                    alert_minutes: task.alert_minutes,
+                    completed: false,
                 },
             );
             Ok(Created { href, etag })
@@ -533,6 +581,8 @@ mod tests {
             summary: summary.into(),
             description: None,
             due,
+            alert_minutes: None,
+            completed: false,
         }
     }
 
@@ -580,6 +630,112 @@ mod tests {
         assert_eq!(
             rationale, "because Ana asked",
             "rationale must be preserved"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ticked_off_remotely_marks_the_action_done() -> Result<()> {
+        let (_tmp, pool) = pool().await?;
+        let id = insert_action(
+            &pool,
+            "task",
+            "r",
+            "pending",
+            Some(100),
+            Some("mnemis-1@mnemis"),
+            Some("https://srv/cal/mnemis-1@mnemis.ics"),
+            Some("\"e1\""),
+            Some("synced"),
+        )
+        .await?;
+        let mut done = remote("mnemis-1@mnemis", "task", "\"e2\"", Some(100));
+        done.completed = true;
+        let backend = MockBackend::default().with_task(done);
+
+        sync_caldav(&pool, &backend).await?;
+        let (status, uid): (String, Option<String>) =
+            sqlx::query_as("SELECT status, external_calendar_uid FROM actions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!((status.as_str(), uid), ("done", None));
+        assert!(
+            backend.deleted.lock().unwrap().is_empty(),
+            "left in the list, ticked off"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cleared_reminder_leaves_the_calendar() -> Result<()> {
+        let (_tmp, pool) = pool().await?;
+        let id = insert_action(
+            &pool,
+            "task",
+            "r",
+            "pending",
+            Some(100),
+            Some("mnemis-1@mnemis"),
+            Some("https://srv/cal/mnemis-1@mnemis.ics"),
+            Some("\"e1\""),
+            Some("synced"),
+        )
+        .await?;
+        let backend = MockBackend::default().with_task(remote(
+            "mnemis-1@mnemis",
+            "task",
+            "\"e1\"",
+            Some(100),
+        ));
+        crate::mutations::clear_reminder(&pool, id).await?;
+
+        sync_caldav(&pool, &backend).await?;
+        assert!(
+            backend.tasks.lock().unwrap().is_empty(),
+            "the event is gone"
+        );
+        let (status, due, uid): (String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT status, due_at, external_calendar_uid FROM actions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!((status.as_str(), due, uid), ("pending", None, None));
+        // And it isn't created again.
+        sync_caldav(&pool, &backend).await?;
+        assert!(backend.created.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_reminder_time_is_pushed() -> Result<()> {
+        let (_tmp, pool) = pool().await?;
+        let id = insert_action(
+            &pool,
+            "task",
+            "r",
+            "pending",
+            Some(100),
+            Some("mnemis-1@mnemis"),
+            Some("https://srv/cal/mnemis-1@mnemis.ics"),
+            Some("\"e1\""),
+            Some("synced"),
+        )
+        .await?;
+        let backend = MockBackend::default().with_task(remote(
+            "mnemis-1@mnemis",
+            "task",
+            "\"e1\"",
+            Some(100),
+        ));
+        crate::mutations::promote_to_reminder(&pool, id, 200, Some(14 * 60)).await?;
+
+        sync_caldav(&pool, &backend).await?;
+        let updated = backend.updated.lock().unwrap();
+        assert_eq!(
+            (updated[0].due, updated[0].alert_minutes),
+            (Some(200), Some(14 * 60))
         );
         Ok(())
     }

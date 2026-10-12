@@ -3325,9 +3325,9 @@ async fn click_in_card(client: &fantoccini::Client, finder: &str, what: &str) ->
 }
 
 /// Drives the per-action reminder calendar popover and asserts the behaviour the
-/// user asked for: a fresh action shows "Remind"; opening reveals a calendar;
+/// user asked for: a fresh action shows "Set reminder"; opening reveals a calendar;
 /// clicking the backdrop (anywhere else) dismisses without promoting; clicking a
-/// day commits + closes (badge shows the date, button becomes "Change date");
+/// day commits + closes (badge shows the date, button becomes "Change reminder");
 /// and reopening highlights the set day. Backed by a DB check that `due_at`
 /// landed. Follows the testing tenets: assert outcomes the user sees.
 #[tokio::test(flavor = "current_thread")]
@@ -3370,8 +3370,13 @@ async fn reminder_calendar_dismisses_promotes_and_highlights() -> Result<()> {
     let toggle_is = |v: &Value, want: &str| v.get("toggle").and_then(Value::as_str) == Some(want);
     let is_open = |v: &Value| v.get("popoverOpen").and_then(Value::as_bool) == Some(true);
 
-    // 2. Initial state: a "Remind" toggle, no popover, no badge.
-    let p = wait_reminder(&client, |v| toggle_is(v, "Remind"), "the Remind button").await?;
+    // 2. Initial state: a "Set reminder" toggle, no popover, no badge.
+    let p = wait_reminder(
+        &client,
+        |v| toggle_is(v, "Set reminder"),
+        "the Set reminder button",
+    )
+    .await?;
     assert!(!is_open(&p), "calendar must start closed: {p:?}");
     assert!(p["badge"].is_null(), "no badge before a date is set: {p:?}");
 
@@ -3406,7 +3411,7 @@ async fn reminder_calendar_dismisses_promotes_and_highlights() -> Result<()> {
     )
     .await?;
     assert!(
-        toggle_is(&p, "Remind"),
+        toggle_is(&p, "Set reminder"),
         "still a fresh 'Remind' after dismiss: {p:?}"
     );
     assert!(
@@ -3429,11 +3434,11 @@ async fn reminder_calendar_dismisses_promotes_and_highlights() -> Result<()> {
     )
     .await?;
 
-    // 6. After picking: popover closed, badge shows the date, toggle is "Change date".
+    // 6. After picking: popover closed, badge shows the date, toggle is "Change reminder".
     let p = wait_reminder(
         &client,
-        |v| toggle_is(v, "Change date"),
-        "the 'Change date' toggle",
+        |v| toggle_is(v, "Change reminder"),
+        "the 'Change reminder' toggle",
     )
     .await?;
     assert!(
@@ -3456,16 +3461,18 @@ async fn reminder_calendar_dismisses_promotes_and_highlights() -> Result<()> {
         .timestamp();
     {
         let pool = mnemis_engine::db::open(&db_path).await?;
-        let (due,): (Option<i64>,) = sqlx::query_as("SELECT due_at FROM actions WHERE id = ?")
-            .bind(action_id)
-            .fetch_one(&pool)
-            .await
-            .context("reading due_at after picking a day")?;
+        let (due, at): (Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT due_at, remind_minutes FROM actions WHERE id = ?")
+                .bind(action_id)
+                .fetch_one(&pool)
+                .await
+                .context("reading due_at after picking a day")?;
         assert_eq!(
             due,
             Some(expected_due),
             "due_at should be the 15th of the current month at UTC midnight"
         );
+        assert_eq!(at, Some(9 * 60), "a day click alerts at the default 09:00");
         pool.close().await;
     }
 
@@ -3487,6 +3494,29 @@ async fn reminder_calendar_dismisses_promotes_and_highlights() -> Result<()> {
         Some("15"),
         "reopening must highlight the saved day: {p:?}"
     );
+
+    // 9. Remove: the reminder goes and the button offers a new one.
+    click_in_card(
+        &client,
+        "card.querySelector('[data-action=\"remove-reminder\"]')",
+        "the Remove button",
+    )
+    .await?;
+    wait_reminder(
+        &client,
+        |v| toggle_is(v, "Set reminder"),
+        "the Set reminder button after removing",
+    )
+    .await?;
+    {
+        let pool = mnemis_engine::db::open(&db_path).await?;
+        let (due,): (Option<i64>,) = sqlx::query_as("SELECT due_at FROM actions WHERE id = ?")
+            .bind(action_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(due, None, "the reminder is removed");
+        pool.close().await;
+    }
 
     client.close().await.ok();
     Ok(())

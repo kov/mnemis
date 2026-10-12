@@ -505,12 +505,37 @@ pub async fn run_sync_caldav() -> Result<CaldavSyncDto, String> {
 struct PromoteReminderArgs {
     action_id: i64,
     due_at: i64,
+    remind_minutes: Option<i64>,
 }
 
-pub async fn promote_to_reminder(action_id: i64, due_at: i64) -> Result<(), String> {
-    let args = serde_wasm_bindgen::to_value(&PromoteReminderArgs { action_id, due_at })
-        .map_err(|e| e.to_string())?;
+/// Remind on the day `due_at` (midnight UTC of the date) at `remind_minutes`
+/// after local midnight (`None` keeps the time set).
+pub async fn promote_to_reminder(
+    action_id: i64,
+    due_at: i64,
+    remind_minutes: Option<i64>,
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&PromoteReminderArgs {
+        action_id,
+        due_at,
+        remind_minutes,
+    })
+    .map_err(|e| e.to_string())?;
     invoke("promote_to_reminder", args)
+        .await
+        .map_err(|e| format!("invoke failed: {:?}", e))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ActionIdArgs {
+    action_id: i64,
+}
+
+pub async fn clear_reminder(action_id: i64) -> Result<(), String> {
+    let args =
+        serde_wasm_bindgen::to_value(&ActionIdArgs { action_id }).map_err(|e| e.to_string())?;
+    invoke("clear_reminder", args)
         .await
         .map_err(|e| format!("invoke failed: {:?}", e))?;
     Ok(())

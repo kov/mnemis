@@ -228,6 +228,10 @@ pub struct ActionDto {
     pub created_at: i64,
     /// Unix seconds; `None` means no due date.
     pub due_at: Option<i64>,
+    /// When on the due day the reminder alerts, in minutes after local
+    /// midnight; `None`: the default morning time.
+    #[serde(default)]
+    pub remind_minutes: Option<i64>,
     /// Unix seconds: when the action's primary evidence message (the email it
     /// came from) was sent. `None` when it has no primary evidence.
     #[serde(default)]

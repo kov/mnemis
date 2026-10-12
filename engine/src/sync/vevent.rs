@@ -1,8 +1,8 @@
 //! iCalendar VEVENT (de)serialization for the CalDAV backend.
 //!
 //! A mnemis action with a due date becomes an **all-day** VEVENT on that date,
-//! carrying a DISPLAY VALARM that fires at 09:00 the morning of (9h after the
-//! all-day start, which is midnight). iCloud syncs VEVENTs over CalDAV to the
+//! carrying a DISPLAY VALARM that fires at the action's alert time (09:00 by
+//! default; minutes after the all-day start, which is midnight). iCloud syncs VEVENTs over CalDAV to the
 //! Calendar app — unlike VTODO reminders, which it dropped (see the
 //! `icloud-reminders-no-caldav` memory). The all-day date is taken/emitted in
 //! UTC; v1 doesn't resolve per-event timezones.
@@ -13,10 +13,6 @@ use icalendar::{
 };
 
 use super::TaskWrite;
-
-/// 09:00 on the morning of the all-day due date: the all-day VEVENT starts at
-/// midnight, so the alarm triggers 9 hours after start.
-const ALARM_AFTER_START_HOURS: i64 = 9;
 
 /// The fields we read back out of a server VEVENT. `uid` is the join key against
 /// `actions.external_calendar_uid`; everything else is best-effort (a malformed
@@ -47,11 +43,12 @@ pub fn task_to_ics(task: &TaskWrite) -> String {
         // All-day: DTSTART = the day, DTEND = the next day (exclusive).
         event.starts(date);
         event.ends(date.succ_opt().unwrap_or(date));
-        // A morning-of nudge. The calendar event *is* the reminder; any extra
-        // mnemis-side notification is a separate layer on top (v2 Phase 5).
+        // The calendar event *is* the reminder; any extra mnemis-side
+        // notification is a separate layer on top (v2 Phase 5).
+        let minutes = task.alert_minutes.unwrap_or(super::DEFAULT_ALERT_MINUTES);
         event.alarm(Alarm::display(
             &task.summary,
-            Trigger::after_start(Duration::hours(ALARM_AFTER_START_HOURS)),
+            Trigger::after_start(Duration::minutes(i64::from(minutes))),
         ));
     }
     Calendar::new().push(event.done()).done().to_string()
@@ -95,10 +92,12 @@ mod tests {
 
     fn write(due: Option<i64>) -> TaskWrite {
         TaskWrite {
+            action_id: 7,
             uid: "mnemis-action-7@mnemis".into(),
             summary: "Reply to Ana about the budget".into(),
             description: Some("She asked twice; deadline Friday.".into()),
             due,
+            alert_minutes: None,
         }
     }
 
@@ -144,6 +143,15 @@ mod tests {
             ics.contains("TRIGGER;RELATED=START:PT32400S"),
             "morning-of trigger:\n{ics}"
         );
+    }
+
+    #[test]
+    fn alerts_at_the_action_s_time() {
+        let mut task = write(Some(1_780_272_000));
+        task.alert_minutes = Some(14 * 60 + 30);
+        let ics = task_to_ics(&task);
+        // 14:30 = 52200 s after the all-day start.
+        assert!(ics.contains("TRIGGER;RELATED=START:PT52200S"), "{ics}");
     }
 
     #[test]
