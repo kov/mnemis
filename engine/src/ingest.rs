@@ -40,7 +40,12 @@ pub async fn ingest_for_reading(
     channel_id: i64,
     messages: &[ImportedMessage],
 ) -> Result<usize> {
-    let mut tx = pool.begin().await.context("starting ingest transaction")?;
+    // Writing from the start: folders sync side by side, and a transaction
+    // that reads first fails, rather than waits, when another one wrote.
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("starting ingest transaction")?;
     let inserted = ingest_messages(&mut tx, source_id, channel_id, messages, true).await?;
     tx.commit().await.context("committing ingest transaction")?;
     Ok(inserted)

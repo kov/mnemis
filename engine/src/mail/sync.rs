@@ -5,10 +5,11 @@
 //! fetches it whole; everything else lands here as reading-only rows (see
 //! [`crate::ingest::ingest_for_reading`]).
 //!
-//! The algorithm runs over [`MailServer`], one open session per account, so
-//! tests drive it with a fake server.
+//! The algorithm runs over [`MailServer`], an open session to the account
+//! (a few when there are many folders to open), so tests drive it with a
+//! fake server.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -25,6 +26,11 @@ use crate::source::SourceId;
 pub const WINDOW_DAYS: i64 = 90;
 /// UIDs per header fetch.
 const CHUNK: usize = 50;
+/// Sessions an account's sync may open folders on at once.
+const SESSIONS: usize = 4;
+/// Folders to open for each session beyond the first: fewer aren't worth
+/// another login.
+const PER_SESSION: usize = 6;
 
 /// A folder as the server reports it when opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +157,13 @@ pub struct FetchedMessage {
 /// An account's mail server, one session.
 #[async_trait]
 pub trait MailServer: Send {
+    /// Up to `count` more sessions to the same account, to open folders
+    /// alongside this one; fewer where they can't be had.
+    async fn others(&mut self, _count: usize) -> Vec<Box<dyn MailServer>> {
+        Vec::new()
+    }
+    /// Log out of a session from [`MailServer::others`].
+    async fn close(self: Box<Self>) {}
     /// Open a folder for the calls that follow.
     async fn open(&mut self, folder: &str) -> Result<FolderStatus>;
     /// Every folder's status in one go, where the server can (LIST-STATUS,
@@ -241,33 +254,97 @@ pub async fn sync_folders(
         warn!(error = %format!("{e:#}"), "mail sync: folder statuses failed");
         HashMap::new()
     });
-    for (channel_id, folder) in channels {
-        let known = statuses.get(&folder);
-        match sync_folder_known(
-            pool,
-            server,
-            source_id,
-            channel_id,
-            &folder,
-            known,
-            Utc::now(),
-        )
-        .await
-        {
-            Ok(c) => {
-                counts.folders += 1;
-                counts.new += c.new;
-                counts.flag_changes += c.flag_changes;
-                counts.removed += c.removed;
-                counts.unchanged += c.unchanged;
+    // Each folder left to open costs round trips: with many (no LIST-STATUS,
+    // or the first sync), more sessions share them.
+    let to_open = to_open(pool, &channels, &statuses).await?;
+    let mut others = server
+        .others((to_open / PER_SESSION).min(SESSIONS - 1))
+        .await;
+    let queue = Mutex::new(channels.into_iter().collect::<VecDeque<_>>());
+    let mut sessions: Vec<&mut dyn MailServer> = vec![server];
+    sessions.extend(others.iter_mut().map(|s| &mut **s));
+    let shares = futures::future::join_all(sessions.into_iter().map(|session| {
+        let (queue, statuses) = (&queue, &statuses);
+        async move {
+            let mut counts = SyncCounts::default();
+            loop {
+                let Some((channel_id, folder)) = queue.lock().expect("folder queue").pop_front()
+                else {
+                    break;
+                };
+                let known = statuses.get(&folder);
+                match sync_folder_known(
+                    pool,
+                    session,
+                    source_id,
+                    channel_id,
+                    &folder,
+                    known,
+                    Utc::now(),
+                )
+                .await
+                {
+                    Ok(c) => {
+                        counts.folders += 1;
+                        counts.new += c.new;
+                        counts.flag_changes += c.flag_changes;
+                        counts.removed += c.removed;
+                        counts.unchanged += c.unchanged;
+                    }
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), folder, "mail sync: folder failed");
+                        counts.errors.push(format!("folder '{folder}': {e:#}"));
+                    }
+                }
             }
-            Err(e) => {
-                warn!(error = %format!("{e:#}"), folder, "mail sync: folder failed");
-                counts.errors.push(format!("folder '{folder}': {e:#}"));
-            }
+            counts
         }
+    }))
+    .await;
+    for other in others {
+        other.close().await;
+    }
+    for share in shares {
+        counts.folders += share.folders;
+        counts.new += share.new;
+        counts.flag_changes += share.flag_changes;
+        counts.removed += share.removed;
+        counts.unchanged += share.unchanged;
+        counts.errors.extend(share.errors);
     }
     Ok(counts)
+}
+
+/// How many of `channels` the sync will open: all but those the server
+/// showed unchanged.
+async fn to_open(
+    pool: &SqlitePool,
+    channels: &[(i64, String)],
+    statuses: &HashMap<String, FolderStatus>,
+) -> Result<usize> {
+    if statuses.is_empty() {
+        return Ok(channels.len());
+    }
+    let states: HashMap<i64, Option<String>> =
+        sqlx::query_as::<_, (i64, Option<String>)>("SELECT id, mail_state FROM channels")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    Ok(channels
+        .iter()
+        .filter(|(id, folder)| {
+            let state: MailState = states
+                .get(id)
+                .cloned()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            statuses
+                .get(folder)
+                .is_none_or(|status| !unchanged(&state, status))
+        })
+        .count())
 }
 
 pub async fn sync_folder(
@@ -344,9 +421,16 @@ async fn sync_folder_known(
     .map(|u| u as u32)
     .collect();
 
+    // The same UIDNEXT and message count: nothing arrived or left since the
+    // last sync, so only flags can have changed, and the folder's UIDs
+    // needn't be listed.
+    let same_mail = state.uidnext == Some(status.uidnext) && state.exists == Some(status.exists);
+
     // Mail that left the folder.
     let present: HashSet<u32> = if empty {
         HashSet::new()
+    } else if same_mail {
+        known.clone()
     } else {
         server.uids(None).await?.into_iter().collect()
     };
@@ -375,7 +459,7 @@ async fn sync_folder_known(
             _ => Some(0),
         }
     };
-    let in_window = if empty {
+    let in_window = if empty || same_mail {
         Vec::new()
     } else {
         server.uids(Some(now - Duration::days(WINDOW_DAYS))).await?
@@ -873,6 +957,134 @@ pub(crate) mod tests {
             let next = sync_folders(&pool, &mut server, source_id).await?;
             assert_eq!(next.new, 1);
             assert_eq!(server.opens, if list_status { 1 } else { 2 });
+        }
+        Ok(())
+    }
+
+    /// One of several sessions onto the same [`FakeServer`].
+    struct Session {
+        server: Arc<tokio::sync::Mutex<FakeServer>>,
+        open: String,
+        /// Sessions opened besides the first.
+        others: Arc<Mutex<usize>>,
+    }
+
+    impl Session {
+        async fn server(&self) -> tokio::sync::MutexGuard<'_, FakeServer> {
+            let mut server = self.server.lock().await;
+            server.open = self.open.clone();
+            server
+        }
+    }
+
+    #[async_trait]
+    impl MailServer for Session {
+        async fn others(&mut self, count: usize) -> Vec<Box<dyn MailServer>> {
+            *self.others.lock().unwrap() += count;
+            (0..count)
+                .map(|_| {
+                    Box::new(Session {
+                        server: self.server.clone(),
+                        open: String::new(),
+                        others: self.others.clone(),
+                    }) as Box<dyn MailServer>
+                })
+                .collect()
+        }
+        async fn open(&mut self, folder: &str) -> Result<FolderStatus> {
+            self.open = folder.to_string();
+            self.server().await.open(folder).await
+        }
+        async fn statuses(&mut self) -> Result<HashMap<String, FolderStatus>> {
+            self.server().await.statuses().await
+        }
+        async fn uids(&mut self, since: Option<DateTime<Utc>>) -> Result<Vec<u32>> {
+            self.server().await.uids(since).await
+        }
+        async fn headers(&mut self, uids: &[u32]) -> Result<Vec<FetchedHeaders>> {
+            self.server().await.headers(uids).await
+        }
+        async fn messages(&mut self, uids: &[u32]) -> Result<Vec<FetchedMessage>> {
+            self.server().await.messages(uids).await
+        }
+        async fn flags(&mut self, changed_since: Option<u64>) -> Result<Vec<(u32, u32)>> {
+            self.server().await.flags(changed_since).await
+        }
+        async fn auth_headers(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
+            self.server().await.auth_headers(uids).await
+        }
+        async fn received(&mut self, uids: &[u32]) -> Result<Vec<(u32, DateTime<Utc>)>> {
+            self.server().await.received(uids).await
+        }
+        async fn store_seen(&mut self, uids: &[u32], seen: bool) -> Result<()> {
+            self.server().await.store_seen(uids, seen).await
+        }
+        async fn search(&mut self, c: &crate::mail::search::Criteria) -> Result<Vec<u32>> {
+            self.server().await.search(c).await
+        }
+    }
+
+    #[tokio::test]
+    async fn shares_many_folders_among_more_sessions() -> Result<()> {
+        let (_tmp, pool, source_id) = setup().await?;
+        let mut server = FakeServer {
+            condstore: true,
+            ..Default::default()
+        };
+        for n in 0..13 {
+            let name = format!("Folder {n}");
+            folder(&pool, source_id, &name, true).await?;
+            server.add(&name, 1, &format!("{n}@x"), "Hello", 1);
+        }
+        let mut session = Session {
+            server: Arc::new(tokio::sync::Mutex::new(server)),
+            open: String::new(),
+            others: Default::default(),
+        };
+
+        // Without LIST-STATUS every folder is opened: two more sessions.
+        let first = sync_folders(&pool, &mut session, source_id).await?;
+        assert_eq!((first.folders, first.new), (13, 13));
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(count(&pool).await?, 13);
+        assert_eq!(*session.others.lock().unwrap(), 2);
+
+        // The server shows them all unchanged: no folder to open, no session.
+        session.server.lock().await.list_status = true;
+        *session.others.lock().unwrap() = 0;
+        let idle = sync_folders(&pool, &mut session, source_id).await?;
+        assert_eq!(idle.unchanged, 13);
+        assert_eq!(*session.others.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_only_the_flags_when_no_mail_came_or_went() -> Result<()> {
+        for condstore in [true, false] {
+            let (_tmp, pool, source_id) = setup().await?;
+            folder(&pool, source_id, "INBOX", true).await?;
+            let mut server = FakeServer {
+                condstore,
+                ..Default::default()
+            };
+            server.add("INBOX", 1, "a@x", "Lunch", 1);
+            server.add("INBOX", 2, "b@x", "Dinner", 2);
+            sync_folders(&pool, &mut server, source_id).await?;
+
+            // Read elsewhere: the flag arrives without listing the folder.
+            let m = server.folder("INBOX").messages.get_mut(&1).unwrap();
+            m.flags = 1;
+            m.modseq = 5;
+            server.searches = 0;
+            let next = sync_folders(&pool, &mut server, source_id).await?;
+            assert_eq!((next.flag_changes, next.new, next.removed), (1, 0, 0));
+            assert_eq!(server.searches, 0);
+
+            // One left and one came: the same count, but listed again.
+            server.folder("INBOX").messages.remove(&2);
+            server.add("INBOX", 3, "c@x", "Tea", 0);
+            let moved = sync_folders(&pool, &mut server, source_id).await?;
+            assert_eq!((moved.new, moved.removed), (1, 1));
         }
         Ok(())
     }

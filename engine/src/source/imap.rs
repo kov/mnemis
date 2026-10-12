@@ -65,6 +65,7 @@ impl async_imap::Authenticator for XOAuth2 {
     }
 }
 
+#[derive(Clone)]
 pub struct ImapSource {
     id: SourceId,
     config: ImapConfig,
@@ -528,6 +529,7 @@ impl ImapSource {
             session,
             condstore,
             capabilities: names,
+            source: self.clone(),
         })
     }
 }
@@ -549,6 +551,8 @@ pub struct ImapMailSession {
     /// What the server announced after login (`CAPABILITY`), to use the
     /// extensions it has and do without the others.
     capabilities: Vec<String>,
+    /// For more sessions to the same account.
+    source: ImapSource,
 }
 
 impl ImapMailSession {
@@ -635,6 +639,26 @@ impl ImapMailSession {
 
 #[async_trait]
 impl crate::mail::sync::MailServer for ImapMailSession {
+    async fn others(&mut self, count: usize) -> Vec<Box<dyn crate::mail::sync::MailServer>> {
+        let source = &self.source;
+        futures::future::join_all((0..count).map(|_| source.mail_session()))
+            .await
+            .into_iter()
+            .filter_map(|session| match session {
+                Ok(s) => Some(Box::new(s) as Box<dyn crate::mail::sync::MailServer>),
+                // The sessions that did open take its share.
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "mail sync: another session failed");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn close(self: Box<Self>) {
+        self.logout().await;
+    }
+
     async fn open(&mut self, folder: &str) -> Result<crate::mail::sync::FolderStatus> {
         // SELECT, not EXAMINE: the reader marks mail read. Bodies are still
         // fetched with BODY.PEEK so fetching never marks anything.
