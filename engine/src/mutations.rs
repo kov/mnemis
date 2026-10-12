@@ -154,6 +154,8 @@ pub async fn record_suspicious(
     .execute(&mut *tx)
     .await
     .context("inserting warning evidence")?;
+    // Accepted as a to-do, it's followed up like any other.
+    crate::extract::followup::start(&mut tx, id).await?;
     sqlx::query(
         "INSERT INTO action_events (action_id, event_kind, actor, occurred_at) \
          VALUES (?, 'created', 'agent_auto', ?)",
