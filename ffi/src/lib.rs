@@ -203,6 +203,19 @@ pub trait ReminderStore: Send + Sync {
     async fn complete(&self, href: String, etag: String) -> Result<bool, MnemisError>;
 }
 
+/// Mail the chat agent is watching for (`extract::expected`).
+#[derive(uniffi::Record)]
+pub struct MailWatch {
+    pub id: i64,
+    /// The chat that set it up, if it still exists.
+    pub chat_id: Option<i64>,
+    pub looking_for: String,
+    pub instruction: String,
+    pub created_at: i64,
+    /// `None`: until cancelled.
+    pub expires_at: Option<i64>,
+}
+
 /// An item in a [`ReminderStore`].
 #[derive(uniffi::Record)]
 pub struct StoredReminder {
@@ -573,6 +586,36 @@ impl Engine {
     pub async fn save_memory_rules(&self, rules: String) -> Result<(), MnemisError> {
         let pool = self.pool.clone();
         run(async move { memory::save_rules(&pool, &rules).await }).await
+    }
+
+    /// The mail the chat agent is watching for, oldest first.
+    pub async fn mail_watches(&self) -> Result<Vec<MailWatch>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            Ok(mnemis_engine::extract::expected::open(&pool)
+                .await?
+                .into_iter()
+                .map(|w| MailWatch {
+                    id: w.id,
+                    chat_id: w.chat_id,
+                    looking_for: w.looking_for,
+                    instruction: w.instruction,
+                    created_at: w.created_at,
+                    expires_at: w.expires_at,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Stop watching for mail `id`.
+    pub async fn cancel_mail_watch(&self, id: i64) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move {
+            mnemis_engine::extract::expected::cancel(&pool, id).await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn status(&self) -> Result<StatusSnapshot, MnemisError> {

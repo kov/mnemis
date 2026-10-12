@@ -74,8 +74,67 @@ pub(crate) async fn dispatch(
             },
             recorded_action: false,
         },
+        "watch_for_mail" | "cancel_watch" => DispatchOutput {
+            output: match watch_tool(pool, chat_id, name, arguments).await {
+                Ok(json) => json,
+                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+            },
+            recorded_action: false,
+        },
         _ => tools::dispatch(pool, ToolScope::Global, fetch_budget, name, arguments).await,
     }
+}
+
+#[derive(Deserialize)]
+struct WatchForMailArgs {
+    looking_for: String,
+    then: String,
+    days: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CancelWatchArgs {
+    watch_id: String,
+}
+
+/// Save or cancel a watch on incoming mail (see `extract::expected`).
+async fn watch_tool(
+    pool: &SqlitePool,
+    chat_id: i64,
+    name: &str,
+    arguments: &str,
+) -> anyhow::Result<String> {
+    use crate::extract::expected;
+    use anyhow::Context;
+    if name == "watch_for_mail" {
+        let args: WatchForMailArgs =
+            serde_json::from_str(arguments).context("parsing watch_for_mail args")?;
+        let days = args.days.unwrap_or(expected::DEFAULT_DAYS);
+        let id = expected::create(
+            pool,
+            Some(chat_id),
+            &args.looking_for,
+            &args.then,
+            Some(days),
+        )
+        .await?;
+        return Ok(json!({
+            "watch_id": format!("W-{id}"),
+            "waits": if days == 0 { "until cancelled".to_string() } else { format!("{days} days") },
+        })
+        .to_string());
+    }
+    let args: CancelWatchArgs =
+        serde_json::from_str(arguments).context("parsing cancel_watch args")?;
+    let id: i64 = args
+        .watch_id
+        .trim()
+        .trim_start_matches(['W', 'w'])
+        .trim_start_matches('-')
+        .parse()
+        .context("watch_id must look like W-N")?;
+    anyhow::ensure!(expected::cancel(pool, id).await?, "no open watch W-{id}");
+    Ok(json!({ "cancelled": format!("W-{id}") }).to_string())
 }
 
 #[derive(Deserialize)]

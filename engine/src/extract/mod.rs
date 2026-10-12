@@ -10,6 +10,7 @@ use crate::llm::{InputItem, LlmTransport, OutputItem, Role};
 use crate::source::Recipient;
 
 pub mod eval;
+pub mod expected;
 pub mod followup;
 pub mod manual;
 pub mod prompt;
@@ -145,7 +146,9 @@ pub async fn extract_for_channel(
     // `followup`); the watermark still passes it.
     let loaded_up_to = loaded.last().map(|row| row.id);
     let ids: Vec<i64> = loaded.iter().map(|row| row.id).collect();
-    let owned = followup::owned(pool, &ids).await?;
+    let mut owned = followup::owned(pool, &ids).await?;
+    // And mail a watch matched is that watch's (see `expected`).
+    owned.extend(expected::owned(pool, &ids).await?);
     let window: Vec<WindowRow> = loaded
         .into_iter()
         .filter(|row| !owned.contains(&row.id))

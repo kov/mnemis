@@ -75,6 +75,16 @@ pub async fn find_to_dos(
     let _serialized = extraction_lock(pool).await;
     let mut out = SyncOutcome::default();
     let started = Instant::now();
+    // First the mail the user is waiting for, in every account, so channel
+    // extraction leaves a match to its watch.
+    let expected: Erased<'_, usize> = Box::pin(check_expected_mail(pool, llm, window_char_budget));
+    match expected.await {
+        Ok(n) => out.actions_created += n as i64,
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "checking expected mail failed");
+            out.errors.push(format!("expected mail: {e:#}"));
+        }
+    }
     let sources: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, name FROM sources WHERE status != 'disabled' ORDER BY id")
             .fetch_all(pool)
@@ -134,6 +144,28 @@ pub async fn find_to_dos(
         "to-dos found"
     );
     Ok(out)
+}
+
+/// Expire the watches past their time, then check the new mail against the
+/// rest (see `extract::expected`).
+async fn check_expected_mail(
+    pool: &SqlitePool,
+    llm: &dyn LlmTransport,
+    window_char_budget: usize,
+) -> Result<usize> {
+    use crate::extract::expected;
+    let expired = expected::expire(pool).await?;
+    let started = Instant::now();
+    let recorded = expected::check(pool, llm, window_char_budget).await?;
+    if expired > 0 || recorded > 0 {
+        info!(
+            expired,
+            recorded,
+            secs = started.elapsed().as_secs(),
+            "expected mail checked"
+        );
+    }
+    Ok(recorded)
 }
 
 /// Only one [`find_to_dos`] per database at a time: two would extract the

@@ -338,6 +338,27 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             draft_email_params(),
         ),
         ToolDef::function(
+            "watch_for_mail".to_string(),
+            "Watch the user's incoming mail for an email they expect, and do something when it \
+             arrives — e.g. when a confirmation request comes, record a to-do to answer it. \
+             Every new email is checked against open watches as it is synced, and on a match \
+             the instruction is carried out with the to-do tools; this conversation gets a \
+             note saying what was done. Use it whenever the user asks you to keep an eye out \
+             for, wait for or react to a future email, instead of creating the to-do now. \
+             Returns the watch's W-N id."
+                .to_string(),
+            watch_for_mail_params(),
+        ),
+        ToolDef::function(
+            "cancel_watch".to_string(),
+            "Stop an open watch by its W-N id, when the user no longer wants it.".to_string(),
+            json!({
+                "type": "object",
+                "properties": { "watch_id": { "type": "string", "description": "W-N" } },
+                "required": ["watch_id"]
+            }),
+        ),
+        ToolDef::function(
             "search_conversation".to_string(),
             "Keyword search THIS conversation's own earlier turns — use it when the summary at \
              the top of the conversation isn't specific enough and you need to recall what was \
@@ -356,6 +377,31 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             recall_turns_params(),
         ),
     ]
+}
+
+fn watch_for_mail_params() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "looking_for": {
+                "type": "string",
+                "description": "the email to watch for, concretely: its sender or domain, \
+                                subject words, what it is (\"the Mailman confirmation request \
+                                from pkg-webkit-maintainers-request@alioth-lists.debian.net\")"
+            },
+            "then": {
+                "type": "string",
+                "description": "what to do when it arrives, as an instruction (\"record a to-do \
+                                to reply to it to confirm the unsubscription\")"
+            },
+            "days": {
+                "type": "integer",
+                "description": "how many days to wait before giving up (default 7; 0 waits until \
+                                cancelled)"
+            }
+        },
+        "required": ["looking_for", "then"]
+    })
 }
 
 fn draft_email_params() -> serde_json::Value {

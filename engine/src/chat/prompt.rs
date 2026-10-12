@@ -18,6 +18,8 @@ pub struct RenderInputs {
     pub seed: Option<String>,
     /// The rules learned from the user's feedback (`crate::memory`).
     pub memory_rules: Option<String>,
+    /// The open watches on incoming mail, one line each.
+    pub watches: Vec<String>,
 }
 
 /// Assemble the system prompt from already-gathered parts (no I/O).
@@ -42,7 +44,11 @@ pub fn render(inputs: &RenderInputs) -> String {
          or evidence; if you can't find support for a claim, say so plainly.\n\n\
          When the user wants to write, answer or pass on an email, draft it with draft_email, \
          in their voice and in the language of the thread. You cannot send mail: the draft \
-         appears to the user, who reviews and sends it. Never say an email was sent.\n\n",
+         appears to the user, who reviews and sends it. Never say an email was sent.\n\n\
+         When the user wants you to wait for, keep an eye out for or react to an email that \
+         hasn't arrived yet, save a watch with watch_for_mail: new mail is checked against it \
+         as it syncs, and the instruction is carried out when it arrives. Say you're watching \
+         for it; don't create the to-do ahead of time unless the user wants it now.\n\n",
     );
 
     out.push_str("# You are helping\n");
@@ -62,6 +68,14 @@ pub fn render(inputs: &RenderInputs) -> String {
         );
         out.push_str(rules.trim());
         out.push('\n');
+    }
+
+    if !inputs.watches.is_empty() {
+        out.push_str("\n# Mail you are watching for\n");
+        for w in &inputs.watches {
+            out.push_str(w);
+            out.push('\n');
+        }
     }
 
     out.push_str("\n# Current time\n");
@@ -88,6 +102,21 @@ pub async fn build_system_prompt(pool: &SqlitePool, chat_id: i64) -> Result<Stri
 
     let seed = load_seed(pool, chat_id).await?;
     let memory_rules = crate::memory::rules(pool).await?;
+    let watches = crate::extract::expected::open(pool)
+        .await?
+        .into_iter()
+        .map(|w| {
+            let until = w
+                .expires_at
+                .and_then(|t| chrono::DateTime::<Utc>::from_timestamp(t, 0))
+                .map(|t| format!(" (until {})", t.format("%Y-%m-%d")))
+                .unwrap_or_default();
+            format!(
+                "W-{}: {} — then: {}{until}",
+                w.id, w.looking_for, w.instruction
+            )
+        })
+        .collect();
 
     Ok(render(&RenderInputs {
         now_iso: Utc::now().to_rfc3339(),
@@ -95,6 +124,7 @@ pub async fn build_system_prompt(pool: &SqlitePool, chat_id: i64) -> Result<Stri
         custom_prompt: profile.custom_prompt,
         seed,
         memory_rules,
+        watches,
     }))
 }
 
@@ -245,6 +275,7 @@ mod tests {
             custom_prompt: Some("Ana is my direct report.".to_string()),
             seed: Some("This conversation is about action A-42.".to_string()),
             memory_rules: Some("- Newsletters are never action items".to_string()),
+            watches: vec![],
         });
         assert!(p.contains("mnemis's assistant"));
         assert!(p.contains("high confidence so the change applies immediately"));
@@ -264,6 +295,7 @@ mod tests {
             custom_prompt: Some("   ".to_string()),
             seed: None,
             memory_rules: None,
+            watches: vec![],
         });
         assert!(!p.contains("What they told you"));
         assert!(!p.contains("# This conversation"));
