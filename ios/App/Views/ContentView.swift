@@ -144,12 +144,17 @@ private struct ActionsStack: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     if showsSettings { SettingsItem() }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        NavigationLink {
+                            ResolvedActionsView()
+                        } label: {
+                            Label("Recently done", systemImage: "clock.arrow.circlepath")
+                        }
+                    }
                     SyncItem()
                 }
                 .navigationDestination(item: $model.actionSelection) { id in
-                    if let action = model.action(id) {
-                        ActionDetailView(action: action)
-                    }
+                    ActionDetailView(actionId: id)
                 }
         }
     }

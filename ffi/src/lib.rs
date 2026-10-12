@@ -444,6 +444,13 @@ impl Engine {
         .await
     }
 
+    /// The to-dos done, cancelled or dismissed in the last 30 days, most
+    /// recently first: to bring one back.
+    pub async fn list_resolved_actions(&self) -> Result<Vec<ActionDto>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { queries::list_resolved_actions(&pool, 30, 200).await }).await
+    }
+
     /// Stop reminding about `action_id`.
     pub async fn clear_reminder(&self, action_id: i64) -> Result<(), MnemisError> {
         let pool = self.pool.clone();

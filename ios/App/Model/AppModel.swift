@@ -40,6 +40,8 @@ enum AppTab: Hashable {
 final class AppModel {
     private(set) var engine: Engine?
     private(set) var actions: [ActionDto] = []
+    /// To-dos done, cancelled or dismissed lately, to bring one back.
+    private(set) var resolved: [ActionDto] = []
     private(set) var sources: [SourceRowDto] = []
     private(set) var isSyncing = false
     private(set) var lastSync: SyncOutcome?
@@ -335,6 +337,7 @@ final class AppModel {
         guard let engine else { return }
         do {
             actions = try await engine.listActions(includeResolved: false)
+            resolved = try await engine.listResolvedActions()
             sources = try await engine.listSources()
             chats = try await engine.listChats(includeArchived: false)
             let llm = try await engine.llmConfig()
@@ -544,6 +547,10 @@ final class AppModel {
         } catch {
             report(error)
         }
+        // A resolved to-do leaves the list, so its view closes.
+        if [.done, .cancelled, .dismissed].contains(status), actionSelection == action.id {
+            actionSelection = nil
+        }
         // A done to-do's reminder is ticked off now, not at the next sync.
         await syncReminders()
         await refresh()
@@ -719,7 +726,7 @@ final class AppModel {
 
     func action(_ id: ActionDto.ID?) -> ActionDto? {
         guard let id else { return nil }
-        return actions.first { $0.id == id }
+        return actions.first { $0.id == id } ?? resolved.first { $0.id == id }
     }
 
     func report(_ error: Error) {

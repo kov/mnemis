@@ -23,7 +23,6 @@ pub struct ActionFilter {
 /// Return actions ordered by recency (newest first). One row per action;
 /// `evidence_count` is computed inline so the UI can show "N messages" without
 /// a second roundtrip.
-#[allow(clippy::type_complexity)]
 pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec<ActionDto>> {
     let sql = if filter.include_resolved {
         "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, a.remind_minutes, \
@@ -48,26 +47,60 @@ pub async fn list_actions(pool: &SqlitePool, filter: ActionFilter) -> Result<Vec
          ORDER BY a.extracted_at DESC"
     };
 
-    let rows: Vec<(
-        i64,
-        String,
-        Option<String>,
-        String,
-        String,
-        i64,
-        Option<i64>,
-        Option<i64>,
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    )> = sqlx::query_as(sql)
+    let rows: Vec<ActionRow> = sqlx::query_as(sql)
         .fetch_all(pool)
         .await
         .context("listing actions")?;
+    action_dtos(pool, rows).await
+}
 
+/// The to-dos done, cancelled or dismissed in the last `days`, most recently
+/// resolved first, at most `limit`: to bring one back.
+pub async fn list_resolved_actions(
+    pool: &SqlitePool,
+    days: i64,
+    limit: i64,
+) -> Result<Vec<ActionDto>> {
+    let since = chrono::Utc::now().timestamp() - days * 86_400;
+    let rows: Vec<ActionRow> = sqlx::query_as(
+        "SELECT a.id, a.title, a.details, a.confidence, a.status, a.extracted_at, a.due_at, a.remind_minutes, \
+                COALESCE(c.name, ''), COALESCE(s.name, ''), a.sync_status, m.posted_at, m.id, m.thread_id \
+         FROM actions a \
+         LEFT JOIN action_evidence ae ON ae.action_id = a.id AND ae.is_primary = 1 \
+         LEFT JOIN messages m ON m.id = ae.message_id \
+         LEFT JOIN channels c ON c.id = m.channel_id \
+         LEFT JOIN sources s ON s.id = c.source_id \
+         WHERE a.status IN ('done', 'cancelled', 'dismissed') AND a.resolved_at >= ? \
+         GROUP BY a.id \
+         ORDER BY a.resolved_at DESC LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("listing resolved actions")?;
+    action_dtos(pool, rows).await
+}
+
+/// An action as `list_actions` selects it.
+type ActionRow = (
+    i64,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+async fn action_dtos(pool: &SqlitePool, rows: Vec<ActionRow>) -> Result<Vec<ActionDto>> {
     let mut out = Vec::with_capacity(rows.len());
     for (
         id,
@@ -444,6 +477,37 @@ mod tests {
         )
         .await?;
         assert_eq!(all.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_recently_resolved_to_dos_newest_first() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let pool = db::open(&tmp.path().join("t.db")).await?;
+        db::migrate(&pool).await?;
+        let now = chrono::Utc::now().timestamp();
+        for (title, status, resolved) in [
+            ("open", "pending", None),
+            ("done yesterday", "done", Some(now - 86_400)),
+            ("dismissed today", "dismissed", Some(now - 60)),
+            ("done long ago", "done", Some(now - 60 * 86_400)),
+        ] {
+            sqlx::query(
+                "INSERT INTO actions (title, confidence, status, extracted_at, resolved_at) \
+                 VALUES (?, 'high', ?, 0, ?)",
+            )
+            .bind(title)
+            .bind(status)
+            .bind(resolved)
+            .execute(&pool)
+            .await?;
+        }
+        let titles: Vec<String> = list_resolved_actions(&pool, 30, 50)
+            .await?
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(titles, ["dismissed today", "done yesterday"]);
         Ok(())
     }
 

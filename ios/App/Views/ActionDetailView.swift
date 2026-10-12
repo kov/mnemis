@@ -1,12 +1,27 @@
 import SwiftUI
 
+/// A to-do, kept current as it changes (a reminder set, a sync).
 struct ActionDetailView: View {
+    @Environment(AppModel.self) private var model
+    let actionId: Int64
+
+    var body: some View {
+        if let action = model.action(actionId) {
+            ActionDetailBody(action: action)
+        } else {
+            ContentUnavailableView("No longer here", systemImage: "checklist")
+        }
+    }
+}
+
+private struct ActionDetailBody: View {
     @Environment(AppModel.self) private var model
     let action: ActionDto
     @State private var message: MessageDetailDto?
     @State private var settingReminder = false
 
     private var isWarning: Bool { action.status == .suspicious }
+    private var isResolved: Bool { [.done, .cancelled, .dismissed].contains(action.status) }
 
     var body: some View {
         ScrollView {
@@ -39,6 +54,16 @@ struct ActionDetailView: View {
                         HStack(spacing: 10) {
                             acceptButton
                             discardButton
+                        }
+                        .controlSize(.large)
+                        .labelStyle(.titleAndIcon)
+                        .font(.subheadline.weight(.semibold))
+                    }
+                } else if isResolved {
+                    GlassEffectContainer(spacing: 10) {
+                        HStack(spacing: 10) {
+                            reopenButton
+                            talkButton
                         }
                         .controlSize(.large)
                         .labelStyle(.titleAndIcon)
@@ -175,6 +200,18 @@ struct ActionDetailView: View {
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.glass)
+    }
+
+    private var reopenButton: some View {
+        Button {
+            Task { await model.setStatus(action, to: .pending) }
+        } label: {
+            Label("Bring back", systemImage: "arrow.uturn.backward")
+                .lineLimit(1)
+                .fixedSize()
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glassProminent)
     }
 
     private var dismissButton: some View {
@@ -321,6 +358,57 @@ struct ReminderSheet: View {
         Task {
             await model.setReminder(action, day: ReminderTime.day(ofLocal: date), minutes: ReminderTime.minutes(of: date))
             dismiss()
+        }
+    }
+}
+
+/// To-dos done, cancelled or dismissed in the last 30 days, most recent
+/// first, to bring one back.
+struct ResolvedActionsView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        List(model.resolved, id: \.id) { action in
+            NavigationLink {
+                ActionDetailView(actionId: action.id)
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(action.title)
+                        .font(.body.weight(.medium))
+                        .lineLimit(2)
+                    Text(Self.label(action.status))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+            .swipeActions(edge: .leading) {
+                Button("Bring back", systemImage: "arrow.uturn.backward") {
+                    Task { await model.setStatus(action, to: .pending) }
+                }
+                .tint(.blue)
+            }
+        }
+        .overlay {
+            if model.resolved.isEmpty {
+                ContentUnavailableView(
+                    "Nothing done lately",
+                    systemImage: "clock.arrow.circlepath",
+                    description: Text("To-dos you finish or dismiss show here for 30 days.")
+                )
+            }
+        }
+        .navigationTitle("Recently done")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await model.refresh() }
+    }
+
+    private static func label(_ status: ActionStatus) -> String {
+        switch status {
+        case .done: "Done"
+        case .cancelled: "Cancelled"
+        case .dismissed: "Dismissed"
+        default: ""
         }
     }
 }
