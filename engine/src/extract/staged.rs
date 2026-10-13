@@ -544,6 +544,12 @@ fn action_system(ctx: &Context<'_>, external_id: &str) -> String {
         who(ctx),
         ctx.now.to_rfc3339()
     );
+    if let Some(rule) =
+        crate::settings::language_rule(ctx.profile.language.as_deref(), "the title and details")
+    {
+        out.push_str(&rule);
+        out.push('\n');
+    }
     if !ctx.existing.is_empty() {
         out.push_str(
             "\nIf it is the same to-do as one of these, call update_action with its id instead:\n",

@@ -9,6 +9,8 @@ pub struct PromptInputs<'a> {
     pub user_display_name: &'a str,
     pub user_identifiers: &'a [String],
     pub custom_prompt: Option<&'a str>,
+    /// What to write to-dos in (`settings::language`).
+    pub language: Option<&'a str>,
     pub current_time: DateTime<Utc>,
     pub existing_actions: &'a [ExistingAction],
     /// The rules learned from the user's feedback (`crate::memory`).
@@ -71,6 +73,13 @@ pub fn build(inputs: &PromptInputs) -> String {
     {
         out.push_str("# Context (user-provided)\n");
         out.push_str(prompt.trim());
+        out.push_str("\n\n");
+    }
+
+    if let Some(rule) = crate::settings::language_rule(inputs.language, "to-do titles and details")
+    {
+        out.push_str("# Language\n");
+        out.push_str(&rule);
         out.push_str("\n\n");
     }
 
@@ -265,6 +274,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,
@@ -283,6 +293,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &["gustavo@example.com".to_string()],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,
@@ -314,6 +325,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,
@@ -346,6 +358,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,
@@ -382,6 +395,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &["gustavo@example.com".to_string()],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,
@@ -429,6 +443,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[ExistingAction {
                 id: 7,
@@ -464,6 +479,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: Some("Ana is my direct report."),
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[ExistingAction {
                 id: 42,
@@ -487,6 +503,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: Some("   "),
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,
@@ -504,6 +521,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: Some("- Billing emails from acme.com are never action items\n"),
@@ -518,6 +536,29 @@ mod tests {
     }
 
     #[test]
+    fn asks_for_the_users_language_when_they_chose_one() {
+        let mut inputs = PromptInputs {
+            source_kind: "imap",
+            channel_name: "INBOX",
+            user_display_name: "Gustavo",
+            user_identifiers: &[],
+            custom_prompt: None,
+            language: Some("Brazilian Portuguese"),
+            current_time: dt(1_700_000_000),
+            existing_actions: &[],
+            memory_rules: None,
+            window: &[],
+        };
+        let rendered = build(&inputs);
+        assert!(
+            rendered.contains("Write to-do titles and details in Brazilian Portuguese"),
+            "{rendered}"
+        );
+        inputs.language = None;
+        assert!(!build(&inputs).contains("# Language"));
+    }
+
+    #[test]
     fn omits_the_rules_section_when_there_are_none() {
         let inputs = PromptInputs {
             source_kind: "imap",
@@ -525,6 +566,7 @@ mod tests {
             user_display_name: "Gustavo",
             user_identifiers: &[],
             custom_prompt: None,
+            language: None,
             current_time: dt(1_700_000_000),
             existing_actions: &[],
             memory_rules: None,

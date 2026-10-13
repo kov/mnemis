@@ -57,6 +57,10 @@ pub async fn tag_new_mail(
     }
     untagged.reverse();
     let context = context(pool).await?;
+    let system = match crate::settings::language(pool).await? {
+        Some(language) => format!("{SYSTEM}\nWrite the reasons in {language}."),
+        None => SYSTEM.to_string(),
+    };
     let per_batch = (char_budget / 2 / (SNIPPET_CHARS + 160)).clamp(5, 40);
     let mut tagged = 0;
     for batch in untagged.chunks(per_batch) {
@@ -82,7 +86,7 @@ pub async fn tag_new_mail(
             content: prompt,
         }];
         let response =
-            agent::send_with_stall_retry(llm, SYSTEM, &history, &[], 0, None, |_| {}).await?;
+            agent::send_with_stall_retry(llm, &system, &history, &[], 0, None, |_| {}).await?;
         let mut tags: Vec<Option<(MailCategory, i64, String)>> = vec![None; batch.len()];
         for (index, tag) in parse(&text(&response)) {
             if let Some(slot) = tags.get_mut(index) {

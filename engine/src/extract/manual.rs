@@ -22,7 +22,7 @@ phrase saying what the user has to do (not a summary of the email). Details \
 hold what the user needs to act without rereading the email: who, what, \
 deadlines, amounts, links. Set due_at (RFC 3339) only when the email gives or \
 clearly implies a date. Use confidence \"high\", since the user asked, and \
-put the email's id in evidence_external_ids. Write in the email's language.";
+put the email's id in evidence_external_ids.";
 
 /// Ask the model for a to-do from `message_id`; returns the new action's id.
 /// The to-do starts claimed: the user asked for it.
@@ -32,6 +32,12 @@ pub async fn to_do_from_message(
     message_id: i64,
 ) -> Result<i64> {
     let email = describe(pool, message_id).await?;
+    let language = crate::settings::language(pool).await?;
+    let system = format!(
+        "{SYSTEM} {}",
+        crate::settings::language_rule(language.as_deref(), "the title and details")
+            .unwrap_or_else(|| "Write in the email's language.".to_string())
+    );
     let mut history = vec![InputItem::Message {
         role: Role::User,
         content: email,
@@ -43,7 +49,7 @@ pub async fn to_do_from_message(
     let mut budget = FetchBudget::new(0);
     for step in 0..TURNS {
         let response =
-            agent::send_with_stall_retry(llm, SYSTEM, &history, &defs, step, None, |_| {}).await?;
+            agent::send_with_stall_retry(llm, &system, &history, &defs, step, None, |_| {}).await?;
         let mut calls = Vec::new();
         for item in response.output {
             match item {

@@ -468,12 +468,14 @@ pub async fn dump_prompt(cfg: &Config, channel_id: i64) -> Result<()> {
     // Match what extract_for_channel feeds the model — the dump is only
     // useful as a regression aid if the two prompts stay in sync.
     let memory_rules = mnemis_engine::memory::rules(&pool).await?;
+    let language = mnemis_engine::settings::language(&pool).await?;
     let inputs = prompt::PromptInputs {
         source_kind: &source_kind,
         channel_name: &channel_name,
         user_display_name: &display,
         user_identifiers: &identifiers,
         custom_prompt: custom.as_deref(),
+        language: language.as_deref(),
         current_time: Utc::now(),
         existing_actions: &existing,
         memory_rules: memory_rules.as_deref(),

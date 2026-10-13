@@ -531,6 +531,39 @@ fn forwarded(original: &Original) -> String {
     )
 }
 
+/// The name the user goes by in their own mail: the name an account sends
+/// as, else the one most of their sent mail carries. For onboarding, which
+/// can't read the owner's name from the device. `None` until mail they
+/// sent has synced.
+pub async fn suggested_name(pool: &SqlitePool) -> Result<Option<String>> {
+    let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM sources WHERE kind = 'imap' ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    for (id,) in ids {
+        if let Ok((account, _)) = load_account(pool, id).await
+            && !account.from_name.trim().is_empty()
+        {
+            return Ok(Some(account.from_name.trim().to_string()));
+        }
+    }
+    let own = own_addresses(pool).await?;
+    if own.is_empty() {
+        return Ok(None);
+    }
+    let name: Option<String> = sqlx::query_scalar(
+        "SELECT TRIM(p.display_name) FROM messages m JOIN people p ON p.id = m.author_id \
+         WHERE LOWER(p.external_id) IN (SELECT value FROM json_each(?)) \
+           AND TRIM(COALESCE(p.display_name, '')) != '' \
+           AND p.display_name NOT LIKE '%@%' \
+         GROUP BY TRIM(p.display_name) ORDER BY COUNT(*) DESC LIMIT 1",
+    )
+    .bind(serde_json::to_string(&own)?)
+    .fetch_optional(pool)
+    .await
+    .context("finding the user's name in their mail")?;
+    Ok(name)
+}
+
 /// The user's own addresses, never to be replied to: their profile's and
 /// every account's.
 pub(crate) async fn own_addresses(pool: &SqlitePool) -> Result<Vec<String>> {
@@ -1084,6 +1117,34 @@ async fn send_inner(pool: &SqlitePool, postbox: &dyn Postbox, id: i64) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn suggests_the_name_the_user_signs_their_mail_with() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let pool = crate::db::open(&tmp.path().join("t.db")).await?;
+        crate::db::migrate(&pool).await?;
+        assert_eq!(super::suggested_name(&pool).await?, None);
+        sqlx::query(
+            "INSERT INTO sources (id, kind, name, config_ref, created_at) VALUES (1, 'imap', 'a', 'r', 0); \
+             INSERT INTO channels (id, source_id, external_id, name, kind) VALUES (1, 1, 'Sent', 'Sent', 'mailbox'); \
+             INSERT INTO contacts (id, display_name, relationship, created_at, updated_at) VALUES (1, '', 'self', 0, 0); \
+             INSERT INTO contact_identifiers (contact_id, kind, value) VALUES (1, 'email', 'gustavo@x.br'); \
+             INSERT INTO people (id, source_id, external_id, display_name) VALUES (1, 1, 'Gustavo@x.br', 'Gustavo Noronha Silva'); \
+             INSERT INTO people (id, source_id, external_id, display_name) VALUES (2, 1, 'gustavo@x.br', 'gustavo@x.br'); \
+             INSERT INTO people (id, source_id, external_id, display_name) VALUES (3, 1, 'ana@x.br', 'Ana'); \
+             INSERT INTO messages (channel_id, external_id, author_id, posted_at, body, body_format, ingested_at) \
+             VALUES (1, '<1@x>', 1, 0, '', 'text', 0), (1, '<2@x>', 1, 0, '', 'text', 0), \
+                    (1, '<3@x>', 2, 0, '', 'text', 0), (1, '<4@x>', 3, 0, '', 'text', 0), \
+                    (1, '<5@x>', 3, 0, '', 'text', 0), (1, '<6@x>', 3, 0, '', 'text', 0);",
+        )
+        .execute(&pool)
+        .await?;
+        assert_eq!(
+            super::suggested_name(&pool).await?.as_deref(),
+            Some("Gustavo Noronha Silva")
+        );
+        Ok(())
+    }
+
     #[test]
     fn sends_to_addresses_with_a_long_user_part() {
         // Mailman's confirmation address: 71 characters before the @.

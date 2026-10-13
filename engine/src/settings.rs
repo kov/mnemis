@@ -42,6 +42,44 @@ pub async fn get_user_profile(pool: &SqlitePool) -> Result<UserProfileDto> {
     })
 }
 
+/// The language the user wants to-dos, summaries and the briefing written
+/// in, as an English name ("Brazilian Portuguese"); `None`: each email's own.
+pub async fn language(pool: &SqlitePool) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT language FROM user_profile WHERE id = 1")
+            .fetch_optional(pool)
+            .await
+            .context("loading the language")?;
+    Ok(row
+        .and_then(|(l,)| l)
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty()))
+}
+
+/// Set the language (see [`language`]); `None` or empty goes back to each
+/// email's own. Kept apart from [`save_user_profile`] so a profile form
+/// that doesn't show it can't clear it.
+pub async fn save_language(pool: &SqlitePool, language: Option<&str>) -> Result<()> {
+    let language = language.map(str::trim).filter(|l| !l.is_empty());
+    sqlx::query(
+        "INSERT INTO user_profile (id, display_name, language, updated_at) VALUES (1, '', ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET language = excluded.language, \
+            updated_at = excluded.updated_at",
+    )
+    .bind(language)
+    .bind(Utc::now().timestamp())
+    .execute(pool)
+    .await
+    .context("saving the language")?;
+    Ok(())
+}
+
+/// The instruction that puts what the model writes for the user in their
+/// language, when they chose one.
+pub fn language_rule(language: Option<&str>, what: &str) -> Option<String> {
+    language.map(|l| format!("Write {what} in {l}, whatever the email's language."))
+}
+
 /// Replace the user profile (upserts the singleton row) and reconciles the
 /// self-contact's identifiers against the desired set. Identifiers are
 /// matched by `(kind, value)`; rows not in the desired set are deleted, new
@@ -728,6 +766,35 @@ mod tests {
         );
         assert!(values.contains(&"b@x"));
         assert!(values.contains(&"c@x"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_language_is_kept_apart_from_the_profile() -> Result<()> {
+        let (_tmp, pool) = open().await?;
+        assert_eq!(language(&pool).await?, None);
+        save_language(&pool, Some("Brazilian Portuguese")).await?;
+        assert_eq!(
+            language(&pool).await?.as_deref(),
+            Some("Brazilian Portuguese")
+        );
+        // A profile form that doesn't show it leaves it alone.
+        save_user_profile(
+            &pool,
+            &UserProfileDto {
+                display_name: "Gustavo".into(),
+                custom_prompt: None,
+                identifiers: vec![],
+            },
+        )
+        .await?;
+        assert_eq!(
+            language(&pool).await?.as_deref(),
+            Some("Brazilian Portuguese")
+        );
+        assert_eq!(get_user_profile(&pool).await?.display_name, "Gustavo");
+        save_language(&pool, Some("  ")).await?;
+        assert_eq!(language(&pool).await?, None);
         Ok(())
     }
 

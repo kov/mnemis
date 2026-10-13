@@ -66,6 +66,10 @@ its title, never by its A-N id, written as a markdown link to it: \
 headings. When the user adds instructions for this briefing, follow them. \
 Write in the language of the user's notes, English if there are none.";
 
+/// [`SYSTEM`]'s default language, replaced when the user chose one.
+const DEFAULT_LANGUAGE: &str =
+    "Write in the language of the user's notes, English if there are none.";
+
 #[derive(Serialize, Deserialize)]
 struct Highlight {
     external_id: String,
@@ -91,6 +95,10 @@ pub async fn write(
         role: Role::User,
         content: prompt(pool, days, since, &mail, instructions, char_budget / 2).await?,
     }];
+    let system = match crate::settings::language(pool).await? {
+        Some(language) => SYSTEM.replace(DEFAULT_LANGUAGE, &format!("Write in {language}.")),
+        None => SYSTEM.to_string(),
+    };
     let defs = definitions();
     let mut budget = FetchBudget::new(char_budget / 2);
     let mut highlights: Vec<Highlight> = Vec::new();
@@ -98,7 +106,7 @@ pub async fn write(
     for step in 0..TURNS {
         let tools: &[ToolDef] = if step + 1 == TURNS { &[] } else { &defs };
         let response =
-            agent::send_with_stall_retry(llm, SYSTEM, &history, tools, step, None, |_| {}).await?;
+            agent::send_with_stall_retry(llm, &system, &history, tools, step, None, |_| {}).await?;
         summary = text(&response);
         let mut calls = Vec::new();
         for item in response.output {

@@ -589,6 +589,26 @@ impl Engine {
         run(async move { memory::save_rules(&pool, &rules).await }).await
     }
 
+    /// The language to-dos, summaries and the briefing are written in (an
+    /// English name); `None`: each email's own.
+    pub async fn language(&self) -> Result<Option<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mnemis_engine::settings::language(&pool).await }).await
+    }
+
+    pub async fn save_language(&self, language: Option<String>) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mnemis_engine::settings::save_language(&pool, language.as_deref()).await })
+            .await
+    }
+
+    /// The name the user signs their mail with, once mail they sent has
+    /// synced; for onboarding.
+    pub async fn suggested_name(&self) -> Result<Option<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mnemis_engine::mail::suggested_name(&pool).await }).await
+    }
+
     /// What the user wants to hear about in their mail, `None` until set.
     pub async fn interests(&self) -> Result<Option<String>, MnemisError> {
         let pool = self.pool.clone();

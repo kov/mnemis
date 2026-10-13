@@ -546,6 +546,7 @@ fn batch_system_prompt(
         user_display_name: profile.display_name.as_deref().unwrap_or("(unknown)"),
         user_identifiers: &profile.identifiers,
         custom_prompt: profile.custom_prompt.as_deref(),
+        language: profile.language.as_deref(),
         current_time: now,
         existing_actions: existing,
         memory_rules,
@@ -741,6 +742,8 @@ pub(super) struct UserProfile {
     display_name: Option<String>,
     custom_prompt: Option<String>,
     pub(super) identifiers: Vec<String>,
+    /// What to write to-dos in (`settings::language`).
+    pub(super) language: Option<String>,
 }
 
 pub(super) async fn load_user_profile_for(
@@ -783,6 +786,7 @@ pub(super) async fn load_user_profile_for(
         display_name,
         custom_prompt,
         identifiers,
+        language: crate::settings::language(pool).await?,
     })
 }
 
