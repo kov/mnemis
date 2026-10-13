@@ -622,10 +622,10 @@ impl Engine {
         .await
     }
 
-    /// Rewrite the last day's summary when it is a few hours old and mail
-    /// arrived since; for the foreground, never a background task. Returns
-    /// whether it did.
-    pub async fn refresh_briefing(&self) -> Result<bool, MnemisError> {
+    /// Write the summary for the last `days` days (the chosen period) when
+    /// there is none, or it is a few hours old and mail arrived since; for
+    /// the foreground, never a background task. Returns whether it did.
+    pub async fn refresh_briefing(&self, days: i64) -> Result<bool, MnemisError> {
         let Some(stack) = self.current_llm() else {
             return Ok(false);
         };
@@ -634,6 +634,7 @@ impl Engine {
             mnemis_engine::briefing::agent::refresh_if_stale(
                 &pool,
                 &stack.llm,
+                days,
                 stack.window_char_budget,
             )
             .await

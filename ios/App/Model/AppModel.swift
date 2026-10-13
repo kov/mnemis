@@ -54,6 +54,20 @@ final class AppModel {
     var errorMessage: String?
 
     var selectedTab: AppTab = .briefing
+    /// The briefing's period in days: shown at launch, and the one whose
+    /// summary is written automatically. Kept between launches.
+    var briefingDays: Int64 = AppModel.savedBriefingDays {
+        didSet {
+            UserDefaults.standard.set(Int(briefingDays), forKey: "briefingDays")
+            Task { await refreshBriefing() }
+        }
+    }
+
+    private static var savedBriefingDays: Int64 {
+        let days = UserDefaults.standard.integer(forKey: "briefingDays")
+        return days > 0 ? Int64(days) : 1
+    }
+
     /// The periods (in days) whose summary the agent is writing.
     private(set) var writingBriefing: Set<Int64> = []
     /// Bumped when a summary was written, so the briefing reloads.
@@ -473,14 +487,15 @@ final class AppModel {
         }
     }
 
-    /// Rewrite the last day's summary when it is a few hours old and mail
-    /// arrived since.
+    /// Write the chosen period's summary when there is none, or it is a few
+    /// hours old and mail arrived since.
     func refreshBriefing() async {
-        guard let engine, !writingBriefing.contains(1) else { return }
-        writingBriefing.insert(1)
-        defer { writingBriefing.remove(1) }
+        let days = briefingDays
+        guard let engine, !writingBriefing.contains(days) else { return }
+        writingBriefing.insert(days)
+        defer { writingBriefing.remove(days) }
         do {
-            if try await engine.refreshBriefing() {
+            if try await engine.refreshBriefing(days: days) {
                 briefingVersion += 1
             }
         } catch {
@@ -756,7 +771,7 @@ final class AppModel {
         switch url.host() {
         case "briefing":
             selectedTab = .briefing
-            UserDefaults.standard.set(Int(id), forKey: "briefingDays")
+            briefingDays = id
         case "action":
             selectedTab = .actions
             actionSelection = id

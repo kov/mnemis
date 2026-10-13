@@ -16,18 +16,12 @@ struct BriefingStack: View {
 
 struct BriefingView: View {
     @Environment(AppModel.self) private var model
-    /// The period, kept between launches.
-    @AppStorage("briefingDays") private var days = 1
     @State private var briefing: BriefingDto?
     @State private var choosingDays = false
 
     var body: some View {
+        @Bindable var model = model
         List {
-            Section {
-                PeriodPicker(days: $days, choosingCustom: $choosingDays)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-            }
             if let briefing {
                 SummarySection(briefing: briefing)
                 if !briefing.worthReading.isEmpty {
@@ -59,58 +53,64 @@ struct BriefingView: View {
         .navigationTitle("Briefing")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                PeriodMenu(days: $model.briefingDays, choosingCustom: $choosingDays)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Ask about this", systemImage: "bubble.left.and.text.bubble.right") {
-                    Task { await model.askAboutBriefing(days: Int64(days)) }
+                    Task { await model.askAboutBriefing(days: model.briefingDays) }
                 }
                 .disabled(model.engine == nil)
             }
         }
         .refreshable { await model.sync() }
-        .task(id: "\(days)-\(model.mailVersion)-\(model.briefingVersion)") { await load() }
+        .task(id: "\(model.briefingDays)-\(model.mailVersion)-\(model.briefingVersion)") { await load() }
         .sheet(isPresented: $choosingDays) {
-            CustomDaysSheet(days: $days)
+            CustomDaysSheet(days: $model.briefingDays)
         }
     }
 
     private func load() async {
         guard let engine = model.engine else { return }
         do {
-            briefing = try await engine.briefing(days: Int64(days))
+            briefing = try await engine.briefing(days: model.briefingDays)
         } catch {
             model.report(error)
         }
     }
 }
 
-private struct PeriodPicker: View {
-    @Binding var days: Int
+/// The header's period button: the presets, or a custom number of days.
+private struct PeriodMenu: View {
+    @Binding var days: Int64
     @Binding var choosingCustom: Bool
 
     var body: some View {
-        Picker("Period", selection: Binding(
-            get: { presetDays.contains(Int64(days)) ? Int64(days) : 0 },
-            set: { choice in
-                if choice == 0 {
-                    choosingCustom = true
-                } else {
-                    days = Int(choice)
+        Menu {
+            Picker("Period", selection: $days) {
+                ForEach(presetDays, id: \.self) { d in
+                    Text(periodName(d)).tag(d)
+                }
+                if !presetDays.contains(days) {
+                    Text(periodName(days)).tag(days)
                 }
             }
-        )) {
-            ForEach(presetDays, id: \.self) { d in
-                Text(d == 1 ? "1 day" : "\(d) days").tag(d)
-            }
-            Text(presetDays.contains(Int64(days)) ? "Custom" : "\(days) days").tag(Int64(0))
+            Button("Custom…", systemImage: "calendar") { choosingCustom = true }
+        } label: {
+            Label(periodName(days), systemImage: "calendar")
+                .labelStyle(.titleAndIcon)
         }
-        .pickerStyle(.segmented)
     }
+}
+
+func periodName(_ days: Int64) -> String {
+    days == 1 ? "1 day" : "\(days) days"
 }
 
 private struct CustomDaysSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @Binding var days: Int
-    @State private var choice = 14
+    @Binding var days: Int64
+    @State private var choice: Int64 = 14
 
     var body: some View {
         NavigationStack {
@@ -133,7 +133,7 @@ private struct CustomDaysSheet: View {
         }
         .presentationDetents([.height(200)])
         .onAppear {
-            if !presetDays.contains(Int64(days)) { choice = days }
+            if !presetDays.contains(days) { choice = days }
         }
     }
 }

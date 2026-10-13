@@ -2,8 +2,9 @@
 //! came in and what matters, and picks the emails worth reading. It starts from the
 //! period's tagged mail, reads what deserves it, and can look up earlier mail
 //! (locally or on the server) to explain an email's context. It runs on
-//! demand, and the apps call [`refresh_if_stale`] for the last day when they
-//! are in the foreground; a run can take minutes, so sync never does.
+//! demand, and the apps call [`refresh_if_stale`] for the user's chosen
+//! period when they are in the foreground; a run can take minutes, so sync
+//! never does.
 //!
 //! One briefing is kept per period length, with the newest email it saw, so
 //! the briefing can say how much mail arrived since.
@@ -129,26 +130,30 @@ pub async fn write(
     Ok(())
 }
 
-/// Rewrite the last day's briefing when it is older than a few hours and
-/// mail arrived since. Returns whether it did.
+/// Write the summary for the last `days` days (the user's chosen period)
+/// when there is none, or it is older than a few hours and mail arrived
+/// since. Returns whether it did.
 pub async fn refresh_if_stale(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
+    days: i64,
     char_budget: usize,
 ) -> Result<bool> {
+    let days = days.clamp(1, super::MAX_DAYS);
     let stored: Option<(i64, i64)> =
-        sqlx::query_as("SELECT generated_at, up_to FROM briefings WHERE days = 1")
+        sqlx::query_as("SELECT generated_at, up_to FROM briefings WHERE days = ?")
+            .bind(days)
             .fetch_optional(pool)
             .await?;
     if stored.is_some_and(|(at, _)| Utc::now().timestamp() - at < STALE_SECS) {
         return Ok(false);
     }
     let up_to = stored.map_or(0, |(_, up_to)| up_to);
-    let mail = super::period_mail(pool, super::since(1)).await?;
+    let mail = super::period_mail(pool, super::since(days)).await?;
     if !mail.iter().any(|m| m.id > up_to) {
         return Ok(false);
     }
-    write(pool, llm, 1, char_budget).await?;
+    write(pool, llm, days, char_budget).await?;
     Ok(true)
 }
 
@@ -458,7 +463,7 @@ mod tests {
 
         // Fresh: sync leaves it alone, even with new mail.
         arrive(&pool, 3, 1, 1, "Re: Dinner", 0).await?;
-        assert!(!refresh_if_stale(&pool, &MockLlm::new(vec![]), 20_000).await?);
+        assert!(!refresh_if_stale(&pool, &MockLlm::new(vec![]), 1, 20_000).await?);
         assert_eq!(
             super::super::load(&pool, 1)
                 .await?
@@ -472,14 +477,14 @@ mod tests {
             .execute(&pool)
             .await?;
         let llm = MockLlm::new(vec![mock::no_tools("Ana wrote again.")]);
-        assert!(refresh_if_stale(&pool, &llm, 20_000).await?);
+        assert!(refresh_if_stale(&pool, &llm, 1, 20_000).await?);
         let b = super::super::load(&pool, 1).await?.written.unwrap();
         assert_eq!((b.summary.as_str(), b.newer_mail), ("Ana wrote again.", 0));
         // Stale but nothing new: no model call.
         sqlx::query("UPDATE briefings SET generated_at = 0")
             .execute(&pool)
             .await?;
-        assert!(!refresh_if_stale(&pool, &MockLlm::new(vec![]), 20_000).await?);
+        assert!(!refresh_if_stale(&pool, &MockLlm::new(vec![]), 1, 20_000).await?);
         Ok(())
     }
 
