@@ -9,8 +9,6 @@
 //! One briefing is kept per period length, with the newest email it saw, so
 //! the briefing can say how much mail arrived since.
 
-use std::collections::HashSet;
-
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone, Utc};
 use mnemis_types::{BriefingMailDto, WrittenBriefingDto};
@@ -49,19 +47,23 @@ each email the user should read, most important first, at most 8, with one \
 sentence saying why. Don't highlight what is already a to-do unless there is \
 more to it, and don't create or change to-dos.\n\n\
 Emails marked SUSPICIOUS failed checks that point to phishing (a forged date \
-or sender, a misleading link, a look-alike sender); the mark says which. \
-Never pass on what one claims as fact. Scrutinize it first: fetch it, look \
-at the sender's real address and domain and where its links lead, and \
-compare it with earlier mail from the genuine sender (search_messages). \
-Highlight it only when it still looks genuine or the user must be warned, \
-and then say in the why and in the briefing that it was flagged as \
-suspicious, why, and what you concluded.\n\n\
+or sender, a misleading link, a look-alike sender); the mark says which, and \
+what an earlier look found. Never pass on what one claims as fact. For one \
+that would otherwise matter and hasn't been looked into, look into it: fetch \
+it, check the sender's real address and domain and where its links lead, and \
+compare it with earlier mail from the genuine sender (search_messages). Then \
+call record_suspicion with your verdict and the concrete evidence; the user \
+sees it with the email's warning. Leave mail you judge phishing out of the \
+highlights and the briefing entirely: the app lists it under Suspicious. \
+Mail you find genuine you treat like any other. Call record_suspicion too \
+when an unmarked email turns out to be phishing.\n\n\
 Then answer with the briefing itself: one to three short paragraphs of plain \
 prose on what came in and what matters, by theme rather than email by email, \
 without repeating the highlights word for word. When to-dos are overdue or \
-due in the next two days, say so first, naming each and its date. No bullet \
-points or lists, no greeting, no headings. When the user adds instructions \
-for this briefing, follow them. \
+due in the next two days, say so first with their dates. Refer to a to-do by \
+its title, never by its A-N id, written as a markdown link to it: \
+[Pay the plumber](A-12). No bullet points or lists, no greeting, no \
+headings. When the user adds instructions for this briefing, follow them. \
 Write in the language of the user's notes, English if there are none.";
 
 #[derive(Serialize, Deserialize)]
@@ -92,7 +94,6 @@ pub async fn write(
     let defs = definitions();
     let mut budget = FetchBudget::new(char_budget / 2);
     let mut highlights: Vec<Highlight> = Vec::new();
-    let mut challenged: HashSet<String> = HashSet::new();
     let mut summary = String::new();
     for step in 0..TURNS {
         let tools: &[ToolDef] = if step + 1 == TURNS { &[] } else { &defs };
@@ -122,19 +123,11 @@ pub async fn write(
             break;
         }
         for (call_id, name, arguments) in calls {
-            let output = dispatch(
-                pool,
-                &mut budget,
-                &mut highlights,
-                &mut challenged,
-                &name,
-                &arguments,
-            )
-            .await;
+            let output = dispatch(pool, &mut budget, &mut highlights, &name, &arguments).await;
             history.push(InputItem::FunctionCallOutput { call_id, output });
         }
     }
-    let summary = summary.trim();
+    let summary = link_todos(summary.trim());
     anyhow::ensure!(!summary.is_empty(), "the briefing came back empty");
     sqlx::query(
         "INSERT OR REPLACE INTO briefings (days, since, generated_at, up_to, summary, highlights_json) \
@@ -150,6 +143,14 @@ pub async fn write(
     .await
     .context("saving the briefing")?;
     Ok(())
+}
+
+/// The summary's to-do links, `[title](A-12)`, as app links
+/// (`mnemis://action/12`).
+fn link_todos(summary: &str) -> String {
+    summary
+        .replace("](A-", "](mnemis://action/")
+        .replace("](a-", "](mnemis://action/")
 }
 
 /// Write the summary for the last `days` days (the user's chosen period)
@@ -429,6 +430,22 @@ fn definitions() -> Vec<ToolDef> {
             "required": ["external_id", "why"]
         }),
     ));
+    defs.push(ToolDef::function(
+        "record_suspicion".to_string(),
+        "Record what looking into a suspicious email showed: whether it is phishing, and \
+         the concrete evidence (the sender's real domain, where the links lead, how it \
+         differs from the genuine sender's mail). The user sees it with the email's warning."
+            .to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "external_id": { "type": "string" },
+                "phishing": { "type": "boolean" },
+                "finding": { "type": "string", "description": "one or two sentences" }
+            },
+            "required": ["external_id", "phishing", "finding"]
+        }),
+    ));
     defs
 }
 
@@ -436,57 +453,57 @@ async fn dispatch(
     pool: &SqlitePool,
     budget: &mut FetchBudget,
     highlights: &mut Vec<Highlight>,
-    challenged: &mut HashSet<String>,
     name: &str,
     arguments: &str,
 ) -> String {
-    match name {
-        "highlight" => match highlight(pool, highlights, challenged, arguments).await {
-            Ok(out) => out,
-            Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
-        },
-        "search_mail_server" => match crate::chat::tools::search_mail_server(pool, arguments).await
-        {
-            Ok(out) => out,
-            Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
-        },
+    let result = match name {
+        "highlight" => highlight(pool, highlights, arguments).await,
+        "record_suspicion" => record_suspicion(pool, arguments).await,
+        "search_mail_server" => crate::chat::tools::search_mail_server(pool, arguments).await,
         name if READ_TOOLS.contains(&name) => {
             let DispatchOutput { output, .. } =
                 tools::dispatch(pool, ToolScope::Global, budget, name, arguments).await;
-            output
+            Ok(output)
         }
-        other => json!({ "error": format!("unknown tool: {other}") }).to_string(),
-    }
+        other => Err(anyhow::anyhow!("unknown tool: {other}")),
+    };
+    result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") }).to_string())
 }
 
-/// Pick an email. The first try at a suspicious one is turned back with why
-/// it was flagged, so the run looks into it before trying again.
+/// Pick an email. Mail judged phishing is refused, and flagged mail nobody
+/// looked into yet is sent back to be looked into first.
 async fn highlight(
     pool: &SqlitePool,
     highlights: &mut Vec<Highlight>,
-    challenged: &mut HashSet<String>,
     arguments: &str,
 ) -> Result<String> {
     let h: Highlight = serde_json::from_str(arguments).context("parsing highlight args")?;
-    let id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM messages WHERE external_id = ? LIMIT 1")
+    let id = message_id(pool, &h.external_id).await?;
+    if highlights.iter().any(|p| p.external_id == h.external_id) {
+        return Ok(json!({ "ok": "already highlighted" }).to_string());
+    }
+    if crate::mail::suspicion::judged_phishing(pool, &[id])
+        .await?
+        .contains(&id)
+    {
+        anyhow::bail!(
+            "not highlighted: it was judged phishing. Leave it out of the highlights and the \
+             briefing; the app lists it under Suspicious with the finding."
+        );
+    }
+    let looked_into: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM suspicion_findings WHERE external_id = ?")
             .bind(&h.external_id)
             .fetch_optional(pool)
             .await?;
-    let id = id.with_context(|| format!("no email {}", h.external_id))?;
-    let picked: HashSet<&str> = highlights.iter().map(|h| h.external_id.as_str()).collect();
-    if picked.contains(h.external_id.as_str()) {
-        return Ok(json!({ "ok": "already highlighted" }).to_string());
-    }
     if let Some(w) = super::warnings(pool, &[id]).await?.remove(&id)
-        && challenged.insert(h.external_id.clone())
+        && looked_into.is_none()
     {
         anyhow::bail!(
-            "not highlighted: this email is flagged as suspicious ({}). Check it first: \
-             fetch it, look at the sender's real address and where its links lead, and \
-             compare it with earlier mail from the genuine sender. Highlight it only if it \
-             still looks genuine or the user must be warned, by calling highlight again \
-             with a why that says it was flagged, why, and what you concluded.",
+            "not highlighted: it is flagged as suspicious ({}). Look into it (fetch it, check \
+             the sender's real address and where its links lead, compare it with earlier mail \
+             from the genuine sender) and call record_suspicion with your verdict. Highlight \
+             it only if you find it genuine.",
             w.join("; ")
         );
     }
@@ -496,6 +513,32 @@ async fn highlight(
     );
     highlights.push(h);
     Ok(json!({ "ok": "highlighted", "count": highlights.len() }).to_string())
+}
+
+#[derive(Deserialize)]
+struct SuspicionArgs {
+    external_id: String,
+    phishing: bool,
+    finding: String,
+}
+
+async fn record_suspicion(pool: &SqlitePool, arguments: &str) -> Result<String> {
+    let args: SuspicionArgs =
+        serde_json::from_str(arguments).context("parsing record_suspicion args")?;
+    message_id(pool, &args.external_id).await?;
+    anyhow::ensure!(!args.finding.trim().is_empty(), "say what you found");
+    crate::mail::suspicion::save_finding(pool, &args.external_id, args.phishing, &args.finding)
+        .await?;
+    Ok(json!({ "ok": "recorded" }).to_string())
+}
+
+async fn message_id(pool: &SqlitePool, external_id: &str) -> Result<i64> {
+    let id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM messages WHERE external_id = ? LIMIT 1")
+            .bind(external_id)
+            .fetch_optional(pool)
+            .await?;
+    id.with_context(|| format!("no email {external_id}"))
 }
 
 #[cfg(test)]
@@ -615,63 +658,91 @@ mod tests {
         Ok(())
     }
 
+    /// Dated days after it arrived: a forged date.
+    async fn forge(pool: &SqlitePool, id: i64) -> Result<()> {
+        sqlx::query("UPDATE messages SET posted_at = received_at + 5 * 86400 WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn run_tool(pool: &SqlitePool, name: &str, arguments: serde_json::Value) -> String {
+        dispatch(
+            pool,
+            &mut FetchBudget::unlimited(),
+            &mut Vec::new(),
+            name,
+            &arguments.to_string(),
+        )
+        .await
+    }
+
     #[tokio::test]
-    async fn suspicious_mail_is_looked_into_before_it_is_highlighted() -> Result<()> {
+    async fn suspicious_mail_is_looked_into_and_phishing_left_out() -> Result<()> {
         let (_tmp, pool) = setup().await?;
         arrive(&pool, 1, 1, 2, "Your loan payment is pending", 2).await?;
         tag(&pool, 1, "transactional", 3, "a payment is pending").await?;
-        // Dated days after it arrived: a forged date.
-        sqlx::query("UPDATE messages SET posted_at = received_at + 5 * 86400 WHERE id = 1")
-            .execute(&pool)
-            .await?;
+        forge(&pool, 1).await?;
+        arrive(&pool, 2, 1, 1, "Dinner on Friday?", 2).await?;
+        tag(&pool, 2, "person", 3, "Ana invites you").await?;
+        forge(&pool, 2).await?;
         let mail = super::super::period_mail(&pool, super::super::since(1)).await?;
         let prompt = prompt(&pool, 1, super::super::since(1), &mail, None, 20_000).await?;
         assert!(prompt.contains("| SUSPICIOUS: "), "{prompt}");
 
-        let pick = || {
-            call(
-                "highlight",
-                json!({"external_id": "<m1@x>", "why": "Flagged as forged, and it is: ignore it"}),
-            )
-        };
-        let mut budget = FetchBudget::unlimited();
-        let mut highlights = Vec::new();
-        let mut challenged = HashSet::new();
-        let OutputItem::FunctionCall { arguments, .. } = pick() else {
-            unreachable!()
-        };
-        let first = dispatch(
-            &pool,
-            &mut budget,
-            &mut highlights,
-            &mut challenged,
-            "highlight",
-            &arguments,
-        )
-        .await;
-        assert!(first.contains("flagged as suspicious"), "{first}");
-        assert!(highlights.is_empty(), "turned back the first time");
-        let second = dispatch(
-            &pool,
-            &mut budget,
-            &mut highlights,
-            &mut challenged,
-            "highlight",
-            &arguments,
-        )
-        .await;
-        assert!(second.contains("highlighted"), "{second}");
+        // Flagged and not looked into: sent back.
+        let pick = |id: &str| json!({"external_id": id, "why": "worth it"});
+        let out = run_tool(&pool, "highlight", pick("<m1@x>")).await;
+        assert!(out.contains("record_suspicion"), "{out}");
 
-        // Every list shows why it looks forged, not only Suspicious.
+        // Judged phishing: never highlighted, out of Worth reading, and the
+        // finding goes with its warning everywhere, chat included.
+        let finding = json!({"external_id": "<m1@x>", "phishing": true,
+                             "finding": "sent from mercadopago-cobranca.top, not mercadopago.com"});
+        run_tool(&pool, "record_suspicion", finding).await;
+        let out = run_tool(&pool, "highlight", pick("<m1@x>")).await;
+        assert!(out.contains("judged phishing"), "{out}");
+        let fetched = run_tool(&pool, "fetch_messages", json!({"external_ids": ["<m1@x>"]})).await;
+        assert!(
+            fetched.contains("likely phishing: sent from mercadopago-cobranca.top"),
+            "{fetched}"
+        );
+
+        // Looked into and genuine: highlighted like any other.
+        let finding = json!({"external_id": "<m2@x>", "phishing": false,
+                             "finding": "Ana's usual address; her phone's clock is off"});
+        run_tool(&pool, "record_suspicion", finding).await;
         let llm = MockLlm::new(vec![
-            mock::turn(vec![pick()]),
-            mock::turn(vec![pick()]),
-            mock::no_tools("A payment notice looks forged."),
+            mock::turn(vec![call("highlight", pick("<m2@x>"))]),
+            mock::no_tools("Ana asked about dinner; see [Answer Ana](A-7)."),
         ]);
         write(&pool, &llm, 1, None, 20_000).await?;
         let day = super::super::load(&pool, 1).await?;
-        assert!(!day.worth_reading[0].warnings.is_empty());
-        assert!(!day.written.unwrap().highlights[0].warnings.is_empty());
+        let worth: Vec<&str> = day
+            .worth_reading
+            .iter()
+            .map(|m| m.subject.as_str())
+            .collect();
+        assert_eq!(worth, ["Dinner on Friday?"]);
+        assert!(
+            day.suspicious
+                .iter()
+                .any(|m| m.warnings.iter().any(|w| w.contains("likely phishing")))
+        );
+        let written = day.written.unwrap();
+        assert_eq!(written.highlights[0].subject, "Dinner on Friday?");
+        assert!(
+            written.highlights[0]
+                .warnings
+                .iter()
+                .any(|w| w.contains("probably genuine"))
+        );
+        assert!(
+            written.summary.contains("[Answer Ana](mnemis://action/7)"),
+            "{}",
+            written.summary
+        );
         Ok(())
     }
 

@@ -64,6 +64,12 @@ struct BriefingView: View {
             }
         }
         .refreshable { await model.sync() }
+        // The summary links to to-dos (`mnemis://action/<id>`).
+        .environment(\.openURL, OpenURLAction { url in
+            guard url.scheme == "mnemis" else { return .systemAction }
+            model.open(url)
+            return .handled
+        })
         .task(id: "\(model.briefingDays)-\(model.mailVersion)-\(model.briefingVersion)") { await load() }
         .sheet(isPresented: $choosingDays) {
             CustomDaysSheet(days: $model.briefingDays)

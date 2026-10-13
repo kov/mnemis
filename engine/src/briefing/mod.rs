@@ -268,9 +268,10 @@ pub async fn load(pool: &SqlitePool, days: i64) -> Result<BriefingDto> {
         ..m.dto()
     };
 
+    let phishing = crate::mail::suspicion::judged_phishing(pool, &ids).await?;
     let mut worth: Vec<&Mail> = mail
         .iter()
-        .filter(|m| m.interest.unwrap_or(0) >= WORTH_READING)
+        .filter(|m| m.interest.unwrap_or(0) >= WORTH_READING && !phishing.contains(&m.id))
         .collect();
     worth.sort_by_key(|m| (-m.interest.unwrap_or(0), -m.received_at));
     let worth_reading = worth

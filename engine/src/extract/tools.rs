@@ -736,6 +736,9 @@ struct FetchedMessage {
     author: Option<String>,
     subject: Option<String>,
     body: String,
+    /// Why it looks forged (`mail::suspicion`), when it does.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suspicious: Vec<String>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -781,28 +784,35 @@ async fn fetch_messages(
     };
 
     for ext_id in &args.external_ids {
-        let row: Option<(String, i64, Option<String>, Option<String>, String)> = sqlx::query_as(
-            "SELECT m.external_id, m.posted_at, p.display_name, m.subject, m.body \
+        #[allow(clippy::type_complexity)]
+        let row: Option<(i64, String, i64, Option<String>, Option<String>, String)> =
+            sqlx::query_as(
+                "SELECT m.id, m.external_id, m.posted_at, p.display_name, m.subject, m.body \
              FROM messages m \
              LEFT JOIN people p ON p.id = m.author_id \
              JOIN channels c ON c.id = m.channel_id \
              WHERE m.external_id = ? AND (? IS NULL OR c.source_id = ?) \
              ORDER BY m.has_body DESC LIMIT 1",
-        )
-        .bind(ext_id)
-        .bind(filter)
-        .bind(filter)
-        .fetch_optional(pool)
-        .await
-        .context("fetch_messages lookup failed")?;
+            )
+            .bind(ext_id)
+            .bind(filter)
+            .bind(filter)
+            .fetch_optional(pool)
+            .await
+            .context("fetch_messages lookup failed")?;
 
         match row {
             None => not_found.push(ext_id.clone()),
-            Some((external_id, posted_at, author, subject, body)) => {
+            Some((id, external_id, posted_at, author, subject, body)) => {
                 if !budget.try_charge(body.len()) {
                     over_budget.push(ext_id.clone());
                     continue;
                 }
+                let own = crate::mail::own_addresses(pool).await?;
+                let suspicious = crate::mail::suspicion::for_messages(pool, &[id], &own)
+                    .await?
+                    .remove(&id)
+                    .unwrap_or_default();
                 messages.push(FetchedMessage {
                     external_id,
                     posted_at: DateTime::<Utc>::from_timestamp(posted_at, 0)
@@ -811,6 +821,7 @@ async fn fetch_messages(
                     author,
                     subject,
                     body,
+                    suspicious,
                 });
             }
         }

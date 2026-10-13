@@ -4,6 +4,10 @@
 //! links whose text shows one site and lead to another, and a first email
 //! from a domain under a name that has nothing to do with it. The last two
 //! are weak alone: tracked newsletters and new correspondents trip them.
+//!
+//! The briefing agent looks further into flagged mail and records what it
+//! concluded ([`save_finding`]); that finding joins the email's reasons, and
+//! a phishing verdict flags an email the checks above missed.
 
 use std::collections::HashMap;
 
@@ -239,7 +243,46 @@ pub async fn reasons(pool: &SqlitePool, facts: &Facts<'_>) -> Result<Vec<String>
     Ok(out)
 }
 
-/// [`reasons`] for each of `ids` that has any; the user's own mail has none.
+/// Record what looking into email `external_id` showed: whether it is
+/// phishing, and the evidence.
+pub async fn save_finding(
+    pool: &SqlitePool,
+    external_id: &str,
+    phishing: bool,
+    finding: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO suspicion_findings (external_id, phishing, finding, created_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(external_id)
+    .bind(phishing)
+    .bind(finding.trim())
+    .bind(chrono::Utc::now().timestamp())
+    .execute(pool)
+    .await
+    .context("saving a suspicion finding")?;
+    Ok(())
+}
+
+/// Which of `ids` were judged phishing after a closer look.
+pub async fn judged_phishing(
+    pool: &SqlitePool,
+    ids: &[i64],
+) -> Result<std::collections::HashSet<i64>> {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT m.id FROM messages m JOIN suspicion_findings f ON f.external_id = m.external_id \
+         WHERE f.phishing = 1 AND m.id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(serde_json::to_string(ids)?)
+    .fetch_all(pool)
+    .await
+    .context("loading phishing verdicts")?;
+    Ok(rows.into_iter().collect())
+}
+
+/// [`reasons`] for each of `ids` that has any, with the finding of a closer
+/// look when there was one; the user's own mail has none.
 pub async fn for_messages(
     pool: &SqlitePool,
     ids: &[i64],
@@ -254,10 +297,13 @@ pub async fn for_messages(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<bool>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT m.id, m.posted_at, m.received_at, m.auth_json, m.links_json, \
-                p.external_id, p.display_name \
+                p.external_id, p.display_name, f.phishing, f.finding \
          FROM messages m LEFT JOIN people p ON p.id = m.author_id \
+         LEFT JOIN suspicion_findings f ON f.external_id = m.external_id \
          WHERE m.id IN (SELECT value FROM json_each(?))",
     )
     .bind(serde_json::to_string(ids)?)
@@ -265,7 +311,7 @@ pub async fn for_messages(
     .await
     .context("loading what tells forged mail")?;
     let mut out = HashMap::new();
-    for (id, posted_at, received_at, auth, links, address, name) in rows {
+    for (id, posted_at, received_at, auth, links, address, name, phishing, finding) in rows {
         if address
             .as_deref()
             .is_some_and(|a| own.contains(&a.to_lowercase()))
@@ -288,6 +334,16 @@ pub async fn for_messages(
             },
         )
         .await?;
+        let mut found = found;
+        if let (Some(phishing), Some(finding)) = (phishing, finding)
+            && (phishing || !found.is_empty())
+        {
+            found.push(if phishing {
+                format!("looked into, likely phishing: {finding}")
+            } else {
+                format!("looked into, probably genuine: {finding}")
+            });
+        }
         if !found.is_empty() {
             out.insert(id, found);
         }
