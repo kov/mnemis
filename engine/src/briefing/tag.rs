@@ -36,7 +36,9 @@ what the user cares about (below), whether a real person wrote to them, whether 
 they are waiting for it, and whether it changes something for them (money, \
 dates, accounts, people they know).\n\
 reason: a few words saying what it is and why it matters, written for the user \
-(\"Ana asks to move Friday's dinner\", \"weekly deals, nothing you follow\").";
+(\"Ana asks to move Friday's dinner\", \"weekly deals, nothing you follow\").\n\
+An email marked SUSPICIOUS failed checks that point to phishing: don't rate it \
+by what it claims, and start its reason with \"possible phishing\".";
 
 /// Describe the mail that arrived lately and has no description yet. Returns
 /// how many emails were described.
@@ -60,14 +62,20 @@ pub async fn tag_new_mail(
     for batch in untagged.chunks(per_batch) {
         let mut prompt = context.clone();
         prompt.push_str("\n# New emails\n");
+        let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
+        let warnings = super::warnings(pool, &ids).await?;
         for (i, m) in batch.iter().enumerate() {
             prompt.push_str(&format!(
-                "E-{}: from {} — {} — {}\n",
+                "E-{}: from {} — {} — {}",
                 i + 1,
                 m.from,
                 m.subject,
                 opening(pool, m.id).await?
             ));
+            if let Some(w) = warnings.get(&m.id) {
+                prompt.push_str(&format!(" — SUSPICIOUS: {}", w.join("; ")));
+            }
+            prompt.push('\n');
         }
         let history = vec![InputItem::Message {
             role: Role::User,

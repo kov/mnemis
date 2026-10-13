@@ -354,10 +354,14 @@ private struct MailRow: View {
                     .lineLimit(3)
             }
             if !mail.warnings.isEmpty {
-                Text(mail.warnings.joined(separator: "; "))
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
-                    .lineLimit(3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Badge(text: "Suspicious", systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                    Text(mail.warnings.joined(separator: "; "))
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .lineLimit(3)
+                }
+                .padding(.top, 2)
             }
         }
         .padding(.vertical, 2)

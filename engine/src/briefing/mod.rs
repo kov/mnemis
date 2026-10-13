@@ -186,6 +186,27 @@ pub(crate) async fn period_mail(pool: &SqlitePool, since: i64) -> Result<Vec<Mai
     Ok(out)
 }
 
+/// Why each of `ids` looks forged, for those that do (see
+/// `mail::suspicion`).
+pub(crate) async fn warnings(pool: &SqlitePool, ids: &[i64]) -> Result<HashMap<i64, Vec<String>>> {
+    let own = crate::mail::own_addresses(pool).await?;
+    crate::mail::suspicion::for_messages(pool, ids, &own).await
+}
+
+impl Mail {
+    /// The email for a list, with why it looks forged when it does: every
+    /// list shows that, not only the suspicious one.
+    async fn dto_with_warnings(&self, pool: &SqlitePool) -> Result<BriefingMailDto> {
+        Ok(BriefingMailDto {
+            warnings: warnings(pool, &[self.id])
+                .await?
+                .remove(&self.id)
+                .unwrap_or_default(),
+            ..self.dto()
+        })
+    }
+}
+
 /// The email with Message-ID `external_id`, wherever it is filed.
 pub(crate) async fn mail_by_external_id(
     pool: &SqlitePool,
@@ -240,26 +261,28 @@ pub async fn load(pool: &SqlitePool, days: i64) -> Result<BriefingDto> {
         .collect();
     accounts.sort_by(|a, b| b.count.cmp(&a.count).then(a.account.cmp(&b.account)));
 
+    let ids: Vec<i64> = mail.iter().map(|m| m.id).collect();
+    let warnings = warnings(pool, &ids).await?;
+    let with_warnings = |m: &Mail| BriefingMailDto {
+        warnings: warnings.get(&m.id).cloned().unwrap_or_default(),
+        ..m.dto()
+    };
+
     let mut worth: Vec<&Mail> = mail
         .iter()
         .filter(|m| m.interest.unwrap_or(0) >= WORTH_READING)
         .collect();
     worth.sort_by_key(|m| (-m.interest.unwrap_or(0), -m.received_at));
-    let worth_reading = worth.into_iter().take(LIST_LIMIT).map(Mail::dto).collect();
-
-    let ids: Vec<i64> = mail.iter().map(|m| m.id).collect();
-    let own = crate::mail::own_addresses(pool).await?;
-    let mut warnings = crate::mail::suspicion::for_messages(pool, &ids, &own).await?;
+    let worth_reading = worth
+        .into_iter()
+        .take(LIST_LIMIT)
+        .map(with_warnings)
+        .collect();
     let suspicious = mail
         .iter()
-        .filter_map(|m| {
-            let w = warnings.remove(&m.id)?;
-            Some(BriefingMailDto {
-                warnings: w,
-                ..m.dto()
-            })
-        })
+        .filter(|m| warnings.contains_key(&m.id))
         .take(LIST_LIMIT)
+        .map(with_warnings)
         .collect();
 
     Ok(BriefingDto {
@@ -309,7 +332,10 @@ async fn watches(pool: &SqlitePool, since: i64) -> Result<Vec<BriefingWatchDto>>
     .context("listing matched watches")?;
     for (watch_id, looking_for, message_id) in matched {
         let matched = match message_id {
-            Some(id) => mail_by_id(pool, id).await?.map(|m| m.dto()),
+            Some(id) => match mail_by_id(pool, id).await? {
+                Some(m) => Some(m.dto_with_warnings(pool).await?),
+                None => None,
+            },
             None => None,
         };
         out.push(BriefingWatchDto {
