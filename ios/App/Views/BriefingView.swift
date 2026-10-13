@@ -30,7 +30,6 @@ struct BriefingView: View {
             }
             if let briefing {
                 SummarySection(briefing: briefing)
-                OverviewSection(briefing: briefing)
                 if !briefing.worthReading.isEmpty {
                     Section("Worth reading") {
                         ForEach(briefing.worthReading, id: \.messageId) { MailLink(mail: $0) }
@@ -49,6 +48,7 @@ struct BriefingView: View {
                         ForEach(briefing.suspicious, id: \.messageId) { MailLink(mail: $0) }
                     }
                 }
+                OverviewSection(briefing: briefing)
             }
         }
         .overlay {

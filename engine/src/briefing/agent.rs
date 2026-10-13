@@ -46,9 +46,10 @@ order or a process, a change from what was said before. Call highlight for \
 each email the user should read, most important first, at most 8, with one \
 sentence saying why. Don't highlight what is already a to-do unless there is \
 more to it, and don't create or change to-dos.\n\n\
-Then answer with the briefing itself: three to six short sentences or bullets \
-on what came in and what matters, by theme rather than email by email, \
-without repeating the highlights word for word. No greeting, no headings. \
+Then answer with the briefing itself: one to three short paragraphs of plain \
+prose on what came in and what matters, by theme rather than email by email, \
+without repeating the highlights word for word. No bullet points or lists, no \
+greeting, no headings. \
 Write in the language of the user's notes, English if there are none.";
 
 #[derive(Serialize, Deserialize)]
