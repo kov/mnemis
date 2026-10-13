@@ -137,14 +137,8 @@ private struct CompactLayout: View {
                 }
             }
             .badge(model.inboxUnread)
-            Tab(value: AppTab.settings) {
+            Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 NavigationStack { SettingsView() }
-            } label: {
-                Label {
-                    Text("Settings")
-                } icon: {
-                    ProfileIcon()
-                }
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
@@ -197,38 +191,6 @@ private struct ChatsStack: View {
                         .toolbar(.hidden, for: .tabBar)
                 }
         }
-    }
-}
-
-/// The tab bar's profile icon: the user's initials in a ring, or a gear
-/// until they give their name. Drawn as an image, as the tab bar shows only
-/// images there.
-private struct ProfileIcon: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        if model.initials.isEmpty {
-            Image(systemName: "gearshape")
-        } else {
-            Image(uiImage: Self.ring(model.initials))
-        }
-    }
-
-    private static func ring(_ initials: String) -> UIImage {
-        let size = CGSize(width: 28, height: 28)
-        let image = UIGraphicsImageRenderer(size: size).image { _ in
-            let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
-            let ring = UIBezierPath(ovalIn: bounds)
-            ring.lineWidth = 1.5
-            UIColor.black.setStroke()
-            ring.stroke()
-            let font = UIFont.systemFont(ofSize: initials.count > 1 ? 11 : 13, weight: .bold)
-            let text = NSAttributedString(string: initials, attributes: [.font: font, .foregroundColor: UIColor.black])
-            let textSize = text.size()
-            text.draw(at: CGPoint(x: (size.width - textSize.width) / 2, y: (size.height - textSize.height) / 2))
-        }
-        // Tinted like the other tabs' icons, selected or not.
-        return image.withRenderingMode(.alwaysTemplate)
     }
 }
 
