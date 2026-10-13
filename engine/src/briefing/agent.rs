@@ -38,7 +38,8 @@ static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SYSTEM: &str = "You write the user's mail briefing: what came in over a \
 period and what of it they should read. You are given the period's emails, \
 already sorted (category, interest 0 noise to 3 important, a reason), the \
-to-dos found in them and the emails the user is waiting for.\n\n\
+to-dos found in them, the open to-dos with dates and the emails the user is \
+waiting for.\n\n\
 Look into what deserves it before you write: read emails with fetch_messages \
 when the sender and subject aren't enough, and use search_messages (or \
 search_mail_server for mail older than the last 90 days) to find what an email \
@@ -49,8 +50,10 @@ sentence saying why. Don't highlight what is already a to-do unless there is \
 more to it, and don't create or change to-dos.\n\n\
 Then answer with the briefing itself: one to three short paragraphs of plain \
 prose on what came in and what matters, by theme rather than email by email, \
-without repeating the highlights word for word. No bullet points or lists, no \
-greeting, no headings. \
+without repeating the highlights word for word. When to-dos are overdue or \
+due in the next two days, say so first, naming each and its date. No bullet \
+points or lists, no greeting, no headings. When the user adds instructions \
+for this briefing, follow them. \
 Write in the language of the user's notes, English if there are none.";
 
 #[derive(Serialize, Deserialize)]
@@ -59,11 +62,13 @@ struct Highlight {
     why: String,
 }
 
-/// Write the briefing for the last `days` days and store it.
+/// Write the briefing for the last `days` days and store it. `instructions`
+/// are the user's, for this one (what to look at, what to leave out).
 pub async fn write(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
     days: i64,
+    instructions: Option<&str>,
     char_budget: usize,
 ) -> Result<()> {
     let _one_at_a_time = LOCK.lock().await;
@@ -74,7 +79,7 @@ pub async fn write(
 
     let mut history = vec![InputItem::Message {
         role: Role::User,
-        content: prompt(pool, days, since, &mail, char_budget / 2).await?,
+        content: prompt(pool, days, since, &mail, instructions, char_budget / 2).await?,
     }];
     let defs = definitions();
     let mut budget = FetchBudget::new(char_budget / 2);
@@ -153,7 +158,7 @@ pub async fn refresh_if_stale(
     if !mail.iter().any(|m| m.id > up_to) {
         return Ok(false);
     }
-    write(pool, llm, days, char_budget).await?;
+    write(pool, llm, days, None, char_budget).await?;
     Ok(true)
 }
 
@@ -256,6 +261,7 @@ async fn prompt(
     days: i64,
     since: i64,
     mail: &[Mail],
+    instructions: Option<&str>,
     char_budget: usize,
 ) -> Result<String> {
     let mut out = format!(
@@ -287,6 +293,16 @@ async fn prompt(
         for t in todos {
             out.push_str(&format!("- A-{}: {}\n", t.action_id, t.title));
         }
+    }
+    let dated = dated_todos(pool).await?;
+    if !dated.is_empty() {
+        out.push_str("\n# Open to-dos with dates, soonest first\n");
+        out.push_str(&dated);
+    }
+    if let Some(i) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
+        out.push_str(&format!(
+            "\n# The user's instructions for this briefing\n{i}\n"
+        ));
     }
 
     let mut ordered: Vec<&Mail> = mail.iter().collect();
@@ -322,6 +338,39 @@ async fn prompt(
         out.push_str(&format!(
             "Not listed (noise, or past the space): {}. list_messages finds them.\n",
             counts.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+/// The open to-dos with a due date, one line each, saying how far off it is.
+async fn dated_todos(pool: &SqlitePool) -> Result<String> {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT id, title, due_at FROM actions \
+         WHERE due_at IS NOT NULL AND status IN ('pending', 'auto_claimed', 'claimed') \
+         ORDER BY due_at LIMIT 30",
+    )
+    .fetch_all(pool)
+    .await
+    .context("listing dated to-dos")?;
+    let today = Local::now().date_naive();
+    let mut out = String::new();
+    for (id, title, due_at) in rows {
+        // The day is stored as midnight UTC of the date.
+        let Some(due) = chrono::DateTime::<Utc>::from_timestamp(due_at, 0) else {
+            continue;
+        };
+        let due = due.date_naive();
+        let when = match (due - today).num_days() {
+            n if n < -1 => format!("overdue by {} days", -n),
+            -1 => "overdue since yesterday".to_string(),
+            0 => "due today".to_string(),
+            1 => "due tomorrow".to_string(),
+            n => format!("due in {n} days"),
+        };
+        out.push_str(&format!(
+            "- A-{id}: {title} — {} ({when})\n",
+            due.format("%a %Y-%m-%d")
         ));
     }
     Ok(out)
@@ -447,7 +496,7 @@ mod tests {
             ]),
             mock::no_tools("Ana invited you to dinner on Friday; the rest was a sale."),
         ]);
-        write(&pool, &llm, 1, 20_000).await?;
+        write(&pool, &llm, 1, None, 20_000).await?;
 
         let day = super::super::load(&pool, 1).await?;
         let b = day.written.expect("stored");
@@ -489,6 +538,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_agent_sees_due_to_dos_and_the_users_instructions() -> Result<()> {
+        let (_tmp, pool) = setup().await?;
+        // Due days are stored as midnight UTC of the date.
+        let day = |offset: i64| {
+            let date = Local::now().date_naive() + chrono::Duration::days(offset);
+            date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()
+        };
+        for (id, title, status, due) in [
+            (1, "Pay the plumber", "claimed", day(-3)),
+            (2, "Send the form", "pending", day(0)),
+            (3, "Book flights", "pending", day(1)),
+            (4, "Already done", "done", day(-1)),
+        ] {
+            sqlx::query(
+                "INSERT INTO actions (id, title, confidence, status, extracted_at, due_at) \
+                 VALUES (?, ?, 'high', ?, 0, ?)",
+            )
+            .bind(id)
+            .bind(title)
+            .bind(status)
+            .bind(due)
+            .execute(&pool)
+            .await?;
+        }
+        let since = super::super::since(1);
+        let prompt = prompt(&pool, 1, since, &[], Some("Skip the newsletters"), 20_000).await?;
+        assert!(prompt.contains("Pay the plumber"), "{prompt}");
+        assert!(prompt.contains("(overdue by 3 days)"), "{prompt}");
+        assert!(prompt.contains("Send the form"), "{prompt}");
+        assert!(prompt.contains("(due today)"), "{prompt}");
+        assert!(prompt.contains("(due tomorrow)"), "{prompt}");
+        assert!(!prompt.contains("Already done"), "{prompt}");
+        assert!(prompt.contains("Skip the newsletters"), "{prompt}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_chat_about_the_briefing_knows_it() -> Result<()> {
         let (_tmp, pool) = setup().await?;
         arrive(&pool, 1, 1, 1, "Dinner on Friday?", 2).await?;
@@ -499,7 +585,7 @@ mod tests {
             )]),
             mock::no_tools("Ana invited you to dinner."),
         ]);
-        write(&pool, &llm, 3, 20_000).await?;
+        write(&pool, &llm, 3, None, 20_000).await?;
         let chat = start_chat(&pool, 3).await?;
         let prompt = crate::chat::prompt::build_system_prompt(&pool, chat).await?;
         assert!(prompt.contains("last 3 days"), "{prompt}");

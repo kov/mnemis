@@ -142,6 +142,7 @@ private struct CustomDaysSheet: View {
 private struct SummarySection: View {
     @Environment(AppModel.self) private var model
     let briefing: BriefingDto
+    @State private var askingInstructions = false
 
     private var writing: Bool { model.writingBriefing.contains(briefing.days) }
 
@@ -162,9 +163,16 @@ private struct SummarySection: View {
                     .symbolEffect(.pulse)
             } else {
                 Button(briefing.written == nil ? "Write a summary" : "Write it again", systemImage: "sparkles") {
-                    Task { await model.writeBriefing(days: briefing.days) }
+                    if briefing.written == nil {
+                        Task { await model.writeBriefing(days: briefing.days) }
+                    } else {
+                        askingInstructions = true
+                    }
                 }
                 .disabled(model.engine == nil || briefing.received == 0)
+                .sheet(isPresented: $askingInstructions) {
+                    RewriteSheet(days: briefing.days)
+                }
             }
         } header: {
             Text("Summary")
@@ -183,6 +191,46 @@ private struct SummarySection: View {
             markdown: text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(text)
+    }
+}
+
+/// What to consider when writing the summary again; optional.
+private struct RewriteSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let days: Int64
+    @State private var instructions = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField(
+                        "e.g. focus on work mail, skip the shopping",
+                        text: $instructions,
+                        axis: .vertical
+                    )
+                    .lineLimit(3...8)
+                } footer: {
+                    Text("Anything to consider this time. Leave it empty to just write it again.")
+                }
+            }
+            .navigationTitle("Write it again")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Write") {
+                        let text = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+                        Task { await model.writeBriefing(days: days, instructions: text.isEmpty ? nil : text) }
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium])
     }
 }
 

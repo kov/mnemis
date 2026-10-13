@@ -609,15 +609,25 @@ impl Engine {
     }
 
     /// Have the agent write the summary for the last `days` days (it can
-    /// take minutes).
-    pub async fn write_briefing(&self, days: i64) -> Result<(), MnemisError> {
+    /// take minutes), following the user's `instructions` for this one.
+    pub async fn write_briefing(
+        &self,
+        days: i64,
+        instructions: Option<String>,
+    ) -> Result<(), MnemisError> {
         let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
             message: "No LLM configured. Choose one in Settings.".into(),
         })?;
         let pool = self.pool.clone();
         run(async move {
-            mnemis_engine::briefing::agent::write(&pool, &stack.llm, days, stack.window_char_budget)
-                .await
+            mnemis_engine::briefing::agent::write(
+                &pool,
+                &stack.llm,
+                days,
+                instructions.as_deref(),
+                stack.window_char_budget,
+            )
+            .await
         })
         .await
     }

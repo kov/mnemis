@@ -503,15 +503,16 @@ final class AppModel {
         }
     }
 
-    /// Have the agent write the summary for the last `days` days.
-    func writeBriefing(days: Int64) async {
+    /// Have the agent write the summary for the last `days` days, following
+    /// the user's `instructions` for this one.
+    func writeBriefing(days: Int64, instructions: String? = nil) async {
         guard let engine, !writingBriefing.contains(days) else { return }
         writingBriefing.insert(days)
         defer { writingBriefing.remove(days) }
         let finishing = FinishInBackground("writing the briefing")
         defer { finishing.end() }
         do {
-            try await engine.writeBriefing(days: days)
+            try await engine.writeBriefing(days: days, instructions: instructions)
         } catch {
             report(error)
         }
@@ -693,6 +694,28 @@ final class AppModel {
 
     /// Open to-dos, without warnings.
     var todos: [ActionDto] { actions.filter { $0.status != .suspicious } }
+
+    /// Open to-dos whose day has passed, most overdue first.
+    var overdue: [ActionDto] {
+        let today = ReminderTime.day(ofLocal: Date())
+        return todos.filter { ($0.dueAt ?? today) < today }.sorted { ($0.dueAt ?? 0) < ($1.dueAt ?? 0) }
+    }
+
+    /// Open to-dos not overdue.
+    var current: [ActionDto] {
+        let today = ReminderTime.day(ofLocal: Date())
+        return todos.filter { ($0.dueAt ?? today) >= today }
+    }
+
+    /// Move `action` to `days` from today, keeping its reminder time.
+    func postpone(_ action: ActionDto, days: Int) async {
+        let date = Calendar.current.date(byAdding: .day, value: days, to: Date()) ?? Date()
+        await setReminder(
+            action,
+            day: ReminderTime.day(ofLocal: date),
+            minutes: action.remindMinutes ?? ReminderTime.defaultMinutes
+        )
+    }
 
     /// Messages from impostor-looking senders, held back as warnings.
     var warnings: [ActionDto] { actions.filter { $0.status == .suspicious } }

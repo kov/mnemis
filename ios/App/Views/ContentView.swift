@@ -299,8 +299,20 @@ struct ActionListView: View {
                     Text("Suspicious emails")
                 }
             }
+            if !model.overdue.isEmpty {
+                Section {
+                    ForEach(model.overdue, id: \.id) { action in
+                        OverdueRow(action: action)
+                            .tag(action.id)
+                            .listRowBackground(Color.red.opacity(0.08))
+                    }
+                } header: {
+                    Label("Overdue", systemImage: "exclamationmark.circle.fill")
+                        .foregroundStyle(.red)
+                }
+            }
             Section {
-                ForEach(model.todos, id: \.id) { action in
+                ForEach(model.current, id: \.id) { action in
                     ActionRow(action: action)
                         .tag(action.id)
                         .swipeActions(edge: .leading) {
@@ -317,7 +329,7 @@ struct ActionListView: View {
                         }
                 }
             } header: {
-                if !model.warnings.isEmpty && !model.todos.isEmpty {
+                if (!model.warnings.isEmpty || !model.overdue.isEmpty) && !model.current.isEmpty {
                     Text("To-dos")
                 }
             }
@@ -359,6 +371,34 @@ struct ActionRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// An overdue to-do, with Done and Postpone at hand.
+struct OverdueRow: View {
+    @Environment(AppModel.self) private var model
+    let action: ActionDto
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ActionRow(action: action)
+            HStack(spacing: 10) {
+                Button("Done", systemImage: "checkmark") {
+                    Task { await model.setStatus(action, to: .done) }
+                }
+                .tint(.green)
+                Menu {
+                    Button("Tomorrow") { Task { await model.postpone(action, days: 1) } }
+                    Button("In 3 days") { Task { await model.postpone(action, days: 3) } }
+                    Button("Next week") { Task { await model.postpone(action, days: 7) } }
+                } label: {
+                    Label("Postpone", systemImage: "calendar.badge.clock")
+                }
+                .tint(.orange)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
     }
 }
 
