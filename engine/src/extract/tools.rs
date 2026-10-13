@@ -359,6 +359,19 @@ pub fn chat_definitions() -> Vec<ToolDef> {
             }),
         ),
         ToolDef::function(
+            "set_interests".to_string(),
+            "Save what the user wants to hear about in their mail, and what they don't. Their \
+             briefing judges new mail by it. Send the complete note: the current one (in your \
+             instructions) with the change made, one point per line starting with \"- \"; \
+             an empty note clears it."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": { "interests": { "type": "string" } },
+                "required": ["interests"]
+            }),
+        ),
+        ToolDef::function(
             "search_conversation".to_string(),
             "Keyword search THIS conversation's own earlier turns — use it when the summary at \
              the top of the conversation isn't specific enough and you need to recall what was \

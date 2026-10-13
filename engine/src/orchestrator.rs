@@ -108,6 +108,14 @@ pub async fn find_to_dos(
         out.errors.extend(counts.errors);
     }
 
+    // Describe the new mail for the briefing, then rewrite the last day's
+    // summary if it is stale. Best-effort, like the expected-mail check.
+    let briefing: Erased<'_, ()> = Box::pin(update_briefing(pool, llm, window_char_budget));
+    if let Err(e) = briefing.await {
+        warn!(error = %format!("{e:#}"), "updating the briefing failed");
+        out.errors.push(format!("briefing: {e:#}"));
+    }
+
     // Final embed pass picks up actions/notes enqueued during this cycle.
     match drain_once(pool, embedder.as_ref()).await {
         Ok(n) => out.embeddings_drained += n as i64,
@@ -166,6 +174,28 @@ async fn check_expected_mail(
         );
     }
     Ok(recorded)
+}
+
+/// Tag the new mail (see `briefing::tag`), then refresh the last day's
+/// written briefing when it is stale.
+async fn update_briefing(
+    pool: &SqlitePool,
+    llm: &dyn LlmTransport,
+    window_char_budget: usize,
+) -> Result<()> {
+    use crate::briefing::{agent, tag};
+    let started = Instant::now();
+    let tagged = tag::tag_new_mail(pool, llm, window_char_budget).await?;
+    let rewritten = agent::refresh_if_stale(pool, llm, window_char_budget).await?;
+    if tagged > 0 || rewritten {
+        info!(
+            tagged,
+            rewritten,
+            secs = started.elapsed().as_secs(),
+            "briefing updated"
+        );
+    }
+    Ok(())
 }
 
 /// Only one [`find_to_dos`] per database at a time: two would extract the

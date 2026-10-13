@@ -20,6 +20,8 @@ pub struct RenderInputs {
     pub memory_rules: Option<String>,
     /// The open watches on incoming mail, one line each.
     pub watches: Vec<String>,
+    /// What the user wants to hear about in their mail (`crate::memory`).
+    pub interests: Option<String>,
 }
 
 /// Assemble the system prompt from already-gathered parts (no I/O).
@@ -48,7 +50,11 @@ pub fn render(inputs: &RenderInputs) -> String {
          When the user wants you to wait for, keep an eye out for or react to an email that \
          hasn't arrived yet, save a watch with watch_for_mail: new mail is checked against it \
          as it syncs, and the instruction is carried out when it arrives. Say you're watching \
-         for it; don't create the to-do ahead of time unless the user wants it now.\n\n",
+         for it; don't create the to-do ahead of time unless the user wants it now.\n\n\
+         When the user says what they want to hear about in their mail, or what they \
+         don't (\"tell me about anything from my bank\", \"I don't care about \
+         newsletters\"), save it with set_interests: their briefing judges new mail by \
+         it.\n\n",
     );
 
     out.push_str("# You are helping\n");
@@ -68,6 +74,15 @@ pub fn render(inputs: &RenderInputs) -> String {
         );
         out.push_str(rules.trim());
         out.push('\n');
+    }
+
+    out.push_str("\n# What they want to hear about in their mail\n");
+    match inputs.interests.as_deref() {
+        Some(interests) => {
+            out.push_str(interests.trim());
+            out.push('\n');
+        }
+        None => out.push_str("(nothing saved yet)\n"),
     }
 
     if !inputs.watches.is_empty() {
@@ -102,6 +117,7 @@ pub async fn build_system_prompt(pool: &SqlitePool, chat_id: i64) -> Result<Stri
 
     let seed = load_seed(pool, chat_id).await?;
     let memory_rules = crate::memory::rules(pool).await?;
+    let interests = crate::memory::interests(pool).await?;
     let watches = crate::extract::expected::open(pool)
         .await?
         .into_iter()
@@ -125,6 +141,7 @@ pub async fn build_system_prompt(pool: &SqlitePool, chat_id: i64) -> Result<Stri
         seed,
         memory_rules,
         watches,
+        interests,
     }))
 }
 
@@ -167,6 +184,11 @@ pub async fn seed_label(pool: &SqlitePool, chat_id: i64) -> Result<Option<String
                 format!("message from {who} \u{00b7} \u{201c}{subj}\u{201d}")
             }))
         }
+        "briefing" => Ok(Some(if id == 1 {
+            "mail \u{00b7} the last day".to_string()
+        } else {
+            format!("mail \u{00b7} the last {id} days")
+        })),
         _ => Ok(None),
     }
 }
@@ -187,6 +209,7 @@ async fn load_seed(pool: &SqlitePool, chat_id: i64) -> Result<Option<String>> {
     match kind.as_str() {
         "action" => seed_for_action(pool, id).await,
         "message" => seed_for_message(pool, id).await,
+        "briefing" => crate::briefing::agent::seed(pool, id).await,
         _ => Ok(None),
     }
 }
@@ -276,6 +299,7 @@ mod tests {
             seed: Some("This conversation is about action A-42.".to_string()),
             memory_rules: Some("- Newsletters are never action items".to_string()),
             watches: vec![],
+            interests: None,
         });
         assert!(p.contains("mnemis's assistant"));
         assert!(p.contains("high confidence so the change applies immediately"));
@@ -296,6 +320,7 @@ mod tests {
             seed: None,
             memory_rules: None,
             watches: vec![],
+            interests: None,
         });
         assert!(!p.contains("What they told you"));
         assert!(!p.contains("# This conversation"));

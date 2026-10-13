@@ -647,6 +647,135 @@ pub struct MailboxDto {
     pub unread: i64,
 }
 
+/// What kind of mail an email is, as the briefing sorts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailCategory {
+    /// A person writing to the user.
+    Person,
+    Newsletter,
+    /// Automated alerts, service and social notifications.
+    Notification,
+    /// Receipts, bills, orders, bookings, codes.
+    Transactional,
+    /// Mailing-list discussion.
+    List,
+    Other,
+}
+
+impl MailCategory {
+    pub const ALL: [Self; 6] = [
+        Self::Person,
+        Self::Newsletter,
+        Self::Notification,
+        Self::Transactional,
+        Self::List,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Newsletter => "newsletter",
+            Self::Notification => "notification",
+            Self::Transactional => "transactional",
+            Self::List => "list",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
+/// The briefing for the last `days` days.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingDto {
+    pub days: i64,
+    /// Unix seconds the period starts at; it ends now.
+    pub since: i64,
+    /// Emails received (a copy in a second folder counts once).
+    pub received: i64,
+    pub unread: i64,
+    /// How many of each category, most first; emails not described yet are
+    /// left out (see `untagged`).
+    pub categories: Vec<CategoryCountDto>,
+    pub untagged: i64,
+    /// Emails per account, most first.
+    pub accounts: Vec<AccountCountDto>,
+    /// The emails most worth reading, most important first.
+    pub worth_reading: Vec<BriefingMailDto>,
+    /// Open watches, then the ones that matched in the period.
+    pub watches: Vec<BriefingWatchDto>,
+    /// Open to-dos that came from the period's mail.
+    pub new_todos: Vec<BriefingTodoDto>,
+    /// To-dos resolved in the period.
+    pub resolved_todos: i64,
+    pub suspicious: Vec<BriefingMailDto>,
+    /// What the agent wrote about the period, once it has.
+    pub written: Option<WrittenBriefingDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryCountDto {
+    pub category: MailCategory,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountCountDto {
+    pub account: String,
+    pub count: i64,
+}
+
+/// An email as the briefing lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingMailDto {
+    pub message_id: i64,
+    pub thread_id: Option<i64>,
+    pub from: String,
+    pub subject: String,
+    pub received_at: i64,
+    pub unread: bool,
+    pub category: Option<MailCategory>,
+    /// 0 noise, 1 skim, 2 worth reading, 3 important.
+    pub interest: Option<i64>,
+    /// Why it matters, from tagging or the briefing.
+    pub reason: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingWatchDto {
+    pub watch_id: i64,
+    pub looking_for: String,
+    /// False once it matched.
+    pub open: bool,
+    pub expires_at: Option<i64>,
+    /// The email it matched, when it did.
+    pub matched: Option<BriefingMailDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefingTodoDto {
+    pub action_id: i64,
+    pub title: String,
+    pub due_at: Option<i64>,
+}
+
+/// What the briefing agent wrote about a period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrittenBriefingDto {
+    pub generated_at: i64,
+    pub summary: String,
+    /// The emails it says to read, most important first.
+    pub highlights: Vec<BriefingMailDto>,
+    /// Emails in the period that arrived after it was written.
+    pub newer_mail: i64,
+}
+
 /// Which threads a list shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

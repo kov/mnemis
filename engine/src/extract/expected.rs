@@ -460,7 +460,8 @@ async fn note(pool: &SqlitePool, chat_id: i64, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn text(response: &ResponsesResponse) -> String {
+/// The text of a reply, tool calls left out.
+pub(crate) fn text(response: &ResponsesResponse) -> String {
     let mut out = String::new();
     for item in &response.output {
         if let OutputItem::Message { content } = item {

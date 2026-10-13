@@ -81,6 +81,13 @@ pub(crate) async fn dispatch(
             },
             recorded_action: false,
         },
+        "set_interests" => DispatchOutput {
+            output: match set_interests(pool, arguments).await {
+                Ok(json) => json,
+                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+            },
+            recorded_action: false,
+        },
         _ => tools::dispatch(pool, ToolScope::Global, fetch_budget, name, arguments).await,
     }
 }
@@ -138,6 +145,20 @@ async fn watch_tool(
 }
 
 #[derive(Deserialize)]
+struct SetInterestsArgs {
+    interests: String,
+}
+
+/// Replace the interests note the briefing judges mail by.
+async fn set_interests(pool: &SqlitePool, arguments: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let args: SetInterestsArgs =
+        serde_json::from_str(arguments).context("parsing set_interests args")?;
+    crate::memory::save_interests(pool, &args.interests).await?;
+    Ok(json!({ "saved": crate::memory::interests(pool).await? }).to_string())
+}
+
+#[derive(Deserialize)]
 struct SearchMailServerArgs {
     from: Option<String>,
     subject: Option<String>,
@@ -149,7 +170,10 @@ struct SearchMailServerArgs {
 
 /// Search the mail servers, then describe the hits from the rows the search
 /// stored.
-async fn search_mail_server(pool: &SqlitePool, arguments: &str) -> anyhow::Result<String> {
+pub(crate) async fn search_mail_server(
+    pool: &SqlitePool,
+    arguments: &str,
+) -> anyhow::Result<String> {
     use anyhow::Context;
     let args: SearchMailServerArgs =
         serde_json::from_str(arguments).context("parsing search_mail_server args")?;

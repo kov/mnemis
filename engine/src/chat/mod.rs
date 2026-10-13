@@ -11,7 +11,7 @@
 mod compact;
 pub mod prompt;
 pub mod store;
-mod tools;
+pub(crate) mod tools;
 
 use std::path::Path;
 use std::time::Duration;

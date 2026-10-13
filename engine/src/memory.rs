@@ -7,6 +7,9 @@
 //! overlapping rules folded together, contradicted ones dropped. The user can
 //! read and edit the note directly; their edit is simply the next version.
 //! `dismissal_feedback` stays as the raw log the rules were learned from.
+//!
+//! A second note, the interests, says what the user wants to hear about in
+//! their mail; the briefing judges mail by it (see `crate::briefing`).
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -22,27 +25,50 @@ pub const RULES_KEY: &str = "rules";
 /// Merges rewrite the whole note, so two at once would lose one's lesson.
 static MERGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// `memory_notes.key` of the interests note: what the user wants to hear
+/// about in their mail, which the briefing judges mail by.
+pub const INTERESTS_KEY: &str = "interests";
+
 /// The current rules, `None` until there are any.
 pub async fn rules(pool: &SqlitePool) -> Result<Option<String>> {
+    note(pool, RULES_KEY).await
+}
+
+/// Replace the rules (a user edit, or a merge's result). Empty clears them.
+pub async fn save_rules(pool: &SqlitePool, content: &str) -> Result<()> {
+    save_note(pool, RULES_KEY, content).await
+}
+
+/// The interests note, `None` until there is one. The user edits it, and the
+/// chat agent rewrites it when the user says what they care about.
+pub async fn interests(pool: &SqlitePool) -> Result<Option<String>> {
+    note(pool, INTERESTS_KEY).await
+}
+
+/// Replace the interests note. Empty clears it.
+pub async fn save_interests(pool: &SqlitePool, content: &str) -> Result<()> {
+    save_note(pool, INTERESTS_KEY, content).await
+}
+
+async fn note(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT content FROM memory_notes WHERE key = ?")
-        .bind(RULES_KEY)
+        .bind(key)
         .fetch_optional(pool)
         .await
-        .context("loading memory rules")?;
+        .with_context(|| format!("loading memory note {key}"))?;
     Ok(row
         .map(|(c,)| c.trim().to_string())
         .filter(|c| !c.is_empty()))
 }
 
-/// Replace the rules (a user edit, or a merge's result). Empty clears them.
-pub async fn save_rules(pool: &SqlitePool, content: &str) -> Result<()> {
+async fn save_note(pool: &SqlitePool, key: &str, content: &str) -> Result<()> {
     let content = content.trim();
     if content.is_empty() {
         sqlx::query("DELETE FROM memory_notes WHERE key = ?")
-            .bind(RULES_KEY)
+            .bind(key)
             .execute(pool)
             .await
-            .context("clearing memory rules")?;
+            .with_context(|| format!("clearing memory note {key}"))?;
         return Ok(());
     }
     let now = Utc::now().timestamp();
@@ -50,13 +76,13 @@ pub async fn save_rules(pool: &SqlitePool, content: &str) -> Result<()> {
         "INSERT INTO memory_notes (key, content, created_at, updated_at) VALUES (?, ?, ?, ?) \
          ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
     )
-    .bind(RULES_KEY)
+    .bind(key)
     .bind(content)
     .bind(now)
     .bind(now)
     .execute(pool)
     .await
-    .context("saving memory rules")?;
+    .with_context(|| format!("saving memory note {key}"))?;
     Ok(())
 }
 
@@ -372,6 +398,24 @@ mod tests {
         save_rules(&pool, "- A rule").await?;
         save_rules(&pool, "  ").await?;
         assert_eq!(rules(&pool).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interests_are_a_note_of_their_own() -> Result<()> {
+        let (_tmp, pool, _) = pool_with_action().await?;
+        save_rules(&pool, "- A rule").await?;
+        save_interests(&pool, "- Anything from my bank\n").await?;
+        assert_eq!(
+            interests(&pool).await?.as_deref(),
+            Some("- Anything from my bank")
+        );
+        assert_eq!(rules(&pool).await?.as_deref(), Some("- A rule"));
+        let chat = crate::chat::store::create_chat(&pool, None, None).await?;
+        let prompt = crate::chat::prompt::build_system_prompt(&pool, chat).await?;
+        assert!(prompt.contains("- Anything from my bank"), "{prompt}");
+        save_interests(&pool, "").await?;
+        assert_eq!(interests(&pool).await?, None);
         Ok(())
     }
 }
