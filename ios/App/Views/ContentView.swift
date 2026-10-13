@@ -66,6 +66,8 @@ private struct SplitLayout: View {
                     }
                 }
             )) {
+                Label("Briefing", systemImage: "sun.horizon")
+                    .tag(SidebarItem.section(.briefing))
                 Label("To-dos", systemImage: "checklist")
                     .badge(model.todos.count)
                     .tag(SidebarItem.section(.actions))
@@ -98,6 +100,7 @@ private struct SplitLayout: View {
             }
         } detail: {
             switch model.selectedTab {
+            case .briefing: BriefingStack()
             case .actions: ActionsStack()
             case .chat: ChatsStack()
             case .settings: NavigationStack { SettingsView() }
@@ -117,6 +120,9 @@ private struct CompactLayout: View {
     var body: some View {
         @Bindable var model = model
         TabView(selection: $model.selectedTab) {
+            Tab("Briefing", systemImage: "sun.horizon", value: AppTab.briefing) {
+                BriefingStack()
+            }
             Tab("To-dos", systemImage: "checklist", value: AppTab.actions) {
                 ActionsStack()
             }

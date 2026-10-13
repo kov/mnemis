@@ -27,6 +27,7 @@ final class FinishInBackground {
 }
 
 enum AppTab: Hashable {
+    case briefing
     case actions
     case chat
     case mail
@@ -52,7 +53,11 @@ final class AppModel {
     private(set) var initials = ""
     var errorMessage: String?
 
-    var selectedTab: AppTab = .actions
+    var selectedTab: AppTab = .briefing
+    /// The periods (in days) whose summary the agent is writing.
+    private(set) var writingBriefing: Set<Int64> = []
+    /// Bumped when a summary was written, so the briefing reloads.
+    private(set) var briefingVersion = 0
     /// Kept here rather than in the views so switching sections keeps them.
     var actionSelection: ActionDto.ID?
     /// Shared by both sections' split views, driven by the header's toggle.
@@ -461,6 +466,55 @@ final class AppModel {
         }
         await syncReminders()
         await refresh()
+        // The day's summary is rewritten only in front: it can take minutes,
+        // more than a background wake-up gets.
+        if UIApplication.shared.applicationState == .active {
+            await refreshBriefing()
+        }
+    }
+
+    /// Rewrite the last day's summary when it is a few hours old and mail
+    /// arrived since.
+    func refreshBriefing() async {
+        guard let engine, !writingBriefing.contains(1) else { return }
+        writingBriefing.insert(1)
+        defer { writingBriefing.remove(1) }
+        do {
+            if try await engine.refreshBriefing() {
+                briefingVersion += 1
+            }
+        } catch {
+            print("[briefing] \(error)")
+        }
+    }
+
+    /// Have the agent write the summary for the last `days` days.
+    func writeBriefing(days: Int64) async {
+        guard let engine, !writingBriefing.contains(days) else { return }
+        writingBriefing.insert(days)
+        defer { writingBriefing.remove(days) }
+        let finishing = FinishInBackground("writing the briefing")
+        defer { finishing.end() }
+        do {
+            try await engine.writeBriefing(days: days)
+        } catch {
+            report(error)
+        }
+        briefingVersion += 1
+    }
+
+    /// A new chat about the briefing for the last `days` days, on the Chats
+    /// tab.
+    func askAboutBriefing(days: Int64) async {
+        guard let engine else { return }
+        do {
+            let id = try await engine.briefingChat(days: days)
+            await refreshChats()
+            chatSelection = id
+            selectedTab = .chat
+        } catch {
+            report(error)
+        }
     }
 
     /// Marks messages read or unread here at once; the server hears in the
@@ -691,7 +745,8 @@ final class AppModel {
         draftsVersion += 1
     }
 
-    /// Deep links: `mnemis://action/<id>` and `mnemis://chat/<id>` open that
+    /// Deep links: `mnemis://briefing/<days>` opens the briefing for that
+    /// period, `mnemis://action/<id>` and `mnemis://chat/<id>` open that
     /// action or chat, `mnemis://draft/<id>` the composer on that draft,
     /// `mnemis://mail/<folder id>` a folder (0: All Inboxes) and
     /// `mnemis://thread/<id>` a thread in All Inboxes (for notifications,
@@ -699,6 +754,9 @@ final class AppModel {
     func open(_ url: URL) {
         guard url.scheme == "mnemis", let id = Int64(url.lastPathComponent) else { return }
         switch url.host() {
+        case "briefing":
+            selectedTab = .briefing
+            UserDefaults.standard.set(Int(id), forKey: "briefingDays")
         case "action":
             selectedTab = .actions
             actionSelection = id

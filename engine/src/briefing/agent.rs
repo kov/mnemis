@@ -2,7 +2,8 @@
 //! came in and what matters, and picks the emails worth reading. It starts from the
 //! period's tagged mail, reads what deserves it, and can look up earlier mail
 //! (locally or on the server) to explain an email's context. It runs on
-//! demand, and from sync for the last day when the briefing is stale.
+//! demand, and the apps call [`refresh_if_stale`] for the last day when they
+//! are in the foreground; a run can take minutes, so sync never does.
 //!
 //! One briefing is kept per period length, with the newest email it saw, so
 //! the briefing can say how much mail arrived since.

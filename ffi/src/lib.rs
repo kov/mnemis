@@ -19,12 +19,13 @@ use mnemis_engine::llm::{ForeignClient, ForeignLlm, LlmBackend};
 use mnemis_engine::source::SourceId;
 use mnemis_engine::{chat, config, db, mail, memory, mutations, orchestrator, queries, settings};
 use mnemis_types::{
-    ActionDto, ActionStatus, AttachmentDto, ChannelRowDto, ChatDto, ChatEvent, ChatTurnDto,
-    Confidence, DraftDto, DraftKind, DraftStatus, FeedbackKind, LlmConfigDto, LlmProvider,
-    MailScope, MailboxDto, MailboxRole, MessageActionRef, MessageDetailDto, ProfileIdentifier,
-    RenderedMessageDto, SmtpSettingsDto, SourceHealth, SourceRowDto, SourceStatus, StatusSnapshot,
-    SyncOutcome, ThinkingLevel, ThreadDto, ThreadMessageDto, ThreadSummaryDto, ThreadTodoDto,
-    UserProfileDto,
+    AccountCountDto, ActionDto, ActionStatus, AttachmentDto, BriefingDto, BriefingMailDto,
+    BriefingTodoDto, BriefingWatchDto, CategoryCountDto, ChannelRowDto, ChatDto, ChatEvent,
+    ChatTurnDto, Confidence, DraftDto, DraftKind, DraftStatus, FeedbackKind, LlmConfigDto,
+    LlmProvider, MailCategory, MailScope, MailboxDto, MailboxRole, MessageActionRef,
+    MessageDetailDto, ProfileIdentifier, RenderedMessageDto, SmtpSettingsDto, SourceHealth,
+    SourceRowDto, SourceStatus, StatusSnapshot, SyncOutcome, ThinkingLevel, ThreadDto,
+    ThreadMessageDto, ThreadSummaryDto, ThreadTodoDto, UserProfileDto, WrittenBriefingDto,
 };
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
@@ -586,6 +587,64 @@ impl Engine {
     pub async fn save_memory_rules(&self, rules: String) -> Result<(), MnemisError> {
         let pool = self.pool.clone();
         run(async move { memory::save_rules(&pool, &rules).await }).await
+    }
+
+    /// What the user wants to hear about in their mail, `None` until set.
+    pub async fn interests(&self) -> Result<Option<String>, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { memory::interests(&pool).await }).await
+    }
+
+    /// Replace the interests note with the user's edit; empty clears it.
+    pub async fn save_interests(&self, interests: String) -> Result<(), MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { memory::save_interests(&pool, &interests).await }).await
+    }
+
+    /// The briefing for the last `days` days, from stored data (no model
+    /// call).
+    pub async fn briefing(&self, days: i64) -> Result<BriefingDto, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mnemis_engine::briefing::load(&pool, days).await }).await
+    }
+
+    /// Have the agent write the summary for the last `days` days (it can
+    /// take minutes).
+    pub async fn write_briefing(&self, days: i64) -> Result<(), MnemisError> {
+        let stack = self.current_llm().ok_or_else(|| MnemisError::Failed {
+            message: "No LLM configured. Choose one in Settings.".into(),
+        })?;
+        let pool = self.pool.clone();
+        run(async move {
+            mnemis_engine::briefing::agent::write(&pool, &stack.llm, days, stack.window_char_budget)
+                .await
+        })
+        .await
+    }
+
+    /// Rewrite the last day's summary when it is a few hours old and mail
+    /// arrived since; for the foreground, never a background task. Returns
+    /// whether it did.
+    pub async fn refresh_briefing(&self) -> Result<bool, MnemisError> {
+        let Some(stack) = self.current_llm() else {
+            return Ok(false);
+        };
+        let pool = self.pool.clone();
+        run(async move {
+            mnemis_engine::briefing::agent::refresh_if_stale(
+                &pool,
+                &stack.llm,
+                stack.window_char_budget,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Start a chat about the briefing for the last `days` days.
+    pub async fn briefing_chat(&self, days: i64) -> Result<i64, MnemisError> {
+        let pool = self.pool.clone();
+        run(async move { mnemis_engine::briefing::agent::start_chat(&pool, days).await }).await
     }
 
     /// The mail the chat agent is watching for, oldest first.
@@ -1490,6 +1549,83 @@ pub struct ThreadMessageDto {
     pub downloaded: bool,
     pub from_me: bool,
     pub warnings: Vec<String>,
+}
+
+#[uniffi::remote(Enum)]
+pub enum MailCategory {
+    Person,
+    Newsletter,
+    Notification,
+    Transactional,
+    List,
+    Other,
+}
+
+#[uniffi::remote(Record)]
+pub struct CategoryCountDto {
+    pub category: MailCategory,
+    pub count: i64,
+}
+
+#[uniffi::remote(Record)]
+pub struct AccountCountDto {
+    pub account: String,
+    pub count: i64,
+}
+
+#[uniffi::remote(Record)]
+pub struct BriefingMailDto {
+    pub message_id: i64,
+    pub thread_id: Option<i64>,
+    pub from: String,
+    pub subject: String,
+    pub received_at: i64,
+    pub unread: bool,
+    pub category: Option<MailCategory>,
+    pub interest: Option<i64>,
+    pub reason: String,
+    pub warnings: Vec<String>,
+}
+
+#[uniffi::remote(Record)]
+pub struct BriefingWatchDto {
+    pub watch_id: i64,
+    pub looking_for: String,
+    pub open: bool,
+    pub expires_at: Option<i64>,
+    pub matched: Option<BriefingMailDto>,
+}
+
+#[uniffi::remote(Record)]
+pub struct BriefingTodoDto {
+    pub action_id: i64,
+    pub title: String,
+    pub due_at: Option<i64>,
+}
+
+#[uniffi::remote(Record)]
+pub struct WrittenBriefingDto {
+    pub generated_at: i64,
+    pub summary: String,
+    pub highlights: Vec<BriefingMailDto>,
+    pub newer_mail: i64,
+}
+
+#[uniffi::remote(Record)]
+pub struct BriefingDto {
+    pub days: i64,
+    pub since: i64,
+    pub received: i64,
+    pub unread: i64,
+    pub categories: Vec<CategoryCountDto>,
+    pub untagged: i64,
+    pub accounts: Vec<AccountCountDto>,
+    pub worth_reading: Vec<BriefingMailDto>,
+    pub watches: Vec<BriefingWatchDto>,
+    pub new_todos: Vec<BriefingTodoDto>,
+    pub resolved_todos: i64,
+    pub suspicious: Vec<BriefingMailDto>,
+    pub written: Option<WrittenBriefingDto>,
 }
 
 #[uniffi::remote(Record)]

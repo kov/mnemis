@@ -1,16 +1,38 @@
 import SwiftUI
 
-/// The rules mnemis has learned from your dismissals, editable. Your edit is
-/// what the next merge builds on.
+/// What mnemis keeps about you, editable: your interests, which the briefing
+/// judges mail by, and the rules learned from your dismissals (your edit is
+/// what the next merge builds on).
 struct MemoryView: View {
     @Environment(AppModel.self) private var model
     @State private var rules = ""
     @State private var saved = ""
+    @State private var interests = ""
+    @State private var savedInterests = ""
     @State private var loaded = false
     @State private var watches: [MailWatch] = []
 
     var body: some View {
         Form {
+            Section {
+                TextEditor(text: $interests)
+                    .font(.callout)
+                    .frame(minHeight: 120)
+                    .overlay(alignment: .topLeading) {
+                        if loaded && interests.isEmpty {
+                            Text("Nothing yet. Write what you want to hear about, or tell the assistant in a chat.")
+                                .font(.callout)
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 8)
+                                .padding(.leading, 5)
+                                .allowsHitTesting(false)
+                        }
+                    }
+            } header: {
+                Text("Interests")
+            } footer: {
+                Text("What you want to hear about in your mail, and what you don't. The briefing judges new mail by it.")
+            }
             Section {
                 TextEditor(text: $rules)
                     .font(.callout)
@@ -25,6 +47,8 @@ struct MemoryView: View {
                                 .allowsHitTesting(false)
                         }
                     }
+            } header: {
+                Text("To-do rules")
             } footer: {
                 Text("One rule per line. mnemis follows these when it reads your mail and in chat, and updates them each time you explain a dismissal.")
             }
@@ -62,7 +86,7 @@ struct MemoryView: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Save") { Task { await save() } }
-                    .disabled(rules == saved)
+                    .disabled(rules == saved && interests == savedInterests)
             }
         }
         .task { await load() }
@@ -72,6 +96,8 @@ struct MemoryView: View {
         guard let engine = model.engine else { return }
         do {
             rules = try await engine.memoryRules() ?? ""
+            interests = try await engine.interests() ?? ""
+            savedInterests = interests
             watches = try await engine.mailWatches()
             saved = rules
             loaded = true
@@ -95,6 +121,8 @@ struct MemoryView: View {
         do {
             try await engine.saveMemoryRules(rules: rules)
             saved = rules
+            try await engine.saveInterests(interests: interests)
+            savedInterests = interests
         } catch {
             model.report(error)
         }

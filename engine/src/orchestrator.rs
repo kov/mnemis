@@ -108,11 +108,13 @@ pub async fn find_to_dos(
         out.errors.extend(counts.errors);
     }
 
-    // Describe the new mail for the briefing, then rewrite the last day's
-    // summary if it is stale. Best-effort, like the expected-mail check.
-    let briefing: Erased<'_, ()> = Box::pin(update_briefing(pool, llm, window_char_budget));
+    // Describe the new mail for the briefing. Best-effort, like the
+    // expected-mail check. The written summary is the apps' call (see
+    // `briefing::agent::refresh_if_stale`): it can take minutes, too long
+    // for a background sync.
+    let briefing: Erased<'_, usize> = Box::pin(tag_for_briefing(pool, llm, window_char_budget));
     if let Err(e) = briefing.await {
-        warn!(error = %format!("{e:#}"), "updating the briefing failed");
+        warn!(error = %format!("{e:#}"), "tagging mail for the briefing failed");
         out.errors.push(format!("briefing: {e:#}"));
     }
 
@@ -176,26 +178,22 @@ async fn check_expected_mail(
     Ok(recorded)
 }
 
-/// Tag the new mail (see `briefing::tag`), then refresh the last day's
-/// written briefing when it is stale.
-async fn update_briefing(
+/// Describe the new mail for the briefing (see `briefing::tag`).
+async fn tag_for_briefing(
     pool: &SqlitePool,
     llm: &dyn LlmTransport,
     window_char_budget: usize,
-) -> Result<()> {
-    use crate::briefing::{agent, tag};
+) -> Result<usize> {
     let started = Instant::now();
-    let tagged = tag::tag_new_mail(pool, llm, window_char_budget).await?;
-    let rewritten = agent::refresh_if_stale(pool, llm, window_char_budget).await?;
-    if tagged > 0 || rewritten {
+    let tagged = crate::briefing::tag::tag_new_mail(pool, llm, window_char_budget).await?;
+    if tagged > 0 {
         info!(
             tagged,
-            rewritten,
             secs = started.elapsed().as_secs(),
-            "briefing updated"
+            "mail tagged for the briefing"
         );
     }
-    Ok(())
+    Ok(tagged)
 }
 
 /// Only one [`find_to_dos`] per database at a time: two would extract the
