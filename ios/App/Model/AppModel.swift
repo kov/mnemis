@@ -86,6 +86,9 @@ final class AppModel {
     /// Bumped whenever a draft changes, so views showing one reload it.
     private(set) var draftsVersion = 0
 
+    /// First launch without a mail account: onboarding is up.
+    var needsOnboarding = false
+
     /// True until an LLM and at least one account are configured — the
     /// actions list shows a setup prompt instead of an empty list.
     private(set) var needsSetup = false
@@ -193,6 +196,7 @@ final class AppModel {
         do {
             let engine = try await openEngine()
             await refresh()
+            needsOnboarding = sources.isEmpty && !UserDefaults.standard.bool(forKey: "onboarded")
             // Always a full sync at launch: new mail, then to-dos.
             Task { await sync(userInitiated: false) }
             // The app went active before the engine was open.
@@ -455,6 +459,14 @@ final class AppModel {
         if toDos {
             await findToDos(userInitiated: false)
         }
+    }
+
+    /// Onboarding is done: open on the briefing and read the mail.
+    func finishOnboarding() {
+        UserDefaults.standard.set(true, forKey: "onboarded")
+        needsOnboarding = false
+        selectedTab = .briefing
+        Task { await sync(userInitiated: false) }
     }
 
     /// Look for to-dos in mail synced but not yet read by the model, then

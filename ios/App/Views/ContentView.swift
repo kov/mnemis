@@ -24,6 +24,9 @@ struct ContentView: View {
         .sheet(item: $model.composing, onDismiss: { model.draftChanged() }) { draft in
             ComposeView(draft: draft)
         }
+        .fullScreenCover(isPresented: $model.needsOnboarding) {
+            OnboardingView()
+        }
         .alert(
             "Something went wrong",
             isPresented: Binding(

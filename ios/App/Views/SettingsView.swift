@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var displayName = ""
     @State private var emails = ""
     @State private var customPrompt: String?
+    @State private var language: String?
 
     // Language model
     @State private var provider: LlmProvider = .anthropic
@@ -35,6 +36,12 @@ struct SettingsView: View {
                     Text("You")
                 } footer: {
                     Text("Separate addresses with commas. mnemis uses them to tell what was asked of you.")
+                }
+
+                Section {
+                    LanguagePicker(language: $language)
+                } footer: {
+                    Text("To-dos, summaries and the briefing are written in this language.")
                 }
 
                 Section {
@@ -164,6 +171,7 @@ struct SettingsView: View {
             let profile = try await engine.userProfile()
             displayName = profile.displayName
             customPrompt = profile.customPrompt
+            language = try await engine.language()
             emails = profile.identifiers
                 .filter { $0.kind == "email" }
                 .map(\.value)
@@ -203,6 +211,7 @@ struct SettingsView: View {
                 customPrompt: customPrompt,
                 identifiers: identifiers
             ))
+            try await engine.saveLanguage(language: language)
 
             let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             try await engine.saveLlmConfig(cfg: LlmConfigDto(
